@@ -871,10 +871,10 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(identifier, _worker_host \\ nil)
 
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp cleanup_issue_workspace(identifier, _worker_host) when is_binary(identifier) do
+    Workspace.cleanup_sandbox("karkhana-" <> String.replace(identifier, ~r/[^A-Za-z0-9._-]/, "_"))
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
