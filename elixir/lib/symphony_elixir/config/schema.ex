@@ -199,6 +199,62 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Claude do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "claude")
+      field(:model, :string)
+      field(:max_turns, :integer, default: 50)
+      field(:dangerously_skip_permissions, :boolean, default: true)
+      field(:allowed_tools, {:array, :string})
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [:command, :model, :max_turns, :dangerously_skip_permissions, :allowed_tools, :turn_timeout_ms, :stall_timeout_ms],
+        empty_values: []
+      )
+      |> validate_number(:max_turns, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
+  defmodule Bhatti do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:url, :string, default: "http://localhost:8080")
+      field(:api_key, :string)
+      field(:image, :string, default: "minimal")
+      field(:cpus, :integer, default: 2)
+      field(:memory_mb, :integer, default: 2048)
+      field(:disk_mb, :integer, default: 4096)
+      field(:volume, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:url, :api_key, :image, :cpus, :memory_mb, :disk_mb, :volume], empty_values: [])
+      |> validate_number(:cpus, greater_than: 0)
+      |> validate_number(:memory_mb, greater_than: 0)
+      |> validate_number(:disk_mb, greater_than: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -268,6 +324,8 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude, Claude, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:bhatti, Bhatti, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -360,6 +418,8 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:claude, with: &Claude.changeset/2)
+    |> cast_embed(:bhatti, with: &Bhatti.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -383,7 +443,13 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    bhatti = %{
+      settings.bhatti
+      | url: resolve_secret_setting(settings.bhatti.url, "http://localhost:8080") || "http://localhost:8080",
+        api_key: resolve_secret_setting(settings.bhatti.api_key, System.get_env("BHATTI_API_KEY"))
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, bhatti: bhatti}
   end
 
   defp normalize_keys(value) when is_map(value) do
