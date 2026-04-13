@@ -16,7 +16,7 @@ agent:
   max_retry_backoff_ms: 300000
 
 claude:
-  command: claude
+  command: pi
   dangerously_skip_permissions: true
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
@@ -24,7 +24,7 @@ claude:
 bhatti:
   url: https://api.bhatti.sh
   api_key: $BHATTI_API_KEY
-  image: karkhana-claude
+  image: karkhana-pi
   cpus: 2
   memory_mb: 2048
   disk_mb: 4096
