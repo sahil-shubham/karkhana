@@ -158,7 +158,34 @@ defmodule SymphonyElixir.Claude.CLI do
 
   defp build_first_turn_args(prompt) do
     settings = Config.settings!().claude
+    command = settings.command || "pi"
 
+    case detect_agent(command) do
+      :pi -> build_pi_args(prompt, settings)
+      :claude -> build_claude_args(prompt, settings)
+    end
+  end
+
+  defp build_resume_args(_session_id, prompt) do
+    # pi doesn't support --resume; each turn is independent.
+    # Claude supports --resume but we use pi now.
+    # For both: just send the prompt as a new invocation.
+    build_first_turn_args(prompt)
+  end
+
+  defp build_pi_args(prompt, settings) do
+    base = [
+      "-p", prompt,
+      "--mode", "json",
+      "--no-session"
+    ]
+
+    base
+    |> maybe_add_flag(settings.dangerously_skip_permissions, "--dangerously-skip-permissions")
+    |> maybe_add_option(settings.model, "--model")
+  end
+
+  defp build_claude_args(prompt, settings) do
     base = [
       "-p", prompt,
       "--verbose",
@@ -172,21 +199,9 @@ defmodule SymphonyElixir.Claude.CLI do
     |> maybe_add_allowed_tools(settings.allowed_tools)
   end
 
-  defp build_resume_args(session_id, prompt) do
-    settings = Config.settings!().claude
-
-    base = [
-      "--resume", session_id,
-      "-p", prompt,
-      "--verbose",
-      "--output-format", "stream-json",
-      "--max-turns", to_string(settings.max_turns)
-    ]
-
-    base
-    |> maybe_add_flag(settings.dangerously_skip_permissions, "--dangerously-skip-permissions")
+  defp detect_agent(command) do
+    if String.contains?(command, "pi"), do: :pi, else: :claude
   end
-
 
   defp maybe_add_flag(args, true, flag), do: args ++ [flag]
   defp maybe_add_flag(args, _, _), do: args

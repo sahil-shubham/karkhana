@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.Claude.StreamParser do
   @moduledoc """
-  Parses newline-delimited JSON events from Claude Code's `--output-format stream-json`.
+  Parses newline-delimited JSON events from the coding agent's output.
+  Supports both Claude Code (`--output-format stream-json`) and
+  pi (`--mode json`) event formats.
   """
 
   @spec parse_line(String.t()) :: {:ok, map()} | {:error, term()}
@@ -14,26 +16,33 @@ defmodule SymphonyElixir.Claude.StreamParser do
 
   @spec extract_session_id(map()) :: String.t() | nil
   def extract_session_id(%{"session_id" => id}) when is_binary(id), do: id
+  # pi puts session id in the "session" event
+  def extract_session_id(%{"type" => "session", "id" => id}) when is_binary(id), do: id
   def extract_session_id(_), do: nil
 
   @spec extract_usage(map()) :: map() | nil
   def extract_usage(event) do
+    # pi: usage is nested in message_update -> message -> usage
+    # claude: usage is at top level or in message.usage
     usage =
       Map.get(event, "usage") ||
-        get_in(event, ["message", "usage"])
+        get_in(event, ["message", "usage"]) ||
+        get_in(event, ["assistantMessageEvent", "message", "usage"])
 
     normalize_usage(usage)
   end
 
   defp normalize_usage(%{} = usage) do
-    input = get_int(usage, "input_tokens")
-    output = get_int(usage, "output_tokens")
+    # pi uses "input"/"output"/"totalTokens", claude uses "input_tokens"/"output_tokens"
+    input = get_int(usage, "input_tokens") || get_int(usage, "input")
+    output = get_int(usage, "output_tokens") || get_int(usage, "output")
+    total = get_int(usage, "total_tokens") || get_int(usage, "totalTokens")
 
-    if input || output do
+    if input || output || total do
       %{
         input_tokens: input || 0,
         output_tokens: output || 0,
-        total_tokens: (input || 0) + (output || 0)
+        total_tokens: total || (input || 0) + (output || 0)
       }
     end
   end
@@ -46,12 +55,25 @@ defmodule SymphonyElixir.Claude.StreamParser do
 
     event_type =
       case {type, subtype} do
+        # Claude events
         {"system", "init"} -> :session_started
         {"system", _} -> :system
         {"assistant", _} -> :assistant
         {"tool", _} -> :tool_use
         {"result", _} -> :result
         {"error", _} -> :error
+        # pi events
+        {"session", _} -> :session_started
+        {"agent_start", _} -> :session_started
+        {"agent_end", _} -> :result
+        {"turn_start", _} -> :turn_start
+        {"turn_end", _} -> :turn_end
+        {"message_start", _} -> :assistant
+        {"message_update", _} -> :assistant
+        {"message_end", _} -> :assistant
+        {"tool_execution_start", _} -> :tool_use
+        {"tool_execution_update", _} -> :tool_use
+        {"tool_execution_end", _} -> :tool_use
         _ -> :unknown
       end
 
@@ -61,6 +83,7 @@ defmodule SymphonyElixir.Claude.StreamParser do
   defp get_int(map, key) do
     case Map.get(map, key) do
       v when is_integer(v) and v >= 0 -> v
+      v when is_float(v) and v >= 0 -> round(v)
       _ -> nil
     end
   end
