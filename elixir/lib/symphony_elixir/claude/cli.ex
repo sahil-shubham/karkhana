@@ -59,10 +59,13 @@ defmodule SymphonyElixir.Claude.CLI do
       # nohup alone isn't enough — bhatti's agent waits for stdout to close,
       # and backgrounded processes can still hold pty references.
       # setsid creates a new session, fully detaching from the controlling terminal.
+      # Capture both stdout and stderr in the output file.
+      # Stderr lines won't parse as JSON and will be skipped by the parser,
+      # but they'll be visible when debugging.
       launch_cmd =
-        "rm -f #{@output_file} && " <>
+        "rm -f #{@output_file} #{@output_file}.err && " <>
         "setsid bash -c '#{command} -p \"$(cat #{@prompt_file})\" #{plain_args} " <>
-        "< /dev/null > #{@output_file} 2>/dev/null; " <>
+        "< /dev/null > #{@output_file} 2>#{@output_file}.err; " <>
         "echo #{@done_marker}:$? >> #{@output_file}' " <>
         "< /dev/null > /dev/null 2>&1 &"
 
@@ -96,8 +99,9 @@ defmodule SymphonyElixir.Claude.CLI do
     now = System.monotonic_time(:millisecond)
 
     if now >= deadline do
-      # Kill claude process
-      Bhatti.exec(sandbox_id, ["bash", "-c", "pkill -f 'claude.*print' 2>/dev/null"], timeout_sec: 5)
+      Bhatti.exec(sandbox_id, ["bash", "-c", "pkill -f 'pi\|claude' 2>/dev/null"], timeout_sec: 5)
+      stderr = read_stderr(sandbox_id)
+      Logger.error("Agent timed out in sandbox #{sandbox_id}. stderr: #{stderr}")
       {:error, :turn_timeout}
     else
       Process.sleep(@poll_interval_ms)
@@ -120,7 +124,10 @@ defmodule SymphonyElixir.Claude.CLI do
               {:ok, %{session_id: new_state.session_id, exit_code: 0, usage: new_state.usage}}
 
             code ->
-              {:error, {:subprocess_exit, code}}
+              # Read stderr for diagnostics
+              stderr = read_stderr(sandbox_id)
+              Logger.error("Agent exited with code #{code} in sandbox #{sandbox_id}. stderr: #{stderr}")
+              {:error, {:subprocess_exit, code, stderr}}
           end
 
         {:ok, _} ->
@@ -213,5 +220,12 @@ defmodule SymphonyElixir.Claude.CLI do
 
   defp maybe_add_allowed_tools(args, tools) when is_list(tools) do
     args ++ ["--allowedTools" | [Enum.join(tools, ",")]]
+  end
+
+  defp read_stderr(sandbox_id) do
+    case Bhatti.exec(sandbox_id, ["bash", "-c", "cat #{@output_file}.err 2>/dev/null | tail -20"], timeout_sec: 10) do
+      {:ok, %{"stdout" => stderr}} -> String.trim(stderr)
+      _ -> "(could not read stderr)"
+    end
   end
 end
