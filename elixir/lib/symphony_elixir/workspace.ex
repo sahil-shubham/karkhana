@@ -91,7 +91,7 @@ defmodule SymphonyElixir.Workspace do
       |> maybe_put_env("ANTHROPIC_API_KEY", System.get_env("ANTHROPIC_API_KEY"))
       |> maybe_put_env("GH_TOKEN", System.get_env("GH_TOKEN"))
       |> maybe_put_env("GITHUB_TOKEN", System.get_env("GH_TOKEN"))
-      |> maybe_put_env("LINEAR_API_KEY", System.get_env("LINEAR_API_KEY"))
+      |> maybe_put_env("LINEAR_API_KEY", System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY"))
 
     spec = %{
       "name" => sandbox_name,

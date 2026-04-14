@@ -159,7 +159,7 @@ curl -s -X POST https://api.linear.app/graphql \
   -H "Authorization: $LINEAR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query":"{ issue(id: \"{{ issue.id }}\") { comments { nodes { id body user { name } } } } }"}' \
-  | jq '.data.issue.comments.nodes[] | select(.user.name != "Sahil Shubham") | .id' -r
+  | jq '.data.issue.comments.nodes[] | select(.user.name == "clanker") | .id' -r
 ```
 
 To update an existing comment (use commentUpdate, not commentCreate):
