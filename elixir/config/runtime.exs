@@ -13,4 +13,8 @@ if config_env() == :prod do
   if path = System.get_env("KARKHANA_WORKFLOW_PATH") do
     config :symphony_elixir, :workflow_file_path, path
   end
+
+  # Log file path — writable location in the sandbox
+  config :symphony_elixir, :log_file,
+    System.get_env("KARKHANA_LOG_FILE") || "/tmp/karkhana.log"
 end
