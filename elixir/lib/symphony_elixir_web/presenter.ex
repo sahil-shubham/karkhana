@@ -21,7 +21,8 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           completed_runs: Enum.map(Map.get(snapshot, :completed_runs, []), &run_payload/1),
           agent_totals: snapshot.agent_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          outcomes: outcome_summary()
         }
 
       :timeout ->
@@ -213,4 +214,22 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp outcome_summary do
+    case SymphonyElixir.OutcomeTracker.scan_recent(days: 7) do
+      {:ok, outcomes} ->
+        summary = SymphonyElixir.OutcomeTracker.summarize(outcomes)
+        %{
+          total: summary.total,
+          zero_touch: summary.zero_touch,
+          one_touch: summary.one_touch,
+          multi_touch: summary.multi_touch,
+          heavy_touch: summary.heavy_touch,
+          zero_touch_rate: summary.zero_touch_rate
+        }
+
+      {:error, _} ->
+        nil
+    end
+  end
 end
