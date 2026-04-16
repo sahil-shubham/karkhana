@@ -15,17 +15,7 @@ env:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            arch: amd64
-            target: linux-amd64
-          - os: ubuntu-24.04-arm
-            arch: arm64
-            target: linux-arm64
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: elixir
@@ -46,9 +36,9 @@ jobs:
           path: |
             elixir/deps
             elixir/_build
-          key: ${{ matrix.target }}-mix-prod-${{ hashFiles('elixir/mix.lock') }}
+          key: linux-amd64-mix-prod-${{ hashFiles('elixir/mix.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-mix-prod-
+            linux-amd64-mix-prod-
 
       - name: Install deps
         run: |
@@ -65,26 +55,10 @@ jobs:
       - name: Package tarball
         run: |
           cd _build/prod/rel
-          tar czf karkhana-${{ github.ref_name }}-${{ matrix.target }}.tar.gz karkhana/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: karkhana-${{ matrix.target }}
-          path: elixir/_build/prod/rel/karkhana-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
+          tar czf karkhana-${{ github.ref_name }}-linux-amd64.tar.gz karkhana/
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*.tar.gz
+          files: elixir/_build/prod/rel/karkhana-${{ github.ref_name }}-linux-amd64.tar.gz
