@@ -377,7 +377,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "seconds_running" => 42.5
              },
              "rate_limits" => %{"primary" => %{"remaining" => 11}},
-             "completed_runs" => []
+             "completed_runs" => [],
+             "outcomes" => nil
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
