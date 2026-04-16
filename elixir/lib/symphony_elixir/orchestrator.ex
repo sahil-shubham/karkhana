@@ -1036,9 +1036,18 @@ defmodule SymphonyElixir.Orchestrator do
       """
 
       case SymphonyElixir.Linear.Client.post_comment(issue_id, body, api_key) do
-        {:ok, _} -> :ok
+        {:ok, _} ->
+          Logger.info("Posted failure comment for #{identifier}")
         {:error, reason} ->
           Logger.warning("Failed to post failure comment for #{identifier}: #{inspect(reason)}")
+      end
+
+      # Move issue to Backlog
+      case SymphonyElixir.Linear.Adapter.update_issue_state(issue_id, "Backlog") do
+        :ok ->
+          Logger.info("Moved #{identifier} to Backlog")
+        {:error, reason} ->
+          Logger.warning("Failed to move #{identifier} to Backlog: #{inspect(reason)}")
       end
     else
       Logger.warning("No LINEAR_BOT_API_KEY or LINEAR_API_KEY set, cannot post failure comment")
