@@ -49,7 +49,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     send(
       recipient,
-      {:codex_worker_update, issue_id,
+      {:agent_worker_update, issue_id,
        %{
          event: event_type,
          timestamp: timestamp,
@@ -68,7 +68,7 @@ defmodule SymphonyElixir.AgentRunner do
        when is_pid(recipient) and is_atom(phase) do
     send(
       recipient,
-      {:codex_worker_update, issue_id,
+      {:agent_worker_update, issue_id,
        %{
          event: phase,
          timestamp: DateTime.utc_now(),
