@@ -122,7 +122,14 @@ defmodule SymphonyElixir.Workspace do
       {:ok, %{"id" => sandbox_id}} ->
         Logger.info("Created sandbox #{sandbox_name} id=#{sandbox_id}")
 
-        # Run after_create hook first (installs claude CLI etc)
+        # Inject sandbox identity so the agent can self-publish preview URLs
+        bhatti_api_key = System.get_env("BHATTI_API_KEY") || ""
+        Client.exec(sandbox_id, ["bash", "-c",
+          "echo 'export BHATTI_SANDBOX_ID=#{sandbox_id}' >> /home/lohar/.bashrc && " <>
+          "echo 'export BHATTI_API_KEY=#{bhatti_api_key}' >> /home/lohar/.bashrc"
+        ], timeout_sec: 10)
+
+        # Run after_create hook (installs pi CLI, clones repo, etc)
         hook = settings.hooks.after_create
         hook_result = if hook do
           run_hook_raw(sandbox_id, hook, "after_create")

@@ -93,8 +93,11 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_claude_turns(sandbox_id, issue, claude_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, session_id) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
+    attempt = Keyword.get(opts, :attempt)
+
     cli_opts = [
-      on_event: claude_event_handler(claude_update_recipient, issue)
+      on_event: claude_event_handler(claude_update_recipient, issue),
+      attempt: attempt
     ]
 
     result =

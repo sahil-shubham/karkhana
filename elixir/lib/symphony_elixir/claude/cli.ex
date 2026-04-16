@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Claude.CLI do
   alias SymphonyElixir.Config
 
   @prompt_file "/tmp/karkhana-prompt.txt"
+  @session_dir "/home/lohar/karkhana-sessions"
 
   @type run_result :: %{
           session_id: String.t() | nil,
@@ -42,6 +43,21 @@ defmodule SymphonyElixir.Claude.CLI do
     # The prompt contains markdown, URLs, parens, quotes — anything that
     # would break shell interpolation.
     {prompt, other_args} = extract_prompt(args)
+
+    # If --continue is in the args but the session dir doesn't exist
+    # (sandbox was destroyed and recreated between turns), fall back
+    # to a fresh invocation instead of failing silently.
+    other_args = if "--continue" in other_args do
+      case Bhatti.exec(sandbox_id, ["test", "-d", @session_dir], timeout_sec: 5) do
+        {:ok, %{"exit_code" => 0}} ->
+          other_args
+        _ ->
+          Logger.warning("Session dir missing in sandbox #{sandbox_id}, falling back to fresh invocation")
+          List.delete(other_args, "--continue")
+      end
+    else
+      other_args
+    end
 
     with :ok <- Bhatti.write_file(sandbox_id, @prompt_file, prompt) do
       command = Config.settings!().claude.command
@@ -125,12 +141,17 @@ defmodule SymphonyElixir.Claude.CLI do
     build_first_turn_args(prompt, opts)
   end
 
-  defp build_pi_args(prompt, settings, _opts) do
+  defp build_pi_args(prompt, settings, opts) do
+    attempt = Keyword.get(opts, :attempt)
+    continuation = is_integer(attempt) and attempt > 0
+
     base = [
       "-p", prompt,
       "--mode", "json",
-      "--no-session"
+      "--session-dir", @session_dir
     ]
+
+    base = if continuation, do: base ++ ["--continue"], else: base
 
     base
     |> maybe_add_option(settings.model, "--model")
