@@ -46,6 +46,7 @@ defmodule SymphonyElixir.MixProject do
       dialyzer: [
         plt_add_apps: [:mix]
       ],
+      releases: releases(),
       escript: escript(),
       aliases: aliases(),
       deps: deps()
@@ -84,6 +85,16 @@ defmodule SymphonyElixir.MixProject do
       setup: ["deps.get"],
       build: ["escript.build"],
       lint: ["specs.check", "credo --strict"]
+    ]
+  end
+
+  defp releases do
+    [
+      karkhana: [
+        include_erts: true,
+        strip_beams: true,
+        cookie: "karkhana-release-cookie"
+      ]
     ]
   end
 

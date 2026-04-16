@@ -55,20 +55,59 @@ case "${1:-start}" in
     # Idempotent: bhatti returns existing sandbox if name exists
     bhatti create --name "$ORCH_NAME" --image karkhana-pi-v2 --cpus 1 --memory 2048 --keep-hot
 
-    echo "Installing Elixir + cloning karkhana..."
-    bhatti exec "$ORCH_NAME" -- bash -lc '
-      # Install Erlang + Elixir
-      sudo apt-get update -qq
-      sudo apt-get install -y -qq erlang elixir 2>&1 | tail -3
+    echo "Installing Erlang/Elixir via elixir-install..."
+    # Write install script and run detached (avoids Cloudflare 524 timeout)
+    cat <<'INSTALL_SCRIPT' | bhatti file write "$ORCH_NAME" /tmp/install-orchestrator.sh
+#!/bin/bash -l
+set -e
+log() { echo "$(date -Iseconds) $1"; }
 
-      # Clone karkhana
-      cd /home/lohar
-      git clone https://github.com/sahil-shubham/karkhana.git 2>/dev/null || true
-      cd karkhana/elixir
-      mix local.hex --force
-      mix local.rebar --force
-      mix deps.get
-    '
+log "Installing elixir-install..."
+curl -fsSL https://raw.githubusercontent.com/cigrainger/elixir-install/main/bin/elixir-install | bash >> /tmp/install.log 2>&1
+export PATH="$HOME/.elixir-install/bin:$PATH"
+echo 'export PATH="$HOME/.elixir-install/bin:$PATH"' >> ~/.bashrc
+
+log "Installing Erlang/OTP 27..."
+elixir-install otp 27 >> /tmp/install.log 2>&1
+
+log "Installing Elixir 1.18..."
+elixir-install elixir 1.18 >> /tmp/install.log 2>&1
+
+# Source the paths that elixir-install set up
+source ~/.bashrc 2>/dev/null || true
+export PATH="$HOME/.elixir-install/installs/otp/27/bin:$HOME/.elixir-install/installs/elixir/1.18/bin:$PATH"
+
+log "Installing hex + rebar..."
+mix local.hex --force >> /tmp/install.log 2>&1
+mix local.rebar --force >> /tmp/install.log 2>&1
+
+log "Cloning karkhana..."
+cd /home/lohar
+git clone https://github.com/sahil-shubham/karkhana.git 2>/dev/null || true
+cd karkhana/elixir
+
+log "Installing deps..."
+mix deps.get >> /tmp/install.log 2>&1
+
+log "Compiling..."
+mix compile >> /tmp/install.log 2>&1
+
+log "INSTALL_DONE"
+INSTALL_SCRIPT
+
+    bhatti exec "$ORCH_NAME" --timeout 10 -- bash -c \
+      'chmod +x /tmp/install-orchestrator.sh; nohup /tmp/install-orchestrator.sh > /tmp/install-progress.log 2>&1 & disown; echo ok' \
+      || true
+
+    echo "Waiting for install (this takes 3-8 minutes)..."
+    while true; do
+      sleep 15
+      LAST=$(bhatti exec "$ORCH_NAME" --timeout 10 -- tail -1 /tmp/install-progress.log 2>/dev/null || echo "...")
+      echo "  $LAST"
+      if echo "$LAST" | grep -q "INSTALL_DONE"; then
+        break
+      fi
+    done
 
     echo "Deploying env and WORKFLOW.md..."
     bhatti file write "$ORCH_NAME" /home/lohar/karkhana/elixir/.env < "$SCRIPT_DIR/elixir/.env"
