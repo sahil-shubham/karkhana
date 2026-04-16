@@ -54,43 +54,18 @@ download_release() {
   "
 }
 
-# Install the runner script that auto-restarts on crash
-install_runner() {
-  cat <<SCRIPT | bhatti file write "$ORCH_NAME" /home/lohar/karkhana-run.sh
-#!/bin/bash
-cd $RELEASE_DIR
-source /home/lohar/karkhana/.env 2>/dev/null || true
 
-# Export WORKFLOW.md path for the orchestrator
-export KARKHANA_WORKFLOW_PATH=/home/lohar/karkhana/elixir/WORKFLOW.md
-
-while true; do
-  echo "\$(date -Iseconds) Starting karkhana..." >> /tmp/karkhana.log
-
-  # Pull latest WORKFLOW.md (hot-reloadable config)
-  cd /home/lohar/karkhana && git pull origin main --ff-only 2>> /tmp/karkhana.log || true
-
-  cd $RELEASE_DIR
-  bin/karkhana start >> /tmp/karkhana.log 2>&1 || true
-  # start runs in foreground — if it exits, we restart
-  EXIT=\$?
-  echo "\$(date -Iseconds) Karkhana exited (\$EXIT), restarting in 5s..." >> /tmp/karkhana.log
-  sleep 5
-done
-SCRIPT
-}
 
 start_orchestrator() {
-  bhatti exec "$ORCH_NAME" --timeout 10 -- bash -c "
-    pkill -f 'karkhana-run.sh' 2>/dev/null || true
-    pkill -f 'bin/karkhana' 2>/dev/null || true
+  # Stop any existing instance
+  bhatti exec "$ORCH_NAME" --timeout 10 -- bash -c '
+    source /home/lohar/karkhana/.env 2>/dev/null || true
+    export KARKHANA_WORKFLOW_PATH=/home/lohar/karkhana/elixir/WORKFLOW.md
+    /home/lohar/karkhana-release/bin/karkhana stop 2>/dev/null || true
     sleep 1
-    chmod +x /home/lohar/karkhana-run.sh
-    > /tmp/karkhana.log
-    setsid /home/lohar/karkhana-run.sh </dev/null >/dev/null 2>&1 &
-    disown
+    /home/lohar/karkhana-release/bin/karkhana daemon
     echo started
-  " || true
+  ' || true
 }
 
 case "${1:-start}" in
@@ -107,7 +82,6 @@ case "${1:-start}" in
   upgrade)
     VERSION="${2:-$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")}"
     download_release "$VERSION"
-    install_runner
     start_orchestrator
     echo "Upgraded to $VERSION and restarted."
     ;;
@@ -133,7 +107,6 @@ case "${1:-start}" in
     # Get latest release version
     VERSION="${2:-$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")}"
     download_release "$VERSION"
-    install_runner
 
     echo "Starting orchestrator..."
     start_orchestrator
