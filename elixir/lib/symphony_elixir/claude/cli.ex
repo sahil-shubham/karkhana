@@ -1,10 +1,10 @@
 defmodule SymphonyElixir.Claude.CLI do
   @moduledoc """
-  Runs Claude Code CLI inside bhatti sandboxes.
+  Runs coding agents (Pi or Claude Code) inside bhatti sandboxes.
 
-  Approach: fire-and-forget exec that writes output to a file,
-  then poll the file for results. This avoids Cloudflare tunnel
-  timeouts on long-running HTTP requests.
+  Uses bhatti's streaming exec endpoint — the HTTP response stays open
+  for the duration of the agent run, delivering NDJSON events as they
+  arrive. No setsid, no file polling, no shell escaping.
   """
 
   require Logger
@@ -13,9 +13,7 @@ defmodule SymphonyElixir.Claude.CLI do
   alias SymphonyElixir.Claude.StreamParser
   alias SymphonyElixir.Config
 
-  @poll_interval_ms 3_000
-  @output_file "/tmp/karkhana-claude.jsonl"
-  @done_marker "__KARKHANA_DONE__"
+  @prompt_file "/tmp/karkhana-prompt.txt"
 
   @type run_result :: %{
           session_id: String.t() | nil,
@@ -25,162 +23,109 @@ defmodule SymphonyElixir.Claude.CLI do
 
   @spec run(String.t(), String.t(), keyword()) :: {:ok, run_result()} | {:error, term()}
   def run(prompt, sandbox_id, opts \\ []) do
-    args = build_first_turn_args(prompt)
+    args = build_first_turn_args(prompt, opts)
     execute(args, sandbox_id, opts)
   end
 
   @spec resume(String.t(), String.t(), String.t(), keyword()) ::
           {:ok, run_result()} | {:error, term()}
   def resume(session_id, prompt, sandbox_id, opts \\ []) do
-    args = build_resume_args(session_id, prompt)
+    args = build_resume_args(session_id, prompt, opts)
     execute(args, sandbox_id, opts)
   end
-
-  @prompt_file "/tmp/karkhana-prompt.txt"
 
   defp execute(args, sandbox_id, opts) do
     on_event = Keyword.get(opts, :on_event, fn _event -> :ok end)
     turn_timeout_ms = Keyword.get(opts, :turn_timeout_ms, Config.settings!().claude.turn_timeout_ms)
 
-    # Extract prompt from args and write to a file inside the sandbox.
+    # Write the prompt to a file inside the sandbox to avoid shell escaping.
     # The prompt contains markdown, URLs, parens, quotes — anything that
-    # would break shell escaping. Reading from file avoids all of that.
+    # would break shell interpolation.
     {prompt, other_args} = extract_prompt(args)
 
     with :ok <- Bhatti.write_file(sandbox_id, @prompt_file, prompt) do
       command = Config.settings!().claude.command
 
-      # other_args are simple flags (--verbose, --output-format, etc) — no
-      # special characters, no escaping needed. They go inside the bash -c
-      # single-quoted string so must NOT be individually single-quoted.
+      # Build the shell command. other_args are simple flags (--mode, --model, etc.)
+      # — no special characters. The prompt is read from file via $(cat ...).
       plain_args = Enum.join(other_args, " ")
+      shell_cmd = "#{command} -p \"$(cat #{@prompt_file})\" #{plain_args}"
 
-      # Use setsid to fully detach the process from the bhatti exec session.
-      # nohup alone isn't enough — bhatti's agent waits for stdout to close,
-      # and backgrounded processes can still hold pty references.
-      # setsid creates a new session, fully detaching from the controlling terminal.
-      # Capture both stdout and stderr in the output file.
-      # Stderr lines won't parse as JSON and will be skipped by the parser,
-      # but they'll be visible when debugging.
-      launch_cmd =
-        "rm -f #{@output_file} #{@output_file}.err && " <>
-        "setsid bash -c '#{command} -p \"$(cat #{@prompt_file})\" #{plain_args} " <>
-        "< /dev/null > #{@output_file} 2>#{@output_file}.err; " <>
-        "echo #{@done_marker}:$? >> #{@output_file}' " <>
-        "< /dev/null > /dev/null 2>&1 &"
+      cmd = ["bash", "-lc", shell_cmd]
 
-      Logger.info("Claude launch cmd (#{String.length(launch_cmd)} chars): #{String.slice(launch_cmd, 0, 120)}...")
+      Logger.info("Agent exec in sandbox #{sandbox_id}: #{String.slice(shell_cmd, 0, 120)}...")
 
-      case Bhatti.exec(sandbox_id, ["bash", "-c", launch_cmd], timeout_sec: 30) do
-        {:ok, _} ->
-          Logger.info("Claude launched in sandbox #{sandbox_id}, polling output...")
-          poll_output(sandbox_id, on_event, turn_timeout_ms)
+      # Track session_id and usage across the stream via process dictionary.
+      # This runs in a Task (one per agent dispatch), so the process dictionary
+      # is scoped and cleaned up on exit.
+      Process.put(:karkhana_session_id, nil)
+      Process.put(:karkhana_usage, nil)
+
+      on_line = fn line ->
+        case StreamParser.parse_line(line) do
+          {:ok, event} ->
+            sid = StreamParser.extract_session_id(event)
+            if sid, do: Process.put(:karkhana_session_id, sid)
+
+            usage = StreamParser.extract_usage(event)
+            if usage, do: Process.put(:karkhana_usage, usage)
+
+            on_event.(event)
+
+          {:error, _} ->
+            # Non-JSON line (stderr mixed in, debug output, etc.) — skip
+            :ok
+        end
+      end
+
+      result = Bhatti.exec_stream(sandbox_id, cmd, on_line,
+        timeout_sec: div(turn_timeout_ms, 1000))
+
+      session_id = Process.get(:karkhana_session_id)
+      usage = Process.get(:karkhana_usage)
+
+      case result do
+        {:ok, 0} ->
+          {:ok, %{session_id: session_id, exit_code: 0, usage: usage}}
+
+        {:ok, exit_code} ->
+          Logger.error("Agent exited with code #{exit_code} in sandbox #{sandbox_id}")
+          {:error, {:subprocess_exit, exit_code, ""}}
+
+        {:error, :timeout} ->
+          Logger.error("Agent timed out in sandbox #{sandbox_id}")
+          Bhatti.exec(sandbox_id, ["bash", "-c", "pkill -f 'pi\\|claude' 2>/dev/null"], timeout_sec: 5)
+          {:error, :turn_timeout}
 
         {:error, reason} ->
-          {:error, {:launch_failed, reason}}
+          {:error, reason}
       end
     end
   end
 
-  defp extract_prompt(args) do
-    extract_prompt(args, [])
-  end
-
+  defp extract_prompt(args), do: extract_prompt(args, [])
   defp extract_prompt(["-p", prompt | rest], acc), do: {prompt, Enum.reverse(acc) ++ rest}
   defp extract_prompt([arg | rest], acc), do: extract_prompt(rest, [arg | acc])
   defp extract_prompt([], acc), do: {"", Enum.reverse(acc)}
 
-  defp poll_output(sandbox_id, on_event, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    poll_loop(sandbox_id, on_event, deadline, 0, %{session_id: nil, usage: nil})
-  end
-
-  defp poll_loop(sandbox_id, on_event, deadline, lines_seen, state) do
-    now = System.monotonic_time(:millisecond)
-
-    if now >= deadline do
-      Bhatti.exec(sandbox_id, ["bash", "-c", "pkill -f 'pi\|claude' 2>/dev/null"], timeout_sec: 5)
-      stderr = read_stderr(sandbox_id)
-      Logger.error("Agent timed out in sandbox #{sandbox_id}. stderr: #{stderr}")
-      {:error, :turn_timeout}
-    else
-      Process.sleep(@poll_interval_ms)
-
-      # Read new lines from the output file
-      skip_cmd = if lines_seen > 0, do: "tail -n +#{lines_seen + 1}", else: "cat"
-      read_cmd = "#{skip_cmd} #{@output_file} 2>/dev/null"
-
-      case Bhatti.exec(sandbox_id, ["bash", "-c", read_cmd], timeout_sec: 15) do
-        {:ok, %{"exit_code" => 0, "stdout" => stdout}} ->
-          lines = String.split(stdout, "\n", trim: true)
-          {new_state, done_exit} = process_lines(lines, on_event, state)
-          new_lines_seen = lines_seen + length(lines)
-
-          case done_exit do
-            nil ->
-              poll_loop(sandbox_id, on_event, deadline, new_lines_seen, new_state)
-
-            0 ->
-              {:ok, %{session_id: new_state.session_id, exit_code: 0, usage: new_state.usage}}
-
-            code ->
-              # Read stderr for diagnostics
-              stderr = read_stderr(sandbox_id)
-              Logger.error("Agent exited with code #{code} in sandbox #{sandbox_id}. stderr: #{stderr}")
-              {:error, {:subprocess_exit, code, stderr}}
-          end
-
-        {:ok, _} ->
-          # File doesn't exist yet or read error — keep polling
-          poll_loop(sandbox_id, on_event, deadline, lines_seen, state)
-
-        {:error, reason} ->
-          Logger.warning("Poll read failed: #{inspect(reason)}, retrying...")
-          poll_loop(sandbox_id, on_event, deadline, lines_seen, state)
-      end
-    end
-  end
-
-  defp process_lines(lines, on_event, state) do
-    Enum.reduce(lines, {state, nil}, fn line, {acc_state, acc_exit} ->
-      cond do
-        String.starts_with?(line, @done_marker) ->
-          code = line |> String.split(":") |> List.last() |> String.trim() |> String.to_integer()
-          {acc_state, code}
-
-        true ->
-          case StreamParser.parse_line(line) do
-            {:ok, event} ->
-              session_id = StreamParser.extract_session_id(event) || acc_state.session_id
-              usage = StreamParser.extract_usage(event) || acc_state.usage
-              on_event.(event)
-              {%{acc_state | session_id: session_id, usage: usage}, acc_exit}
-
-            {:error, _} ->
-              {acc_state, acc_exit}
-          end
-      end
-    end)
-  end
-
-  defp build_first_turn_args(prompt) do
+  defp build_first_turn_args(prompt, opts) do
     settings = Config.settings!().claude
     command = settings.command || "pi"
 
     case detect_agent(command) do
-      :pi -> build_pi_args(prompt, settings)
+      :pi -> build_pi_args(prompt, settings, opts)
       :claude -> build_claude_args(prompt, settings)
     end
   end
 
-  defp build_resume_args(_session_id, prompt) do
+  defp build_resume_args(_session_id, prompt, opts) do
     # pi doesn't support --resume; each turn is independent.
     # Claude supports --resume but we use pi now.
     # For both: just send the prompt as a new invocation.
-    build_first_turn_args(prompt)
+    build_first_turn_args(prompt, opts)
   end
 
-  defp build_pi_args(prompt, settings) do
+  defp build_pi_args(prompt, settings, _opts) do
     base = [
       "-p", prompt,
       "--mode", "json",
@@ -220,12 +165,5 @@ defmodule SymphonyElixir.Claude.CLI do
 
   defp maybe_add_allowed_tools(args, tools) when is_list(tools) do
     args ++ ["--allowedTools" | [Enum.join(tools, ",")]]
-  end
-
-  defp read_stderr(sandbox_id) do
-    case Bhatti.exec(sandbox_id, ["bash", "-c", "cat #{@output_file}.err 2>/dev/null | tail -20"], timeout_sec: 10) do
-      {:ok, %{"stdout" => stderr}} -> String.trim(stderr)
-      _ -> "(could not read stderr)"
-    end
   end
 end
