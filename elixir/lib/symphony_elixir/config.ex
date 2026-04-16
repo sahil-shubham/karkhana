@@ -37,6 +37,24 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec pipeline_config() :: [map()]
+  def pipeline_config do
+    case Workflow.current() do
+      {:ok, %{config: %{"pipeline" => pipeline}}} when is_list(pipeline) ->
+        Enum.map(pipeline, fn entry ->
+          %{
+            state: entry["state"],
+            role: entry["role"] || "implementer",
+            only_after: entry["only_after"]
+          }
+        end)
+
+      _ ->
+        # Default: implementer for all states
+        [%{state: "Todo", role: "implementer"}, %{state: "In Progress", role: "implementer"}]
+    end
+  end
+
   @spec settings!() :: Schema.t()
   def settings! do
     case settings() do

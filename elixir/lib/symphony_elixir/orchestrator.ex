@@ -699,8 +699,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    role = role_for_issue(issue, state)
+
+    if is_nil(role) do
+      # Role dispatch skipped (e.g., only_after condition not met)
+      state
+    else
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host, role: role)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -712,6 +718,8 @@ defmodule SymphonyElixir.Orchestrator do
             pid: pid,
             ref: ref,
             identifier: issue.identifier,
+            role: role,
+            config_hash: compute_config_hash(role),
             issue: issue,
             worker_host: worker_host,
             workspace_path: nil,
@@ -750,6 +758,7 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
     end
   end
 
@@ -1156,6 +1165,64 @@ defmodule SymphonyElixir.Orchestrator do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
+  defp compute_config_hash(role_name) do
+    workflow_path = SymphonyElixir.Workflow.workflow_file_path()
+    base_dir = Path.dirname(workflow_path)
+    role_dir = Path.join(base_dir, "roles/#{role_name}")
+    skills_dir = Path.join(base_dir, "skills")
+
+    # Collect all config files that affect agent behavior
+    files =
+      [Path.join(role_dir, "ROLE.md"), Path.join(role_dir, "config.yaml")]
+      |> Enum.concat(list_skill_files(skills_dir))
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.sort()
+
+    content = Enum.map_join(files, fn f -> File.read!(f) end)
+    :crypto.hash(:sha256, content) |> Base.encode16(case: :lower) |> String.slice(0, 8)
+  rescue
+    _ -> nil
+  end
+
+  defp list_skill_files(skills_dir) do
+    if File.dir?(skills_dir) do
+      File.ls!(skills_dir)
+      |> Enum.flat_map(fn name ->
+        path = Path.join(skills_dir, name)
+        if File.dir?(path), do: [Path.join(path, "SKILL.md")], else: []
+      end)
+    else
+      []
+    end
+  end
+
+  defp role_for_issue(%Issue{state: issue_state}, %State{completed_runs: runs} = _state) do
+    pipeline = Config.pipeline_config()
+    normalized = normalize_issue_state(issue_state)
+
+    match = Enum.find(pipeline, fn entry ->
+      normalize_issue_state(entry.state || "") == normalized
+    end)
+
+    role = if match, do: match.role, else: "implementer"
+
+    # Check only_after: if configured, only dispatch this role if the last
+    # completed run for this issue was from the specified role
+    if match && match.only_after do
+      last_run = Enum.find(runs, &(&1.outcome == :success))
+      if last_run && last_run.role == match.only_after do
+        role
+      else
+        Logger.debug("Skipping role #{role}: only_after=#{match.only_after} but last run was #{inspect(last_run && last_run.role)}")
+        nil
+      end
+    else
+      role
+    end
+  end
+
+  defp role_for_issue(_issue, _state), do: "implementer"
+
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
@@ -1414,7 +1481,8 @@ defmodule SymphonyElixir.Orchestrator do
     run = %{
       issue_id: Map.get(running_entry, :issue, %{}) |> Map.get(:id),
       issue_identifier: running_entry.identifier,
-      role: "implementer",
+      role: Map.get(running_entry, :role, "implementer"),
+      config_hash: Map.get(running_entry, :config_hash),
       attempt: Map.get(running_entry, :retry_attempt, 0),
       sandbox_name: "karkhana-" <> String.replace(running_entry.identifier || "", ~r/[^A-Za-z0-9._-]/, "_"),
       session_id: running_entry.session_id,
