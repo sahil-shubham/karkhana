@@ -42,6 +42,17 @@ defmodule SymphonyElixir.Bhatti.Client do
     })
   end
 
+  @spec exec_detached(String.t(), [String.t()], keyword()) :: {:ok, map()} | {:error, term()}
+  def exec_detached(sandbox_id, cmd, opts \\ []) do
+    timeout_sec = Keyword.get(opts, :timeout_sec, 3600)
+
+    post("/sandboxes/#{sandbox_id}/exec", %{
+      "cmd" => cmd,
+      "timeout_sec" => timeout_sec,
+      "detach" => true
+    })
+  end
+
   @spec exec_stream(String.t(), [String.t()], (String.t() -> any()), keyword()) ::
           {:ok, integer()} | {:error, term()}
   def exec_stream(sandbox_id, cmd, on_stdout_line, opts \\ []) do

@@ -31,7 +31,7 @@ defmodule SymphonyElixir.OutcomeTracker do
         completedAt: { gte: "$SINCE" }
       }
       first: $first
-      orderBy: completedAt
+      orderBy: updatedAt
     ) {
       nodes {
         id
