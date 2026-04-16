@@ -115,7 +115,7 @@ case "${1:-start}" in
     ;;
 
   logs)
-    bhatti exec "$ORCH_NAME" --timeout 10 -- tail -50 /tmp/karkhana.log
+    bhatti exec "$ORCH_NAME" --timeout 10 -- tail -50 /tmp/karkhana.log.1
     ;;
 
   start|"")
