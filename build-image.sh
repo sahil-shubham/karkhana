@@ -11,7 +11,7 @@
 #   - git, curl, jq, gh
 set -euo pipefail
 
-IMAGE_NAME="${1:-karkhana-pi}"
+IMAGE_NAME="${1:-karkhana-pi-v3}"
 BUILD_SANDBOX="karkhana-build-$$"
 
 echo "=== Building image: $IMAGE_NAME ==="

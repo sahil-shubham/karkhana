@@ -120,7 +120,7 @@ case "${1:-start}" in
 
   start|"")
     echo "Creating orchestrator sandbox..."
-    bhatti create --name "$ORCH_NAME" --image karkhana-pi-v2 --cpus 2 --memory 2048 --disk-size 4096 --keep-hot
+    bhatti create --name "$ORCH_NAME" --image karkhana-pi-v3 --cpus 2 --memory 2048 --disk-size 4096 --keep-hot
 
     echo "Cloning karkhana repo (for WORKFLOW.md + .env)..."
     bhatti exec "$ORCH_NAME" --timeout 30 -- bash -lc "
