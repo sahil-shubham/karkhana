@@ -56,11 +56,39 @@ download_release() {
 
 
 
-start_orchestrator() {
-  # Stop any existing instance
+inject_env() {
+  # Write env vars into the release's env.sh so they're available to the BEAM.
+  # The release sources env.sh before every command (start, daemon, stop, etc.).
   bhatti exec "$ORCH_NAME" --timeout 10 -- bash -c '
-    source /home/lohar/karkhana/.env 2>/dev/null || true
-    export KARKHANA_WORKFLOW_PATH=/home/lohar/karkhana/elixir/WORKFLOW.md
+    source /home/lohar/karkhana/elixir/.env 2>/dev/null || true
+
+    # Find the env.sh (version may differ)
+    ENV_SH=$(find /home/lohar/karkhana-release/releases -name env.sh -type f | head -1)
+    if [ -z "$ENV_SH" ]; then
+      echo "ERROR: env.sh not found in release"
+      exit 1
+    fi
+
+    # Remove any previous karkhana env block, then append fresh
+    sed -i "/^# karkhana-env-start/,/^# karkhana-env-end/d" $ENV_SH
+
+    cat >> $ENV_SH <<ENVBLOCK
+# karkhana-env-start
+export LINEAR_API_KEY="$LINEAR_API_KEY"
+export LINEAR_BOT_API_KEY="${LINEAR_BOT_API_KEY:-$LINEAR_API_KEY}"
+export BHATTI_API_KEY="$BHATTI_API_KEY"
+export GH_TOKEN="$GH_TOKEN"
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+export KARKHANA_WORKFLOW_PATH=/home/lohar/karkhana/elixir/WORKFLOW.md
+# karkhana-env-end
+ENVBLOCK
+    echo "env.sh updated"
+  ' || true
+}
+
+start_orchestrator() {
+  inject_env
+  bhatti exec "$ORCH_NAME" --timeout 10 -- bash -c '
     /home/lohar/karkhana-release/bin/karkhana stop 2>/dev/null || true
     sleep 1
     /home/lohar/karkhana-release/bin/karkhana daemon

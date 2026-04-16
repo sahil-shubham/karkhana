@@ -1208,12 +1208,14 @@ defmodule SymphonyElixir.Orchestrator do
 
     # Check only_after: if configured, only dispatch this role if the last
     # completed run for this issue was from the specified role
-    if match && match.only_after do
+    only_after = if match, do: Map.get(match, :only_after), else: nil
+
+    if only_after do
       last_run = Enum.find(runs, &(&1.outcome == :success))
-      if last_run && last_run.role == match.only_after do
+      if last_run && last_run.role == only_after do
         role
       else
-        Logger.debug("Skipping role #{role}: only_after=#{match.only_after} but last run was #{inspect(last_run && last_run.role)}")
+        Logger.debug("Skipping role #{role}: only_after=#{only_after} but last run was #{inspect(last_run && last_run.role)}")
         nil
       end
     else
