@@ -53,7 +53,7 @@ case "${1:-start}" in
   start|"")
     echo "Creating orchestrator sandbox..."
     # Idempotent: bhatti returns existing sandbox if name exists
-    bhatti create --name "$ORCH_NAME" --image karkhana-pi --cpus 1 --memory 2048 --keep-hot
+    bhatti create --name "$ORCH_NAME" --image karkhana-pi-v2 --cpus 1 --memory 2048 --keep-hot
 
     echo "Installing Elixir + cloning karkhana..."
     bhatti exec "$ORCH_NAME" -- bash -lc '

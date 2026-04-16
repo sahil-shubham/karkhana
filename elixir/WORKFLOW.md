@@ -24,7 +24,7 @@ claude:
 bhatti:
   url: https://api.bhatti.sh
   api_key: $BHATTI_API_KEY
-  image: karkhana-pi
+  image: karkhana-pi-v2
   cpus: 2
   memory_mb: 2048
   disk_mb: 4096
