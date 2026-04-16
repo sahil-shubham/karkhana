@@ -32,12 +32,6 @@ bhatti:
 observability:
   dashboard_enabled: false
 
-pipeline:
-  - state: Todo
-    role: implementer
-  - state: In Progress
-    role: implementer
-
 hooks:
   timeout_ms: 180000
   after_create: |

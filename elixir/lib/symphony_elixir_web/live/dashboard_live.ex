@@ -256,7 +256,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <%= if Map.get(@payload, :completed_runs, []) == [] do %>
             <p class="empty-state">No completed runs yet.</p>
           <% else %>
-            <div class="table-wrap">
+            <div class="table-wrap" style="max-height: 400px; overflow-y: auto;">
               <table class="data-table" style="min-width: 800px;">
                 <thead>
                   <tr>
