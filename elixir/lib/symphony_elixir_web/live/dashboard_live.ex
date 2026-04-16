@@ -244,9 +244,69 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Recent runs</h2>
+              <p class="section-copy">Completed dispatch attempts with cost and outcome.</p>
+            </div>
+          </div>
+
+          <%= if Map.get(@payload, :completed_runs, []) == [] do %>
+            <p class="empty-state">No completed runs yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 800px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Outcome</th>
+                    <th>Tokens</th>
+                    <th>Cost</th>
+                    <th>Duration</th>
+                    <th>Attempt</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={run <- Map.get(@payload, :completed_runs, [])}>
+                    <td>
+                      <span class="issue-id"><%= run.issue_identifier %></span>
+                    </td>
+                    <td>
+                      <span class={outcome_badge_class(run.outcome)}>
+                        <%= run.outcome %>
+                      </span>
+                    </td>
+                    <td class="numeric">
+                      <div class="token-stack">
+                        <span><%= format_int(run.tokens.total) %></span>
+                        <span class="muted">cache: <%= format_int(run.tokens.cache_read) %></span>
+                      </div>
+                    </td>
+                    <td class="numeric">$<%= :erlang.float_to_binary(run.cost_usd || 0.0, decimals: 4) %></td>
+                    <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
+                    <td class="numeric"><%= run.attempt %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
       <% end %>
     </section>
     """
+  end
+
+  defp outcome_badge_class(:success), do: "status-badge status-badge-live"
+  defp outcome_badge_class("success"), do: "status-badge status-badge-live"
+  defp outcome_badge_class(_), do: "status-badge status-badge-offline"
+
+  defp format_duration(nil), do: "n/a"
+  defp format_duration(seconds) when is_number(seconds) do
+    minutes = div(trunc(seconds), 60)
+    secs = rem(trunc(seconds), 60)
+    if minutes > 0, do: "#{minutes}m #{secs}s", else: "#{secs}s"
   end
 
   defp load_payload do

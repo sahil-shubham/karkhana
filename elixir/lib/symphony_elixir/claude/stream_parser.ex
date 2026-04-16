@@ -33,16 +33,26 @@ defmodule SymphonyElixir.Claude.StreamParser do
   end
 
   defp normalize_usage(%{} = usage) do
-    # pi uses "input"/"output"/"totalTokens", claude uses "input_tokens"/"output_tokens"
+    # pi uses "input"/"output"/"totalTokens"/"cacheRead"/"cacheWrite",
+    # claude uses "input_tokens"/"output_tokens"
     input = get_int(usage, "input_tokens") || get_int(usage, "input")
     output = get_int(usage, "output_tokens") || get_int(usage, "output")
+    cache_read = get_int(usage, "cacheRead") || get_int(usage, "cache_read_tokens") || 0
+    cache_write = get_int(usage, "cacheWrite") || get_int(usage, "cache_write_tokens") || 0
     total = get_int(usage, "total_tokens") || get_int(usage, "totalTokens")
+
+    # Pi nests cost as usage.cost.total (dollars)
+    cost_map = Map.get(usage, "cost")
+    cost_usd = if is_map(cost_map), do: get_float(cost_map, "total"), else: nil
 
     if input || output || total do
       %{
         input_tokens: input || 0,
         output_tokens: output || 0,
-        total_tokens: total || (input || 0) + (output || 0)
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        total_tokens: total || (input || 0) + (output || 0),
+        cost_usd: cost_usd || 0.0
       }
     end
   end
@@ -84,6 +94,14 @@ defmodule SymphonyElixir.Claude.StreamParser do
     case Map.get(map, key) do
       v when is_integer(v) and v >= 0 -> v
       v when is_float(v) and v >= 0 -> round(v)
+      _ -> nil
+    end
+  end
+
+  defp get_float(map, key) do
+    case Map.get(map, key) do
+      v when is_float(v) -> v
+      v when is_integer(v) -> v * 1.0
       _ -> nil
     end
   end

@@ -19,6 +19,7 @@ defmodule SymphonyElixirWeb.Presenter do
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          completed_runs: Enum.map(Map.get(snapshot, :completed_runs, []), &run_payload/1),
           agent_totals: snapshot.agent_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -125,6 +126,21 @@ defmodule SymphonyElixirWeb.Presenter do
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
+  defp run_payload(run) do
+    %{
+      issue_identifier: run.issue_identifier,
+      role: run.role,
+      attempt: run.attempt,
+      tokens: run.tokens,
+      cost_usd: run.cost_usd,
+      duration_seconds: run.duration_seconds,
+      outcome: run.outcome,
+      error_message: run.error_message,
+      started_at: iso8601(run.started_at),
+      ended_at: iso8601(run.ended_at)
     }
   end
 

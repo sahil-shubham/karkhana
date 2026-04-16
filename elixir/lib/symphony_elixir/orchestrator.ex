@@ -42,7 +42,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       agent_totals: nil,
-      agent_rate_limits: nil
+      agent_rate_limits: nil,
+      completed_runs: []
     ]
   end
 
@@ -139,6 +140,7 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> record_completed_run(running_entry, :success)
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -152,7 +154,9 @@ defmodule SymphonyElixir.Orchestrator do
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              state
+              |> record_completed_run(running_entry, :error, inspect(reason))
+              |> schedule_issue_retry(issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
@@ -719,6 +723,9 @@ defmodule SymphonyElixir.Orchestrator do
             agent_input_tokens: 0,
             agent_output_tokens: 0,
             agent_total_tokens: 0,
+            agent_cache_read_tokens: 0,
+            agent_cache_write_tokens: 0,
+            agent_cost_usd: 0.0,
             agent_last_reported_input_tokens: 0,
             agent_last_reported_output_tokens: 0,
             agent_last_reported_total_tokens: 0,
@@ -1235,6 +1242,7 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       completed_runs: state.completed_runs,
        agent_totals: state.agent_totals,
        rate_limits: Map.get(state, :agent_rate_limits),
        polling: %{
@@ -1271,6 +1279,12 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :agent_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
+    # Extract cache + cost from raw usage (additive, not delta-tracked)
+    usage_from_event = extract_usage_from_update(update)
+    cache_read_delta = Map.get(usage_from_event, :cache_read_tokens, 0)
+    cache_write_delta = Map.get(usage_from_event, :cache_write_tokens, 0)
+    cost_delta = Map.get(usage_from_event, :cost_usd, 0.0)
+
     {
       Map.merge(running_entry, %{
         last_agent_timestamp: timestamp,
@@ -1281,6 +1295,9 @@ defmodule SymphonyElixir.Orchestrator do
         agent_input_tokens: agent_input_tokens + token_delta.input_tokens,
         agent_output_tokens: agent_output_tokens + token_delta.output_tokens,
         agent_total_tokens: agent_total_tokens + token_delta.total_tokens,
+        agent_cache_read_tokens: Map.get(running_entry, :agent_cache_read_tokens, 0) + cache_read_delta,
+        agent_cache_write_tokens: Map.get(running_entry, :agent_cache_write_tokens, 0) + cache_write_delta,
+        agent_cost_usd: Map.get(running_entry, :agent_cost_usd, 0.0) + cost_delta,
         agent_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         agent_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         agent_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
@@ -1289,6 +1306,11 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  # Extract cache and cost from the raw usage payload in an update event.
+  # These come from Pi's normalized usage (via stream_parser) in the :usage key.
+  defp extract_usage_from_update(%{usage: %{} = usage}), do: usage
+  defp extract_usage_from_update(_), do: %{}
 
   defp agent_pid_for_update(_existing, %{agent_pid: pid})
        when is_binary(pid),
@@ -1383,6 +1405,48 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_session_completion_totals(state, _running_entry), do: state
+
+  defp record_completed_run(state, running_entry, outcome, error_message \\ nil)
+  defp record_completed_run(state, running_entry, outcome, error_message)
+       when is_map(running_entry) do
+    now = DateTime.utc_now()
+
+    run = %{
+      issue_id: Map.get(running_entry, :issue, %{}) |> Map.get(:id),
+      issue_identifier: running_entry.identifier,
+      role: "implementer",
+      attempt: Map.get(running_entry, :retry_attempt, 0),
+      sandbox_name: "karkhana-" <> String.replace(running_entry.identifier || "", ~r/[^A-Za-z0-9._-]/, "_"),
+      session_id: running_entry.session_id,
+      tokens: %{
+        input: running_entry.agent_input_tokens,
+        output: running_entry.agent_output_tokens,
+        cache_read: Map.get(running_entry, :agent_cache_read_tokens, 0),
+        cache_write: Map.get(running_entry, :agent_cache_write_tokens, 0),
+        total: running_entry.agent_total_tokens
+      },
+      cost_usd: Map.get(running_entry, :agent_cost_usd, 0.0),
+      duration_seconds: running_seconds(running_entry.started_at, now),
+      outcome: outcome,
+      error_message: error_message,
+      started_at: running_entry.started_at,
+      ended_at: now
+    }
+
+    Logger.info(
+      "Run completed: #{run.issue_identifier} " <>
+      "outcome=#{outcome} " <>
+      "tokens=#{run.tokens.total} " <>
+      "cost=$#{:erlang.float_to_binary(run.cost_usd, decimals: 4)} " <>
+      "duration=#{run.duration_seconds}s"
+    )
+
+    # Keep last 100 runs in memory
+    runs = [run | state.completed_runs] |> Enum.take(100)
+    %{state | completed_runs: runs}
+  end
+
+  defp record_completed_run(state, _running_entry, _outcome, _error_message), do: state
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
