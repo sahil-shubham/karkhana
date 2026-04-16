@@ -12,6 +12,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @max_retries_permanent 0
+  @max_retries_logical 3
+  @max_retries_transient 5
+  @max_retries_unknown 5
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -774,6 +778,32 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+
+    # Check retry cap (skip for continuation retries — those are re-checks, not failures)
+    if metadata[:delay_type] != :continuation and retry_cap_reached?(next_attempt, metadata) do
+      identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+      error = pick_retry_error(previous_retry, metadata)
+      error_class = classify_error(to_string(error || ""))
+
+      Logger.error(
+        "Retry cap reached for issue_id=#{issue_id} " <>
+        "issue_identifier=#{identifier} " <>
+        "attempts=#{next_attempt} error_class=#{error_class} " <>
+        "error=#{error}"
+      )
+
+      post_failure_comment(issue_id, identifier, error, next_attempt, error_class)
+      return_state = release_issue_claim(state, issue_id)
+      # Cancel any existing timer
+      old_timer = Map.get(previous_retry, :timer_ref)
+      if is_reference(old_timer), do: Process.cancel_timer(old_timer)
+      return_state
+    else
+      do_schedule_issue_retry(state, issue_id, next_attempt, metadata, previous_retry)
+    end
+  end
+
+  defp do_schedule_issue_retry(state, issue_id, next_attempt, metadata, previous_retry) do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
@@ -936,6 +966,67 @@ defmodule SymphonyElixir.Orchestrator do
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
     min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
+  end
+
+  defp classify_error(error) when is_binary(error) do
+    cond do
+      String.contains?(error, "after_create_hook_failed") -> :permanent
+      String.contains?(error, "hook_failed") -> :permanent
+      String.contains?(error, "workflow_parse_error") -> :permanent
+      String.contains?(error, "template_render_error") -> :permanent
+      String.contains?(error, "sandbox creation failed") -> :transient
+      String.contains?(error, "retry poll failed") -> :transient
+      String.contains?(error, "failed to spawn agent") -> :transient
+      String.contains?(error, "no available orchestrator slots") -> :transient
+      String.contains?(error, "subprocess_exit") -> :logical
+      String.contains?(error, "turn_timeout") -> :logical
+      String.contains?(error, "stalled") -> :logical
+      String.contains?(error, "agent exited") -> :logical
+      true -> :unknown
+    end
+  end
+
+  defp classify_error(_), do: :unknown
+
+  defp max_retries_for_class(:permanent), do: @max_retries_permanent
+  defp max_retries_for_class(:logical), do: @max_retries_logical
+  defp max_retries_for_class(:transient), do: @max_retries_transient
+  defp max_retries_for_class(_), do: @max_retries_unknown
+
+  defp retry_cap_reached?(attempt, metadata) do
+    error_class = classify_error(to_string(metadata[:error] || ""))
+    attempt > max_retries_for_class(error_class)
+  end
+
+  defp post_failure_comment(issue_id, identifier, error, attempts, error_class) do
+    api_key = System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY")
+
+    if api_key do
+      body = """
+      ⚠️ **Karkhana failed after #{attempts} attempts**
+
+      ```
+      #{error || "unknown error"}
+      ```
+
+      **Error class:** #{error_class}
+      **Sandbox:** karkhana-#{identifier}
+
+      ---
+      **Handoff:**
+      - To retry → move to **Todo**
+      - To investigate → `bhatti shell karkhana-#{identifier}`
+      - To abandon → move to **Backlog**
+      """
+
+      case SymphonyElixir.Linear.Client.post_comment(issue_id, body, api_key) do
+        {:ok, _} -> :ok
+        {:error, reason} ->
+          Logger.warning("Failed to post failure comment for #{identifier}: #{inspect(reason)}")
+      end
+    else
+      Logger.warning("No LINEAR_BOT_API_KEY or LINEAR_API_KEY set, cannot post failure comment")
+    end
   end
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt

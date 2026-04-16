@@ -32,7 +32,7 @@ defmodule SymphonyElixir.CLITest do
     }
 
     assert {:error, banner} = CLI.evaluate(["WORKFLOW.md"], deps)
-    assert banner =~ "This Symphony implementation is a low key engineering preview."
+    assert banner =~ "coding agents in isolated VMs, managed through Linear."
     assert banner =~ "Codex will run without any guardrails."
     assert banner =~ "SymphonyElixir is not a supported product and is presented as-is."
     assert banner =~ @ack_flag
@@ -121,7 +121,7 @@ defmodule SymphonyElixir.CLITest do
     }
 
     assert {:error, message} = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
-    assert message =~ "Failed to start Symphony with workflow"
+    assert message =~ "Failed to start Karkhana with workflow"
     assert message =~ ":boom"
   end
 

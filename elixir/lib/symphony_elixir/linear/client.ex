@@ -184,6 +184,32 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @comment_mutation """
+  mutation KarkhanaPostComment($issueId: String!, $body: String!) {
+    commentCreate(input: { issueId: $issueId, body: $body }) {
+      success
+      comment { id }
+    }
+  }
+  """
+
+  @spec post_comment(String.t(), String.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def post_comment(issue_id, body, api_key) when is_binary(issue_id) and is_binary(body) and is_binary(api_key) do
+    payload = build_graphql_payload(@comment_mutation, %{"issueId" => issue_id, "body" => body}, "KarkhanaPostComment")
+    headers = [{"Authorization", api_key}, {"Content-Type", "application/json"}]
+
+    case Req.post(Config.settings!().tracker.endpoint, headers: headers, json: payload, connect_options: [timeout: 30_000]) do
+      {:ok, %{status: 200, body: %{"data" => %{"commentCreate" => %{"success" => true}}} = body}} ->
+        {:ok, body}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:linear_api_status, status, body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do

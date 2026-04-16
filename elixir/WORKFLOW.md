@@ -29,6 +29,9 @@ bhatti:
   memory_mb: 2048
   disk_mb: 4096
 
+observability:
+  dashboard_enabled: false
+
 hooks:
   timeout_ms: 180000
   after_create: |

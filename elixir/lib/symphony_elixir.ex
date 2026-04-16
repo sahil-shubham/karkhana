@@ -1,6 +1,6 @@
 defmodule SymphonyElixir do
   @moduledoc """
-  Entry point for the Symphony orchestrator.
+  Entry point for the Karkhana orchestrator.
   """
 
   @doc """

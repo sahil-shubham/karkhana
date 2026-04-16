@@ -1,6 +1,6 @@
 defmodule SymphonyElixirWeb.ObservabilityApiController do
   @moduledoc """
-  JSON API for Symphony observability data.
+  JSON API for Karkhana observability data.
   """
 
   use Phoenix.Controller, formats: [:json]
