@@ -86,6 +86,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_claude_turns(sandbox_id, issue, claude_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    role_config = load_role_config(Keyword.get(opts, :role, "implementer"))
+    opts = Keyword.put(opts, :role_config, role_config)
 
     do_run_claude_turns(sandbox_id, issue, claude_update_recipient, opts, issue_state_fetcher, 1, max_turns, nil)
   end
@@ -97,7 +99,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     cli_opts = [
       on_event: claude_event_handler(claude_update_recipient, issue),
-      attempt: attempt
+      attempt: attempt,
+      role_config: Keyword.get(opts, :role_config)
     ]
 
     result =
@@ -174,6 +177,62 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  # Load role configuration from roles/<name>/ directory.
+  # Falls back gracefully if the directory doesn't exist (backwards compat).
+  defp load_role_config(role_name) when is_binary(role_name) do
+    workflow_path = SymphonyElixir.Workflow.workflow_file_path()
+    base_dir = Path.dirname(workflow_path)
+    role_dir = Path.join(base_dir, "roles/#{role_name}")
+    skills_dir = Path.join(base_dir, "skills")
+
+    role_md = Path.join(role_dir, "ROLE.md")
+    config_yaml = Path.join(role_dir, "config.yaml")
+
+    if File.exists?(role_md) do
+      # Read role prompt (for --append-system-prompt)
+      system_prompt_file = role_md
+
+      # Read config.yaml if it exists
+      {tools, thinking} =
+        if File.exists?(config_yaml) do
+          case YamlElixir.read_from_file(config_yaml) do
+            {:ok, config} ->
+              tools = case config["tools"] do
+                list when is_list(list) -> Enum.join(list, ",")
+                _ -> nil
+              end
+              {tools, config["thinking"]}
+
+            _ -> {nil, nil}
+          end
+        else
+          {nil, nil}
+        end
+
+      # Collect skill directories
+      skill_dirs = if File.dir?(skills_dir) do
+        File.ls!(skills_dir)
+        |> Enum.map(&Path.join(skills_dir, &1))
+        |> Enum.filter(&File.dir?/1)
+      else
+        []
+      end
+
+      Logger.info("Loaded role config: #{role_name} (#{length(skill_dirs)} skills)")
+
+      %{
+        name: role_name,
+        system_prompt_file: system_prompt_file,
+        tools: tools,
+        thinking: thinking,
+        skill_dirs: skill_dirs
+      }
+    else
+      Logger.debug("No role directory for #{role_name}, using WORKFLOW.md prompt")
+      nil
+    end
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = String.downcase(String.trim(state_name))

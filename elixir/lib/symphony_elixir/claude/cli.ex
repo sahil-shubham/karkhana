@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Claude.CLI do
   alias SymphonyElixir.Config
 
   @prompt_file "/tmp/karkhana-prompt.txt"
+  @system_prompt_file "/tmp/karkhana-system-prompt.txt"
   @session_dir "/home/lohar/karkhana-sessions"
 
   @type run_result :: %{
@@ -59,13 +60,27 @@ defmodule SymphonyElixir.Claude.CLI do
       other_args
     end
 
-    with :ok <- Bhatti.write_file(sandbox_id, @prompt_file, prompt) do
+    # Handle role config: may need to write system prompt file to sandbox
+    role_config = Keyword.get(opts, :role_config)
+    {role_setup, role_args} = role_config_args(role_config)
+    other_args = other_args ++ role_args
+
+    with :ok <- Bhatti.write_file(sandbox_id, @prompt_file, prompt),
+         :ok <- write_role_files(sandbox_id, role_setup) do
       command = Config.settings!().claude.command
 
       # Build the shell command. other_args are simple flags (--mode, --model, etc.)
-      # — no special characters. The prompt is read from file via $(cat ...).
+      # The prompt and system prompt are read from files via $(cat ...) to avoid escaping.
       plain_args = Enum.join(other_args, " ")
-      shell_cmd = "#{command} -p \"$(cat #{@prompt_file})\" #{plain_args}"
+
+      system_prompt_part =
+        if Enum.any?(role_setup, &match?({:write_system_prompt, _}, &1)) do
+          " --append-system-prompt \"$(cat #{@system_prompt_file})\""
+        else
+          ""
+        end
+
+      shell_cmd = "#{command} -p \"$(cat #{@prompt_file})\"#{system_prompt_part} #{plain_args}"
 
       cmd = ["bash", "-lc", shell_cmd]
 
@@ -119,6 +134,17 @@ defmodule SymphonyElixir.Claude.CLI do
     end
   end
 
+  defp write_role_files(_sandbox_id, []), do: :ok
+  defp write_role_files(sandbox_id, setup_cmds) do
+    Enum.reduce_while(setup_cmds, :ok, fn
+      {:write_system_prompt, content}, :ok ->
+        case Bhatti.write_file(sandbox_id, @system_prompt_file, content) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+    end)
+  end
+
   defp extract_prompt(args), do: extract_prompt(args, [])
   defp extract_prompt(["-p", prompt | rest], acc), do: {prompt, Enum.reverse(acc) ++ rest}
   defp extract_prompt([arg | rest], acc), do: extract_prompt(rest, [arg | acc])
@@ -155,6 +181,26 @@ defmodule SymphonyElixir.Claude.CLI do
 
     base
     |> maybe_add_option(settings.model, "--model")
+  end
+
+  # Role config is handled specially: the system prompt content is written
+  # to a file in the sandbox (like the main prompt) to avoid shell escaping.
+  # Returns {extra_setup_cmds, extra_args}
+  defp role_config_args(nil), do: {[], []}
+  defp role_config_args(config) when is_map(config) do
+    extra_args =
+      []
+      |> maybe_add_option(config[:thinking], "--thinking")
+      |> maybe_add_option(config[:tools], "--tools")
+
+    # If there's a system prompt file, we'll write it and reference it
+    has_system_prompt = config[:system_prompt_file] && File.exists?(config[:system_prompt_file])
+
+    if has_system_prompt do
+      {[{:write_system_prompt, File.read!(config[:system_prompt_file])}], extra_args}
+    else
+      {[], extra_args}
+    end
   end
 
   defp build_claude_args(prompt, settings) do
