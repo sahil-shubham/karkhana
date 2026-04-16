@@ -132,6 +132,27 @@ defmodule SymphonyElixir.Bhatti.Client do
     {remainder, new_exit}
   end
 
+  @spec read_file(String.t(), String.t()) :: {:ok, binary()} | {:error, term()}
+  def read_file(sandbox_id, path) do
+    %{url: base_url, api_key: api_key} = config()
+    url = base_url <> "/sandboxes/#{sandbox_id}/files?path=#{URI.encode(path)}"
+
+    headers = [
+      {~c"authorization", ~c"Bearer #{api_key}"}
+    ]
+
+    :inets.start()
+    :ssl.start()
+
+    request = {String.to_charlist(url), headers}
+
+    case :httpc.request(:get, request, [timeout: @timeout_ms], body_format: :binary) do
+      {:ok, {{_, 200, _}, _, body}} -> {:ok, body}
+      {:ok, {{_, status, _}, _, body}} -> {:error, {:http_error, status, body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec write_file(String.t(), String.t(), binary()) :: :ok | {:error, term()}
   def write_file(sandbox_id, path, content) do
     %{url: base_url, api_key: api_key} = config()

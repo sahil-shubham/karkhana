@@ -45,10 +45,16 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @session_dir "/home/lohar/karkhana-sessions"
+  @session_archive_dir "/home/lohar/karkhana/sessions"
+
   @spec cleanup_sandbox(String.t()) :: :ok | {:error, term()}
   def cleanup_sandbox(sandbox_name) when is_binary(sandbox_name) do
     case find_sandbox_by_name(sandbox_name) do
       {:ok, %{"id" => sandbox_id}} ->
+        # Extract session files before destroying
+        extract_sessions(sandbox_id, sandbox_name)
+
         # Run before_remove hook best-effort
         hook = Config.settings!().hooks.before_remove
         if hook do
@@ -176,6 +182,44 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Extract Pi session files from the sandbox before destruction.
+  # Sessions are the complete conversation transcript — every prompt, tool call,
+  # model response. Stored on the orchestrator for post-hoc analysis.
+  defp extract_sessions(sandbox_id, sandbox_name) do
+    archive_dir = Path.join(@session_archive_dir, sandbox_name)
+    File.mkdir_p!(archive_dir)
+
+    # List session files in the sandbox
+    case Client.exec(sandbox_id, ["bash", "-c", "ls #{@session_dir}/*.jsonl 2>/dev/null"], timeout_sec: 10) do
+      {:ok, %{"exit_code" => 0, "stdout" => stdout}} ->
+        stdout
+        |> String.split("\n", trim: true)
+        |> Enum.each(fn remote_path ->
+          filename = Path.basename(remote_path)
+          local_path = Path.join(archive_dir, filename)
+
+          # Skip if already extracted (idempotent across retries)
+          unless File.exists?(local_path) do
+            case Client.read_file(sandbox_id, remote_path) do
+              {:ok, content} ->
+                File.write!(local_path, content)
+                Logger.info("Extracted session #{filename} from #{sandbox_name}")
+
+              {:error, reason} ->
+                Logger.warning("Failed to extract session #{filename} from #{sandbox_name}: #{inspect(reason)}")
+            end
+          end
+        end)
+
+      _ ->
+        # No sessions or sandbox unreachable — not an error
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("Session extraction failed for #{sandbox_name}: #{Exception.message(error)}")
   end
 
   defp safe_identifier(%Issue{identifier: id}) when is_binary(id), do: sanitize(id)
