@@ -27,8 +27,8 @@ defmodule KarkhanaWeb.WebhookController do
       send(orchestrator(), {:tracker_event, event})
 
       Karkhana.Store.insert_issue_event(%{
-        issue_id: event.issue_id,
-        issue_identifier: event.issue_identifier || "unknown",
+        issue_id: event.issue_id || "unknown",
+        issue_identifier: event.issue_identifier || event.issue_id || "unknown",
         event: event.type,
         mode: nil,
         config_hash: nil,
