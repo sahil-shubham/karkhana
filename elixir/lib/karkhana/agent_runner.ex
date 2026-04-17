@@ -6,7 +6,7 @@ defmodule Karkhana.AgentRunner do
   require Logger
   alias Karkhana.Claude.CLI, as: ClaudeCLI
   alias Karkhana.Claude.StreamParser
-  alias Karkhana.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias Karkhana.{Config, Linear.Issue, Protocol, PromptBuilder, Tracker, Workspace}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, claude_update_recipient \\ nil, opts \\ []) do
@@ -15,6 +15,18 @@ defmodule Karkhana.AgentRunner do
     case Workspace.create_for_issue(issue) do
       {:ok, sandbox_id} ->
         try do
+          # Resolve mode from .karkhana/ protocol or fall back to default
+          {mode, mode_prompt} = resolve_mode(sandbox_id, issue)
+          opts = Keyword.merge(opts, mode: mode, mode_prompt: mode_prompt)
+
+          # Report mode to orchestrator for tracking
+          send_runtime_info(claude_update_recipient, issue, %{
+            mode: mode,
+            sandbox_id: sandbox_id
+          })
+
+          Logger.info("Resolved mode=#{mode} for #{issue_context(issue)}")
+
           with :ok <- Workspace.run_before_run_hook(sandbox_id, issue),
                :ok <- send_phase_update(claude_update_recipient, issue, :claude_starting),
                :ok <- run_claude_turns(sandbox_id, issue, claude_update_recipient, opts) do
@@ -183,6 +195,47 @@ defmodule Karkhana.AgentRunner do
   end
 
   defp active_issue_state?(_), do: false
+
+  defp resolve_mode(sandbox_id, issue) do
+    workspace = Config.settings!().workspace.root
+
+    case Protocol.load(workspace) do
+      {:ok, protocol} ->
+        # Build an artifact checker that execs into the sandbox
+        checker = fn cmd ->
+          Karkhana.Bhatti.Client.exec_check(sandbox_id, cmd)
+        end
+
+        mode = Protocol.resolve_mode(protocol, issue, checker)
+        {mode.name, mode.prompt_content}
+
+      {:error, :not_found} ->
+        # No .karkhana/ — use WORKFLOW.md with label-based mode hint
+        mode_from_labels(issue)
+
+      {:error, reason} ->
+        Logger.warning("Failed to load .karkhana/ protocol: #{inspect(reason)}; using default mode")
+        {"default", nil}
+    end
+  end
+
+  defp mode_from_labels(%Issue{labels: labels}) when is_list(labels) do
+    cond do
+      "qa" in labels -> {"qa", nil}
+      "debug" in labels -> {"debugging", nil}
+      "plan" in labels -> {"planning", nil}
+      true -> {"default", nil}
+    end
+  end
+
+  defp mode_from_labels(_), do: {"default", nil}
+
+  defp send_runtime_info(recipient, %Issue{id: issue_id}, info)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:worker_runtime_info, issue_id, info})
+  end
+
+  defp send_runtime_info(_, _, _), do: :ok
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"

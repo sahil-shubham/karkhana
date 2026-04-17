@@ -1,6 +1,13 @@
 defmodule Karkhana.PromptBuilder do
   @moduledoc """
   Builds agent prompts from Linear issue data.
+
+  Supports two modes:
+  - Standard: renders the WORKFLOW.md prompt template
+  - Protocol: renders a mode-specific prompt from .karkhana/modes/
+
+  In both cases, the template receives {{ issue.* }}, {{ attempt }},
+  and {{ mode }} variables. Labels are available as {{ issue.labels }}.
   """
 
   alias Karkhana.{Config, Workflow}
@@ -9,15 +16,21 @@ defmodule Karkhana.PromptBuilder do
 
   @spec build_prompt(Karkhana.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
+    mode = Keyword.get(opts, :mode)
+    mode_prompt = Keyword.get(opts, :mode_prompt)
+
     template =
-      Workflow.current()
-      |> prompt_template!()
-      |> parse_template!()
+      if mode_prompt do
+        parse_template!(mode_prompt)
+      else
+        Workflow.current() |> prompt_template!() |> parse_template!()
+      end
 
     template
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
+        "mode" => mode || "default",
         "issue" => issue |> Map.from_struct() |> to_solid_map()
       },
       @render_opts

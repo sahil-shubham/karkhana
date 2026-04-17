@@ -182,6 +182,8 @@ defmodule Karkhana.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:mode, runtime_info[:mode])
+          |> maybe_put_runtime_value(:sandbox_id, runtime_info[:sandbox_id])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -741,6 +743,15 @@ defmodule Karkhana.Orchestrator do
             agent_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            mode: nil,
+            config_hash: Karkhana.WorkflowStore.config_hash(),
+            sandbox_id: nil,
+            labels: Issue.label_names(issue),
+            artifacts_before: nil,
+            artifacts_after: nil,
+            gate: nil,
+            gate_result: nil,
+            gate_output: nil,
             started_at: DateTime.utc_now()
           })
 

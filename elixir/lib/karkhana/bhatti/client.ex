@@ -42,6 +42,20 @@ defmodule Karkhana.Bhatti.Client do
     })
   end
 
+  @doc """
+  Run a command and return true if exit code is 0, false otherwise.
+  Used for artifact existence checks in mode resolution.
+  """
+  @spec exec_check(String.t(), String.t(), keyword()) :: boolean()
+  def exec_check(sandbox_id, cmd, opts \\ []) do
+    timeout_sec = Keyword.get(opts, :timeout_sec, 10)
+
+    case exec(sandbox_id, ["bash", "-c", cmd], timeout_sec: timeout_sec) do
+      {:ok, %{"exit_code" => 0}} -> true
+      _ -> false
+    end
+  end
+
   @spec exec_detached(String.t(), [String.t()], keyword()) :: {:ok, map()} | {:error, term()}
   def exec_detached(sandbox_id, cmd, opts \\ []) do
     timeout_sec = Keyword.get(opts, :timeout_sec, 3600)
