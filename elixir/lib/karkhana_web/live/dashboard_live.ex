@@ -106,6 +106,83 @@ defmodule KarkhanaWeb.DashboardLive do
           </article>
         </section>
 
+        <%= if Map.get(@payload, :methodology) do %>
+          <% m = @payload.methodology %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Methodology</h2>
+                <p class="section-copy">Mode distribution, gate pass rates, and config changes.</p>
+              </div>
+            </div>
+
+            <div class="metric-grid">
+              <article class="metric-card">
+                <p class="metric-label">Total runs</p>
+                <p class="metric-value numeric"><%= m.total || 0 %></p>
+              </article>
+
+              <%= for {mode, count} <- Map.get(m, :by_mode, %{}) do %>
+                <article class="metric-card">
+                  <p class="metric-label"><%= mode || "default" %></p>
+                  <p class="metric-value numeric"><%= count %></p>
+                  <p class="metric-detail">runs</p>
+                </article>
+              <% end %>
+            </div>
+
+            <%= if Map.get(m, :gate_pass_rate, %{}) != %{} do %>
+              <div class="metric-grid" style="margin-top: 1rem;">
+                <%= for {gate, rate} <- Map.get(m, :gate_pass_rate, %{}) do %>
+                  <article class="metric-card">
+                    <p class="metric-label"><%= gate %></p>
+                    <p class="metric-value numeric"><%= Float.round((rate || 0) * 100, 0) %>%%</p>
+                    <p class="metric-detail">pass rate</p>
+                  </article>
+                <% end %>
+              </div>
+            <% end %>
+
+            <%= if Map.get(m, :avg_cost_by_mode, %{}) != %{} do %>
+              <div class="metric-grid" style="margin-top: 1rem;">
+                <%= for {mode, cost} <- Map.get(m, :avg_cost_by_mode, %{}) do %>
+                  <article class="metric-card">
+                    <p class="metric-label"><%= mode || "default" %></p>
+                    <p class="metric-value numeric">$<%= :erlang.float_to_binary((cost || 0.0) + 0.0, decimals: 2) %></p>
+                    <p class="metric-detail">avg cost</p>
+                  </article>
+                <% end %>
+              </div>
+            <% end %>
+
+            <%= if Map.get(m, :recent_config_changes, []) != [] do %>
+              <div style="margin-top: 1rem;">
+                <p class="metric-label" style="margin-bottom: 0.5rem;">Config changes</p>
+                <div class="table-wrap">
+                  <table class="data-table" style="min-width: 500px;">
+                    <thead>
+                      <tr>
+                        <th>From</th>
+                        <th>To</th>
+                        <th>Files</th>
+                        <th>At</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr :for={c <- Map.get(m, :recent_config_changes, [])}>
+                        <td class="mono"><%= short_hash(c.previous_hash) %></td>
+                        <td class="mono"><%= short_hash(c.config_hash) %></td>
+                        <td><%= Enum.join(c.changed_files || [], ", ") %></td>
+                        <td class="mono"><%= c.inserted_at %></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            <% end %>
+          </section>
+        <% end %>
+
         <section class="section-card">
           <div class="section-header">
             <div>
@@ -141,6 +218,7 @@ defmodule KarkhanaWeb.DashboardLive do
                 <thead>
                   <tr>
                     <th>Issue</th>
+                    <th>Mode</th>
                     <th>State</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
@@ -155,6 +233,9 @@ defmodule KarkhanaWeb.DashboardLive do
                         <span class="issue-id"><%= entry.issue_identifier %></span>
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
+                    </td>
+                    <td>
+                      <span class="mode-badge"><%= Map.get(entry, :mode) || "—" %></span>
                     </td>
                     <td>
                       <span class={state_badge_class(entry.state)}>
@@ -261,11 +342,12 @@ defmodule KarkhanaWeb.DashboardLive do
                 <thead>
                   <tr>
                     <th>Issue</th>
+                    <th>Mode</th>
                     <th>Outcome</th>
+                    <th>Gate</th>
                     <th>Tokens</th>
                     <th>Cost</th>
                     <th>Duration</th>
-                    <th>Attempt</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -274,9 +356,19 @@ defmodule KarkhanaWeb.DashboardLive do
                       <span class="issue-id"><%= run.issue_identifier %></span>
                     </td>
                     <td>
+                      <span class="mode-badge"><%= Map.get(run, :mode) || "—" %></span>
+                    </td>
+                    <td>
                       <span class={outcome_badge_class(run.outcome)}>
                         <%= run.outcome %>
                       </span>
+                    </td>
+                    <td>
+                      <%= case Map.get(run, :gate_result) do %>
+                        <% "pass" -> %><span class="status-badge status-badge-live">✓</span>
+                        <% "fail" -> %><span class="status-badge status-badge-offline">✗</span>
+                        <% _ -> %><span class="muted">—</span>
+                      <% end %>
                     </td>
                     <td class="numeric">
                       <div class="token-stack">
@@ -286,7 +378,6 @@ defmodule KarkhanaWeb.DashboardLive do
                     </td>
                     <td class="numeric">$<%= :erlang.float_to_binary(run.cost_usd || 0.0, decimals: 4) %></td>
                     <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
-                    <td class="numeric"><%= run.attempt %></td>
                   </tr>
                 </tbody>
               </table>
@@ -417,4 +508,8 @@ defmodule KarkhanaWeb.DashboardLive do
 
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+
+  defp short_hash(nil), do: "—"
+  defp short_hash(hash) when is_binary(hash) and byte_size(hash) > 8, do: binary_part(hash, 0, 8)
+  defp short_hash(hash) when is_binary(hash), do: hash
 end

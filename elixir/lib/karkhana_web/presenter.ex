@@ -102,6 +102,7 @@ defmodule KarkhanaWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      mode: Map.get(entry, :mode),
       state: entry.state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
