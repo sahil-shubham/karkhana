@@ -224,6 +224,16 @@ defmodule Karkhana.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info({:tracker_event, %Karkhana.Tracker.Event{} = event}, state) do
+    Logger.info("Tracker event: #{event.type} issue=#{event.issue_identifier || event.issue_id}")
+
+    # Trigger a poll cycle to evaluate whether to dispatch.
+    # The event tells us something changed — the poll cycle
+    # fetches fresh state and decides what to do.
+    state = schedule_tick(state, 0)
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}

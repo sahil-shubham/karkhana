@@ -14,6 +14,11 @@ defmodule KarkhanaWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
+  # Webhook endpoints — no CSRF, need raw body for HMAC verification
+  scope "/webhooks", KarkhanaWeb do
+    post("/linear", WebhookController, :linear)
+  end
+
   scope "/", KarkhanaWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
     get("/vendor/phoenix_html/phoenix_html.js", StaticAssetController, :phoenix_html_js)
