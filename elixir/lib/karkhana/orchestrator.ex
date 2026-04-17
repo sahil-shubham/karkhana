@@ -184,6 +184,9 @@ defmodule Karkhana.Orchestrator do
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
           |> maybe_put_runtime_value(:mode, runtime_info[:mode])
           |> maybe_put_runtime_value(:sandbox_id, runtime_info[:sandbox_id])
+          |> maybe_put_runtime_value(:gate, runtime_info[:gate])
+          |> maybe_put_runtime_value(:gate_result, runtime_info[:gate_result])
+          |> maybe_put_runtime_value(:gate_output, runtime_info[:gate_output])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}

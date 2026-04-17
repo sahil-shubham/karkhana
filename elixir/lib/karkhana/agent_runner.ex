@@ -29,7 +29,8 @@ defmodule Karkhana.AgentRunner do
 
           with :ok <- Workspace.run_before_run_hook(sandbox_id, issue),
                :ok <- send_phase_update(claude_update_recipient, issue, :claude_starting),
-               :ok <- run_claude_turns(sandbox_id, issue, claude_update_recipient, opts) do
+               :ok <- run_claude_turns(sandbox_id, issue, claude_update_recipient, opts),
+               :ok <- run_gate(sandbox_id, issue, opts, claude_update_recipient) do
             :ok
           else
             {:error, reason} ->
@@ -195,6 +196,74 @@ defmodule Karkhana.AgentRunner do
   end
 
   defp active_issue_state?(_), do: false
+
+  defp run_gate(sandbox_id, issue, opts, recipient) do
+    mode = Keyword.get(opts, :mode, "default")
+    workspace = Config.settings!().workspace.root
+
+    gate_script =
+      case Protocol.load(workspace) do
+        {:ok, protocol} ->
+          # Find the gate for the current mode
+          matched = Enum.find(protocol.modes, fn m ->
+            mode_name_matches?(m, mode)
+          end)
+
+          if matched && matched.gate do
+            gate_path = Path.join(protocol.dir, matched.gate)
+
+            case File.read(gate_path) do
+              {:ok, script} -> script
+              {:error, _} -> nil
+            end
+          end
+
+        {:error, _} ->
+          nil
+      end
+
+    if gate_script do
+      Logger.info("Running gate for mode=#{mode} #{issue_context(issue)}")
+
+      case Karkhana.Bhatti.Client.exec(sandbox_id, ["bash", "-c", gate_script], timeout_sec: 60) do
+        {:ok, %{"exit_code" => 0, "stdout" => output}} ->
+          Logger.info("Gate passed for #{issue_context(issue)}: #{String.trim(output)}")
+          send_gate_result(recipient, issue, mode, :pass, String.trim(output))
+          :ok
+
+        {:ok, %{"exit_code" => code} = result} ->
+          output = Map.get(result, "stdout", "") <> "\n" <> Map.get(result, "stderr", "")
+          Logger.warning("Gate failed (exit #{code}) for #{issue_context(issue)}: #{String.trim(output)}")
+          send_gate_result(recipient, issue, mode, :fail, String.trim(output))
+          {:error, {:gate_failed, mode, code, String.trim(output)}}
+
+        {:error, reason} ->
+          Logger.warning("Gate exec failed for #{issue_context(issue)}: #{inspect(reason)}")
+          send_gate_result(recipient, issue, mode, :fail, inspect(reason))
+          {:error, {:gate_failed, mode, :exec_error, inspect(reason)}}
+      end
+    else
+      # No gate defined for this mode — pass through
+      :ok
+    end
+  end
+
+  defp mode_name_matches?(%{match: %{"label" => label}}, mode), do: label == mode
+  defp mode_name_matches?(%{prompt: prompt}, mode) when is_binary(prompt) do
+    prompt |> Path.basename() |> Path.rootname() == mode
+  end
+  defp mode_name_matches?(_, _), do: false
+
+  defp send_gate_result(recipient, %Issue{id: issue_id}, mode, result, output)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:worker_runtime_info, issue_id, %{
+      gate: mode,
+      gate_result: result,
+      gate_output: output
+    }})
+  end
+
+  defp send_gate_result(_, _, _, _, _), do: :ok
 
   defp resolve_mode(sandbox_id, issue) do
     workspace = Config.settings!().workspace.root

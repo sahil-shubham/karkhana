@@ -167,6 +167,34 @@ defmodule Karkhana.ProtocolTest do
     end
   end
 
+  describe "gate resolution" do
+    test "mode with gate returns gate path", %{project: project, karkhana: karkhana, modes_dir: modes_dir, gates_dir: gates_dir} do
+      write_workflow(karkhana)
+      write_mode_prompt(modes_dir, "planning.md", "plan")
+      File.write!(Path.join(gates_dir, "plan-ready.sh"), "#!/bin/bash\necho PASS\nexit 0")
+
+      {:ok, protocol} = Protocol.load(project)
+      mode = Protocol.resolve_mode(protocol, make_issue())
+
+      assert mode.gate == "gates/plan-ready.sh"
+
+      # The gate script file exists and is readable
+      gate_path = Path.join(protocol.dir, mode.gate)
+      assert {:ok, script} = File.read(gate_path)
+      assert script =~ "PASS"
+    end
+
+    test "mode without gate returns nil gate", %{project: project, karkhana: karkhana, modes_dir: modes_dir} do
+      write_workflow(karkhana)
+      write_mode_prompt(modes_dir, "qa.md", "qa")
+
+      {:ok, protocol} = Protocol.load(project)
+      mode = Protocol.resolve_mode(protocol, make_issue(["qa"]))
+
+      assert mode.gate == nil
+    end
+  end
+
   describe "prompt builder integration" do
     test "mode prompt renders with issue variables", %{project: project, karkhana: karkhana, modes_dir: modes_dir} do
       write_workflow(karkhana)
