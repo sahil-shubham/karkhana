@@ -99,7 +99,10 @@ defmodule Karkhana.AgentRunner do
   defp run_claude_turns(sandbox_id, issue, claude_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-    do_run_claude_turns(sandbox_id, issue, claude_update_recipient, opts, issue_state_fetcher, 1, max_turns, nil)
+
+    # Check for a previous session to resume (cross-dispatch continuity)
+    previous_session_id = lookup_previous_session(issue)
+    do_run_claude_turns(sandbox_id, issue, claude_update_recipient, opts, issue_state_fetcher, 1, max_turns, previous_session_id)
   end
 
   defp do_run_claude_turns(sandbox_id, issue, claude_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, session_id) do
@@ -264,6 +267,19 @@ defmodule Karkhana.AgentRunner do
   end
 
   defp send_gate_result(_, _, _, _, _), do: :ok
+
+  defp lookup_previous_session(%Issue{identifier: identifier}) when is_binary(identifier) do
+    case Karkhana.Store.last_session_id(identifier) do
+      {:ok, session_id} when is_binary(session_id) ->
+        Logger.info("Found previous session #{session_id} for #{identifier}")
+        session_id
+
+      _ ->
+        nil
+    end
+  end
+
+  defp lookup_previous_session(_), do: nil
 
   defp resolve_mode(sandbox_id, issue) do
     workspace = Config.settings!().workspace.root

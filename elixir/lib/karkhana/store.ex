@@ -39,6 +39,10 @@ defmodule Karkhana.Store do
   def list_issue_events(issue_identifier) when is_binary(issue_identifier),
     do: call({:list_issue_events, issue_identifier})
 
+  @spec last_session_id(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
+  def last_session_id(issue_identifier) when is_binary(issue_identifier),
+    do: call({:last_session_id, issue_identifier})
+
   @spec run_stats(keyword()) :: {:ok, map()} | {:error, term()}
   def run_stats(opts \\ []), do: call({:run_stats, opts})
 
@@ -89,6 +93,11 @@ defmodule Karkhana.Store do
 
   def handle_call({:list_issue_events, issue_identifier}, _from, %{conn: conn} = state) do
     result = do_list_issue_events(conn, issue_identifier)
+    {:reply, result, state}
+  end
+
+  def handle_call({:last_session_id, issue_identifier}, _from, %{conn: conn} = state) do
+    result = do_last_session_id(conn, issue_identifier)
     {:reply, result, state}
   end
 
@@ -283,6 +292,27 @@ defmodule Karkhana.Store do
   defp do_list_issue_events(conn, issue_identifier) do
     sql = "SELECT * FROM issue_events WHERE issue_identifier = ?1 ORDER BY inserted_at ASC"
     query_all(conn, sql, [issue_identifier], &row_to_issue_event/2)
+  end
+
+  defp do_last_session_id(conn, issue_identifier) do
+    sql = """
+    SELECT session_id FROM runs
+    WHERE issue_identifier = ?1 AND session_id IS NOT NULL AND outcome = 'success'
+    ORDER BY ended_at DESC LIMIT 1
+    """
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
+
+    try do
+      :ok = Exqlite.Sqlite3.bind(stmt, [issue_identifier])
+
+      case Exqlite.Sqlite3.step(conn, stmt) do
+        {:row, [session_id]} when is_binary(session_id) -> {:ok, session_id}
+        _ -> {:ok, nil}
+      end
+    after
+      Exqlite.Sqlite3.release(conn, stmt)
+    end
   end
 
   defp do_run_stats(conn, _opts) do

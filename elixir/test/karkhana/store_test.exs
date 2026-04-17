@@ -157,6 +157,25 @@ defmodule Karkhana.StoreTest do
     end
   end
 
+  describe "last_session_id" do
+    test "returns most recent successful session_id", %{pid: _pid} do
+      Store.insert_run(sample_run("TST-SESS", session_id: "sess-old", started_at: ~U[2026-01-01 00:00:00Z]))
+      Store.insert_run(sample_run("TST-SESS", session_id: "sess-new", started_at: ~U[2026-04-01 00:00:00Z]))
+
+      assert {:ok, "sess-new"} = Store.last_session_id("TST-SESS")
+    end
+
+    test "returns nil when no runs exist", %{pid: _pid} do
+      assert {:ok, nil} = Store.last_session_id("TST-NONE")
+    end
+
+    test "ignores failed runs", %{pid: _pid} do
+      Store.insert_run(sample_run("TST-FAIL", session_id: "sess-1", outcome: :error))
+
+      assert {:ok, nil} = Store.last_session_id("TST-FAIL")
+    end
+  end
+
   describe "persistence" do
     test "data survives restart", %{pid: pid, path: path} do
       Store.insert_run(sample_run("TST-P1"))
@@ -179,7 +198,7 @@ defmodule Karkhana.StoreTest do
       attempt: 0,
       sandbox_id: "sbx_123",
       sandbox_name: "karkhana-#{identifier}",
-      session_id: "sess_123",
+      session_id: Keyword.get(overrides, :session_id, "sess_123"),
       tokens: %{
         input: 1000,
         output: 500,
@@ -189,7 +208,7 @@ defmodule Karkhana.StoreTest do
       },
       cost_usd: Keyword.get(overrides, :cost_usd, 4.50),
       duration_seconds: 120.0,
-      outcome: :success,
+      outcome: Keyword.get(overrides, :outcome, :success),
       error_message: nil,
       artifacts_before: [],
       artifacts_after: ["plan"],
