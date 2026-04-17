@@ -22,7 +22,8 @@ defmodule KarkhanaWeb.Endpoint do
   plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
-    json_decoder: Jason
+    json_decoder: Jason,
+    body_reader: {KarkhanaWeb.CacheBodyReader, :read_body, []}
   )
 
   plug(Plug.MethodOverride)

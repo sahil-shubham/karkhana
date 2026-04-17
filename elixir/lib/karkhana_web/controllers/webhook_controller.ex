@@ -17,11 +17,11 @@ defmodule KarkhanaWeb.WebhookController do
   (even on parse errors — Linear will retry on non-200, and we don't
   want retries for payloads we intentionally skip).
   """
-  def linear(conn, _params) do
-    with {:ok, raw_body} <- read_raw_body(conn),
-         :ok <- verify_signature(conn, raw_body),
-         {:ok, payload} <- Jason.decode(raw_body),
-         {:ok, event} <- Webhook.parse(payload) do
+  def linear(conn, params) do
+    raw_body = conn.assigns[:raw_body] || ""
+
+    with :ok <- verify_signature(conn, raw_body),
+         {:ok, event} <- Webhook.parse(params) do
       Logger.info("Webhook received: #{event.type} issue=#{event.issue_identifier || event.issue_id} source=#{event.source}")
 
       send(orchestrator(), {:tracker_event, event})
@@ -48,21 +48,6 @@ defmodule KarkhanaWeb.WebhookController do
       {:error, reason} ->
         Logger.warning("Webhook error: #{inspect(reason)}")
         conn |> put_status(200) |> json(%{ok: true, error: inspect(reason)})
-    end
-  end
-
-  defp read_raw_body(conn) do
-    case conn.assigns[:raw_body] do
-      body when is_binary(body) ->
-        {:ok, body}
-
-      _ ->
-        # Fallback: re-read (only works if body hasn't been consumed)
-        case Plug.Conn.read_body(conn) do
-          {:ok, body, _conn} -> {:ok, body}
-          {:more, _body, _conn} -> {:error, :body_too_large}
-          {:error, reason} -> {:error, reason}
-        end
     end
   end
 
