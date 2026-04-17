@@ -3,7 +3,7 @@ defmodule KarkhanaWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias Karkhana.{Config, Orchestrator, StatusDashboard}
+  alias Karkhana.{Config, Orchestrator, StatusDashboard, Store}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -22,7 +22,8 @@ defmodule KarkhanaWeb.Presenter do
           completed_runs: Enum.map(Map.get(snapshot, :completed_runs, []), &run_payload/1),
           agent_totals: snapshot.agent_totals,
           rate_limits: snapshot.rate_limits,
-          outcomes: outcome_summary()
+          outcomes: outcome_summary(),
+          methodology: methodology_stats()
         }
 
       :timeout ->
@@ -133,13 +134,16 @@ defmodule KarkhanaWeb.Presenter do
   defp run_payload(run) do
     %{
       issue_identifier: run.issue_identifier,
-      role: run.role,
+      mode: Map.get(run, :mode),
+      config_hash: Map.get(run, :config_hash),
       attempt: run.attempt,
       tokens: run.tokens,
       cost_usd: run.cost_usd,
       duration_seconds: run.duration_seconds,
       outcome: run.outcome,
       error_message: run.error_message,
+      gate: Map.get(run, :gate),
+      gate_result: Map.get(run, :gate_result),
       started_at: iso8601(run.started_at),
       ended_at: iso8601(run.ended_at)
     }
@@ -227,6 +231,22 @@ defmodule KarkhanaWeb.Presenter do
           heavy_touch: summary.heavy_touch,
           zero_touch_rate: summary.zero_touch_rate
         }
+
+      {:error, _} ->
+        nil
+    end
+  end
+
+  defp methodology_stats do
+    case Store.run_stats() do
+      {:ok, stats} ->
+        config_events =
+          case Store.list_config_events(limit: 10) do
+            {:ok, events} -> events
+            _ -> []
+          end
+
+        Map.put(stats, :recent_config_changes, config_events)
 
       {:error, _} ->
         nil

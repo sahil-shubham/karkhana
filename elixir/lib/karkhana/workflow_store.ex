@@ -13,7 +13,7 @@ defmodule Karkhana.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow]
+    defstruct [:path, :stamp, :workflow, :config_hash]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -29,6 +29,14 @@ defmodule Karkhana.WorkflowStore do
 
       _ ->
         Workflow.load()
+    end
+  end
+
+  @spec config_hash() :: String.t() | nil
+  def config_hash do
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) -> GenServer.call(__MODULE__, :config_hash)
+      _ -> nil
     end
   end
 
@@ -69,6 +77,10 @@ defmodule Karkhana.WorkflowStore do
     end
   end
 
+  def handle_call(:config_hash, _from, %State{} = state) do
+    {:reply, state.config_hash, state}
+  end
+
   def handle_call(:force_reload, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
@@ -104,7 +116,7 @@ defmodule Karkhana.WorkflowStore do
   end
 
   defp reload_path(path, state) do
-    case load_state(path) do
+    case load_state(path, state.config_hash) do
       {:ok, new_state} ->
         {:ok, new_state}
 
@@ -129,9 +141,20 @@ defmodule Karkhana.WorkflowStore do
   end
 
   defp load_state(path) do
+    load_state(path, nil)
+  end
+
+  defp load_state(path, previous_hash) do
     with {:ok, workflow} <- Workflow.load(path),
-         {:ok, stamp} <- current_stamp(path) do
-      {:ok, %State{path: path, stamp: stamp, workflow: workflow}}
+         {:ok, stamp} <- current_stamp(path),
+         {:ok, content} <- File.read(path) do
+      new_hash = content_hash(content)
+
+      if previous_hash != nil and new_hash != previous_hash do
+        log_config_change(previous_hash, new_hash, path)
+      end
+
+      {:ok, %State{path: path, stamp: stamp, workflow: workflow, config_hash: new_hash}}
     else
       {:error, reason} ->
         {:error, reason}
@@ -149,5 +172,19 @@ defmodule Karkhana.WorkflowStore do
 
   defp log_reload_error(path, reason) do
     Logger.error("Failed to reload workflow path=#{path} reason=#{inspect(reason)}; keeping last known good configuration")
+  end
+
+  defp content_hash(content) when is_binary(content) do
+    :crypto.hash(:sha256, content) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+  end
+
+  defp log_config_change(previous_hash, new_hash, path) do
+    Logger.info("Config changed: #{previous_hash} → #{new_hash} file=#{path}")
+
+    Karkhana.Store.insert_config_event(%{
+      config_hash: new_hash,
+      previous_hash: previous_hash,
+      changed_files: [Path.basename(path)]
+    })
   end
 end
