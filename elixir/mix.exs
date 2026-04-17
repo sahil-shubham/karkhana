@@ -1,9 +1,9 @@
-defmodule SymphonyElixir.MixProject do
+defmodule Karkhana.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :symphony_elixir,
+      app: :karkhana,
       version: "0.1.0",
       elixir: "~> 1.18",
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
@@ -13,30 +13,30 @@ defmodule SymphonyElixir.MixProject do
           threshold: 100
         ],
         ignore_modules: [
-          SymphonyElixir.Config,
-          SymphonyElixir.Linear.Client,
-          SymphonyElixir.SpecsCheck,
-          SymphonyElixir.Orchestrator,
-          SymphonyElixir.Orchestrator.State,
-          SymphonyElixir.AgentRunner,
-          SymphonyElixir.CLI,
-          SymphonyElixir.Codex.AppServer,
-          SymphonyElixir.Codex.DynamicTool,
-          SymphonyElixir.HttpServer,
-          SymphonyElixir.StatusDashboard,
-          SymphonyElixir.LogFile,
-          SymphonyElixir.Workspace,
-          SymphonyElixirWeb.DashboardLive,
-          SymphonyElixirWeb.Endpoint,
-          SymphonyElixirWeb.ErrorHTML,
-          SymphonyElixirWeb.ErrorJSON,
-          SymphonyElixirWeb.Layouts,
-          SymphonyElixirWeb.ObservabilityApiController,
-          SymphonyElixirWeb.Presenter,
-          SymphonyElixirWeb.StaticAssetController,
-          SymphonyElixirWeb.StaticAssets,
-          SymphonyElixirWeb.Router,
-          SymphonyElixirWeb.Router.Helpers
+          Karkhana.Config,
+          Karkhana.Linear.Client,
+          Karkhana.SpecsCheck,
+          Karkhana.Orchestrator,
+          Karkhana.Orchestrator.State,
+          Karkhana.AgentRunner,
+          Karkhana.CLI,
+          Karkhana.Codex.AppServer,
+          Karkhana.Codex.DynamicTool,
+          Karkhana.HttpServer,
+          Karkhana.StatusDashboard,
+          Karkhana.LogFile,
+          Karkhana.Workspace,
+          KarkhanaWeb.DashboardLive,
+          KarkhanaWeb.Endpoint,
+          KarkhanaWeb.ErrorHTML,
+          KarkhanaWeb.ErrorJSON,
+          KarkhanaWeb.Layouts,
+          KarkhanaWeb.ObservabilityApiController,
+          KarkhanaWeb.Presenter,
+          KarkhanaWeb.StaticAssetController,
+          KarkhanaWeb.StaticAssets,
+          KarkhanaWeb.Router,
+          KarkhanaWeb.Router.Helpers
         ]
       ],
       test_ignore_filters: [
@@ -56,7 +56,7 @@ defmodule SymphonyElixir.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      mod: {SymphonyElixir.Application, []},
+      mod: {Karkhana.Application, []},
       extra_applications: [:logger, :inets, :ssl, :crypto]
     ]
   end
@@ -101,9 +101,9 @@ defmodule SymphonyElixir.MixProject do
   defp escript do
     [
       app: nil,
-      main_module: SymphonyElixir.CLI,
-      name: "symphony",
-      path: "bin/symphony"
+      main_module: Karkhana.CLI,
+      name: "karkhana",
+      path: "bin/karkhana"
     ]
   end
 end
