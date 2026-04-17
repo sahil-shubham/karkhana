@@ -1423,7 +1423,10 @@ defmodule Karkhana.Orchestrator do
     run = %{
       issue_id: Map.get(running_entry, :issue, %{}) |> Map.get(:id),
       issue_identifier: running_entry.identifier,
+      mode: Map.get(running_entry, :mode),
+      config_hash: Map.get(running_entry, :config_hash),
       attempt: Map.get(running_entry, :retry_attempt, 0),
+      sandbox_id: Map.get(running_entry, :sandbox_id),
       sandbox_name: "karkhana-" <> String.replace(running_entry.identifier || "", ~r/[^A-Za-z0-9._-]/, "_"),
       session_id: running_entry.session_id,
       tokens: %{
@@ -1437,6 +1440,12 @@ defmodule Karkhana.Orchestrator do
       duration_seconds: running_seconds(running_entry.started_at, now),
       outcome: outcome,
       error_message: error_message,
+      artifacts_before: Map.get(running_entry, :artifacts_before),
+      artifacts_after: Map.get(running_entry, :artifacts_after),
+      gate: Map.get(running_entry, :gate),
+      gate_result: Map.get(running_entry, :gate_result),
+      gate_output: Map.get(running_entry, :gate_output),
+      labels: Map.get(running_entry, :labels),
       started_at: running_entry.started_at,
       ended_at: now
     }
@@ -1449,7 +1458,13 @@ defmodule Karkhana.Orchestrator do
       "duration=#{run.duration_seconds}s"
     )
 
-    # Keep last 100 runs in memory
+    # Persist to store (best-effort, don't crash orchestrator)
+    case Karkhana.Store.insert_run(run) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("Failed to persist run: #{inspect(reason)}")
+    end
+
+    # Keep last 100 runs in memory as fast cache for dashboard
     runs = [run | state.completed_runs] |> Enum.take(100)
     %{state | completed_runs: runs}
   end

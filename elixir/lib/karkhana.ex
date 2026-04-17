@@ -26,6 +26,7 @@ defmodule Karkhana.Application do
     children = [
       {Phoenix.PubSub, name: Karkhana.PubSub},
       {Task.Supervisor, name: Karkhana.TaskSupervisor},
+      Karkhana.Store,
       Karkhana.WorkflowStore,
       Karkhana.Orchestrator,
       Karkhana.HttpServer,
