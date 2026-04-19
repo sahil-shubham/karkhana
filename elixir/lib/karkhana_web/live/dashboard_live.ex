@@ -186,17 +186,6 @@ defmodule KarkhanaWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
               <h2 class="section-title">Running sessions</h2>
               <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
             </div>
@@ -506,8 +495,6 @@ defmodule KarkhanaWeb.DashboardLive do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
 
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
 
   defp short_hash(nil), do: "—"
   defp short_hash(hash) when is_binary(hash) and byte_size(hash) > 8, do: binary_part(hash, 0, 8)

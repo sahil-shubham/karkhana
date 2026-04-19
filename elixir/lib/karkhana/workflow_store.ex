@@ -56,17 +56,32 @@ defmodule Karkhana.WorkflowStore do
 
   @impl true
   def init(_opts) do
-    case load_state(Workflow.workflow_file_path()) do
+    path = Workflow.workflow_file_path()
+
+    case load_state(path, nil) do
       {:ok, state} ->
         schedule_poll()
         {:ok, state}
 
-      {:error, reason} ->
-        {:stop, reason}
+      {:error, _reason} ->
+        # No WORKFLOW.md — start with empty state, poll until one appears
+        Logger.warning("No workflow file at #{path}; orchestrator will idle until configured")
+        schedule_poll()
+        {:ok, %State{path: path, stamp: nil, workflow: nil, config_hash: nil}}
     end
   end
 
   @impl true
+  def handle_call(:current, _from, %State{workflow: nil} = state) do
+    case reload_state(state) do
+      {:ok, new_state} ->
+        {:reply, {:ok, new_state.workflow}, new_state}
+
+      {:error, _reason, _new_state} ->
+        {:reply, {:error, :no_workflow_configured}, state}
+    end
+  end
+
   def handle_call(:current, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
@@ -138,10 +153,6 @@ defmodule Karkhana.WorkflowStore do
         log_reload_error(path, reason)
         {:error, reason, state}
     end
-  end
-
-  defp load_state(path) do
-    load_state(path, nil)
   end
 
   defp load_state(path, previous_hash) do

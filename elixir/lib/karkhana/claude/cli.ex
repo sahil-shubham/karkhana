@@ -126,10 +126,10 @@ defmodule Karkhana.Claude.CLI do
                   {:ok, %{"exit_code" => 0, "stdout" => final_stdout}} when byte_size(final_stdout) > 0 ->
                     final_lines = String.split(final_stdout, "\n", trim: true)
                     final_state = process_lines(final_lines, on_event, state)
-                    {:ok, %{session_id: final_state.session_id, exit_code: 0, usage: final_state.usage}}
+                    check_agent_error(final_state)
 
                   _ ->
-                    {:ok, %{session_id: state.session_id, exit_code: 0, usage: state.usage}}
+                    check_agent_error(state)
                 end
               else
                 poll_loop(sandbox_id, output_file, on_event, deadline, lines_seen, state)
@@ -148,13 +148,33 @@ defmodule Karkhana.Claude.CLI do
         {:ok, event} ->
           session_id = StreamParser.extract_session_id(event) || acc.session_id
           usage = StreamParser.extract_usage(event) || acc.usage
+          error = detect_agent_error(event) || acc[:error]
           on_event.(event)
-          %{acc | session_id: session_id, usage: usage}
+          acc |> Map.put(:session_id, session_id) |> Map.put(:usage, usage) |> Map.put(:error, error)
 
         {:error, _} ->
           acc
       end
     end)
+  end
+
+  defp detect_agent_error(%{"type" => type} = event) when type in ["turn_end", "agent_end"] do
+    messages = event["messages"] || [event["message"]] |> List.wrap()
+
+    Enum.find_value(messages, fn
+      %{"stopReason" => "error", "errorMessage" => msg} when is_binary(msg) -> msg
+      %{"stopReason" => "error"} -> "agent error (no message)"
+      _ -> nil
+    end)
+  end
+
+  defp detect_agent_error(_), do: nil
+
+  defp check_agent_error(state) do
+    case state[:error] do
+      nil -> {:ok, %{session_id: state.session_id, exit_code: 0, usage: state.usage}}
+      error -> {:error, {:agent_error, error}}
+    end
   end
 
   defp extract_prompt(args), do: extract_prompt(args, [])

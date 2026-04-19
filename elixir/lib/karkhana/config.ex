@@ -43,6 +43,12 @@ defmodule Karkhana.Config do
       {:ok, settings} ->
         settings
 
+      {:error, :no_workflow_configured} ->
+        # No workflow file yet — return defaults so the app can start.
+        # The orchestrator will idle (max_concurrent_agents checked at dispatch).
+        {:ok, defaults} = Schema.parse(%{})
+        defaults
+
       {:error, reason} ->
         raise ArgumentError, message: format_config_error(reason)
     end
@@ -86,8 +92,14 @@ defmodule Karkhana.Config do
   @spec server_port() :: non_neg_integer() | nil
   def server_port do
     case Application.get_env(:karkhana, :server_port_override) do
-      port when is_integer(port) and port >= 0 -> port
-      _ -> settings!().server.port
+      port when is_integer(port) and port >= 0 ->
+        port
+
+      _ ->
+        case settings() do
+          {:ok, config} -> config.server.port
+          _ -> nil
+        end
     end
   end
 

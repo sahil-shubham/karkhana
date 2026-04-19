@@ -56,11 +56,16 @@ defmodule Karkhana.Orchestrator do
   @impl true
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
-    config = Config.settings!()
+
+    {poll_ms, max_agents} =
+      case Config.settings() do
+        {:ok, config} -> {config.polling.interval_ms, config.agent.max_concurrent_agents}
+        {:error, _} -> {30_000, 0}
+      end
 
     state = %State{
-      poll_interval_ms: config.polling.interval_ms,
-      max_concurrent_agents: config.agent.max_concurrent_agents,
+      poll_interval_ms: poll_ms,
+      max_concurrent_agents: max_agents,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
       tick_timer_ref: nil,
@@ -69,7 +74,7 @@ defmodule Karkhana.Orchestrator do
       agent_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    if max_agents > 0, do: run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -137,17 +142,11 @@ defmodule Karkhana.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}")
 
               state
               |> record_completed_run(running_entry, :success)
               |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")

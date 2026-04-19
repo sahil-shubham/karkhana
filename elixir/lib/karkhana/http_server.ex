@@ -20,7 +20,7 @@ defmodule Karkhana.HttpServer do
   def start_link(opts \\ []) do
     case Keyword.get(opts, :port, Config.server_port()) do
       port when is_integer(port) and port >= 0 ->
-        host = Keyword.get(opts, :host, Config.settings!().server.host)
+        host = Keyword.get(opts, :host, safe_server_host())
         orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
         snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
 
@@ -84,5 +84,12 @@ defmodule Karkhana.HttpServer do
 
   defp secret_key_base do
     Base.encode64(:crypto.strong_rand_bytes(@secret_key_bytes), padding: false)
+  end
+
+  defp safe_server_host do
+    case Config.settings() do
+      {:ok, config} -> config.server.host
+      _ -> "127.0.0.1"
+    end
   end
 end

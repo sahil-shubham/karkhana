@@ -10,7 +10,7 @@ defmodule Karkhana.Store do
   use GenServer
   require Logger
 
-  @default_path Path.join(System.tmp_dir!(), "karkhana-store.db")
+  @default_path Path.join(System.user_home!(), ".karkhana/store.db")
 
   # --- Public API ---
 

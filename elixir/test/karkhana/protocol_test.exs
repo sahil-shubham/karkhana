@@ -213,16 +213,15 @@ defmodule Karkhana.ProtocolTest do
       assert result =~ "mode=qa"
     end
 
-    test "mode variable available in standard WORKFLOW.md templates" do
-      # Level 1: labels drive mode via Liquid conditionals
+    test "mode variable available when mode_prompt provided" do
       result = Karkhana.PromptBuilder.build_prompt(
         make_issue(["qa"]),
-        mode: "qa"
+        mode: "qa",
+        mode_prompt: "Mode is {{ mode }} for {{ issue.identifier }}"
       )
 
-      # The default WORKFLOW.md template doesn't use {{ mode }} but
-      # the variable is available. This test just verifies no crash.
-      assert is_binary(result)
+      assert result =~ "Mode is qa"
+      assert result =~ "TST-1"
     end
   end
 end
