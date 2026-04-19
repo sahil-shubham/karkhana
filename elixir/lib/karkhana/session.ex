@@ -1,0 +1,655 @@
+defmodule Karkhana.Session do
+  @moduledoc """
+  A single agent session for one Linear issue.
+
+  Each Session is a GenServer that owns the full lifecycle:
+  create sandbox → run hooks → launch pi → consume events →
+  run gates → transition Linear state → record run → exit.
+
+  Events are broadcast to PubSub topic "session:<identifier>"
+  for real-time dashboard updates. Session summary changes are
+  broadcast to "sessions" for the session list.
+
+  The Session checkpoints its state to SQLite (active_sessions table)
+  so the Dispatcher can recover running sessions after a restart.
+  """
+
+  use GenServer
+  require Logger
+
+  alias Karkhana.Claude.CLI, as: ClaudeCLI
+  alias Karkhana.Claude.StreamParser
+  alias Karkhana.{Config, Gate, Linear.Issue, PromptBuilder, Protocol, Store, Tracker, Workspace}
+
+  @max_events 200
+  @pubsub Karkhana.PubSub
+  @sessions_topic "sessions"
+
+  # --- Public API ---
+
+  @spec start_link({Issue.t(), keyword()}) :: GenServer.on_start()
+  def start_link({issue, opts}) do
+    name = {:via, Registry, {Karkhana.SessionRegistry, issue.identifier}}
+    GenServer.start_link(__MODULE__, {issue, opts}, name: name)
+  end
+
+  @doc "Get current session status summary."
+  @spec status(GenServer.server()) :: map()
+  def status(server) do
+    GenServer.call(server, :status)
+  end
+
+  @doc "Get last N events from the ring buffer."
+  @spec events(GenServer.server(), pos_integer()) :: [map()]
+  def events(server, limit \\ 50) do
+    GenServer.call(server, {:events, limit})
+  end
+
+  @doc "Gracefully stop the session."
+  @spec stop(GenServer.server()) :: :ok
+  def stop(server) do
+    GenServer.stop(server, :normal)
+  end
+
+  @doc "Look up a session by issue identifier via Registry."
+  @spec lookup(String.t()) :: GenServer.server() | nil
+  def lookup(identifier) do
+    case Registry.lookup(Karkhana.SessionRegistry, identifier) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
+  @doc "List all running session identifiers."
+  @spec list_running() :: [String.t()]
+  def list_running do
+    Registry.select(Karkhana.SessionRegistry, [{{:"$1", :_, :_}, [], [:"$1"]}])
+  end
+
+  @doc false
+  @spec status_for_test(%__MODULE__{}) :: map()
+  def status_for_test(state), do: summary(state)
+
+  # --- State ---
+
+  defstruct [
+    :issue,
+    :sandbox_id,
+    :sandbox_name,
+    :mode,
+    :mode_prompt,
+    :session_id,
+    :output_file,
+    :started_at,
+    :error,
+    :gate_results,
+    :gate_specs,
+    :protocol_dir,
+    :artifacts_config,
+    :attempt,
+    :config_hash,
+    lines_seen: 0,
+    tokens: %{input: 0, output: 0, total: 0, cache_read: 0, cache_write: 0},
+    cost_usd: 0.0,
+    events: :queue.new(),
+    event_count: 0,
+    turn_count: 0,
+    status: :starting
+  ]
+
+  # --- Callbacks ---
+
+  @impl true
+  def init({issue, opts}) do
+    state = %__MODULE__{
+      issue: issue,
+      attempt: Keyword.get(opts, :attempt, 0),
+      started_at: DateTime.utc_now(),
+      config_hash: Karkhana.WorkflowStore.config_hash()
+    }
+
+    # Check if this is a resume from a saved checkpoint
+    case Keyword.get(opts, :resume) do
+      %{} = saved ->
+        state = %{
+          state
+          | sandbox_id: saved.sandbox_id,
+            sandbox_name: saved[:sandbox_name],
+            output_file: saved.output_file,
+            lines_seen: saved[:lines_seen] || 0,
+            tokens: saved[:tokens] || state.tokens,
+            cost_usd: saved[:cost_usd] || 0.0,
+            mode: saved[:mode],
+            status: :running
+        }
+
+        Logger.info("Resuming session for #{issue.identifier} from line #{state.lines_seen}")
+        broadcast_sessions({:session_started, summary(state)})
+        send(self(), :poll_output)
+        {:ok, state}
+
+      nil ->
+        send(self(), :start_sandbox)
+        {:ok, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:start_sandbox, state) do
+    case Workspace.create_for_issue(state.issue) do
+      {:ok, sandbox_id} ->
+        sandbox_name = Workspace.sandbox_name_for_issue(state.issue)
+
+        {mode, mode_prompt} = resolve_mode(sandbox_id, state.issue)
+        {gate_specs, protocol_dir, artifacts_config} = load_gate_context(mode)
+
+        state = %{
+          state
+          | sandbox_id: sandbox_id,
+            sandbox_name: sandbox_name,
+            mode: mode,
+            mode_prompt: mode_prompt,
+            gate_specs: gate_specs,
+            protocol_dir: protocol_dir,
+            artifacts_config: artifacts_config
+        }
+
+        Logger.info("Session #{state.issue.identifier}: sandbox=#{sandbox_id} mode=#{mode}")
+        send(self(), :run_hooks)
+        {:noreply, state}
+
+      {:error, reason} ->
+        fail(state, "Sandbox creation failed: #{inspect(reason)}")
+    end
+  end
+
+  def handle_info(:run_hooks, state) do
+    case Workspace.run_before_run_hook(state.sandbox_id, state.issue) do
+      :ok ->
+        send(self(), :launch_agent)
+        {:noreply, state}
+
+      {:error, reason} ->
+        fail(state, "before_run hook failed: #{inspect(reason)}")
+    end
+  end
+
+  def handle_info(:launch_agent, state) do
+    prompt =
+      PromptBuilder.build_prompt(state.issue,
+        mode: state.mode,
+        mode_prompt: state.mode_prompt,
+        attempt: state.attempt,
+        gate_feedback: nil
+      )
+
+    _previous_session_id = lookup_previous_session(state.issue)
+
+    case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.attempt) do
+      {:ok, %{session_id: sid}} ->
+        # Agent turn completed normally
+        state = %{state | session_id: sid || state.session_id, status: :gates}
+        Logger.info("Session #{state.issue.identifier}: agent completed, running gates")
+        broadcast_sessions({:session_status, summary(state)})
+        send(self(), :run_gates)
+        {:noreply, state}
+
+      {:error, reason} ->
+        fail(state, "Agent failed: #{inspect(reason)}")
+    end
+  rescue
+    e ->
+      fail(state, "Agent crashed: #{Exception.message(e)}")
+  end
+
+  def handle_info(:poll_output, state) do
+    # Used for resumed sessions — poll the output file manually
+    # For fresh sessions, ClaudeCLI.run handles the polling internally
+    # and calls on_event for each parsed line.
+    #
+    # TODO: When we move to Session-owned polling (replacing ClaudeCLI's
+    # internal poll loop), this will be the main event consumption path.
+    {:noreply, state}
+  end
+
+  def handle_info(:run_gates, state) do
+    gate_specs = state.gate_specs || []
+
+    if gate_specs == [] do
+      complete_success(state)
+    else
+      gate_context = %{
+        sandbox_id: state.sandbox_id,
+        issue_id: state.issue.id,
+        issue_identifier: state.issue.identifier,
+        mode: state.mode,
+        attempt: state.attempt,
+        protocol_dir: state.protocol_dir,
+        artifacts: state.artifacts_config
+      }
+
+      case Gate.run_gates(gate_specs, gate_context) do
+        {:all_passed, results} ->
+          Logger.info("Session #{state.issue.identifier}: all gates passed")
+          state = %{state | gate_results: results}
+          complete_success(state)
+
+        {:failed, results} ->
+          feedback = Gate.failure_feedback(results)
+          failed_names = Enum.map(feedback, & &1.gate) |> Enum.join(", ")
+          Logger.warning("Session #{state.issue.identifier}: gates failed: #{failed_names}")
+          state = %{state | gate_results: results}
+          fail(state, "Gates failed: #{failed_names}", :gate_failed)
+      end
+    end
+  end
+
+  def handle_info({:stream_event, event}, state) do
+    # Received from the on_event callback during ClaudeCLI.run
+    state = process_event(state, event)
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, summary(state), state}
+  end
+
+  def handle_call({:events, limit}, _from, state) do
+    events =
+      state.events
+      |> :queue.to_list()
+      |> Enum.take(-limit)
+
+    {:reply, events, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    # Best-effort: run after_run hook if sandbox exists
+    if state.sandbox_id do
+      Workspace.run_after_run_hook(state.sandbox_id, state.issue)
+    end
+
+    :ok
+  end
+
+  # --- Event processing ---
+
+  defp process_event(state, event) do
+    event_type = Map.get(event, :event_type, :unknown)
+    session_id = StreamParser.extract_session_id(event) || state.session_id
+    usage = StreamParser.extract_usage(event)
+
+    # Update tokens/cost from usage (cumulative — take max)
+    {tokens, cost} =
+      if usage do
+        tokens = %{
+          input: max(state.tokens.input, Map.get(usage, :input_tokens, 0)),
+          output: max(state.tokens.output, Map.get(usage, :output_tokens, 0)),
+          total: max(state.tokens.total, Map.get(usage, :total_tokens, 0)),
+          cache_read: max(state.tokens.cache_read, Map.get(usage, :cache_read_tokens, 0)),
+          cache_write: max(state.tokens.cache_write, Map.get(usage, :cache_write_tokens, 0))
+        }
+
+        cost = max(state.cost_usd, Map.get(usage, :cost_usd, 0.0))
+        {tokens, cost}
+      else
+        {state.tokens, state.cost_usd}
+      end
+
+    # Build display event for ring buffer
+    display_event = %{
+      at: DateTime.utc_now(),
+      type: event_type,
+      summary: summarize_event(event_type, event),
+      raw: event
+    }
+
+    # Add to ring buffer (cap at @max_events)
+    events = :queue.in(display_event, state.events)
+
+    events =
+      if :queue.len(events) > @max_events do
+        {_, trimmed} = :queue.out(events)
+        trimmed
+      else
+        events
+      end
+
+    turn_count =
+      if event_type in [:turn_start, :result, :turn_end] do
+        state.turn_count + 1
+      else
+        state.turn_count
+      end
+
+    state = %{
+      state
+      | session_id: session_id,
+        tokens: tokens,
+        cost_usd: cost,
+        events: events,
+        event_count: state.event_count + 1,
+        # ensure integer
+        turn_count: div(turn_count, 1)
+    }
+
+    # Broadcast event to per-session topic
+    broadcast_session(state.issue.identifier, {:session_event, display_event})
+
+    state
+  end
+
+  defp handle_stream_event(event) do
+    # Called from within ClaudeCLI.run's poll loop (same process)
+    # We send it as a message so it goes through handle_info
+    # and updates the GenServer state properly
+    send(self(), {:stream_event, event})
+    :ok
+  end
+
+  # --- Completion ---
+
+  defp complete_success(state) do
+    state = %{state | status: :completed}
+    Logger.info("Session #{state.issue.identifier}: completed successfully")
+
+    # Lifecycle transition
+    lifecycle_transition(state)
+
+    # Record run
+    record_run(state, :success)
+
+    # Broadcast
+    broadcast_sessions({:session_completed, summary(state)})
+    broadcast_session(state.issue.identifier, {:session_completed, summary(state)})
+
+    {:stop, :normal, state}
+  end
+
+  defp fail(state, error_message, outcome \\ :error) do
+    state = %{state | status: :failed, error: error_message}
+    Logger.warning("Session #{state.issue.identifier}: failed — #{error_message}")
+
+    # Record run
+    record_run(state, outcome, error_message)
+
+    # Post error to Linear
+    post_error_comment(state, error_message)
+
+    # Broadcast
+    broadcast_sessions({:session_failed, summary(state)})
+    broadcast_session(state.issue.identifier, {:session_failed, summary(state)})
+
+    {:stop, :normal, state}
+  end
+
+  defp lifecycle_transition(state) do
+    lifecycle = Config.settings!().lifecycle
+    issue_state = state.issue.state
+    on_complete = Karkhana.Config.Schema.Lifecycle.on_complete_state(lifecycle, issue_state)
+
+    if on_complete do
+      Logger.info("Session #{state.issue.identifier}: transitioning #{issue_state} → #{on_complete}")
+
+      case Tracker.update_issue_state(state.issue.id, on_complete) do
+        :ok -> Logger.info("Session #{state.issue.identifier}: moved to #{on_complete}")
+        {:error, reason} -> Logger.warning("Session #{state.issue.identifier}: transition failed: #{inspect(reason)}")
+      end
+
+      # Stop sandbox at human gates
+      sandbox_action = Karkhana.Config.Schema.Lifecycle.sandbox_action(lifecycle, on_complete)
+
+      if sandbox_action == "stop" and state.sandbox_id do
+        Logger.info("Session #{state.issue.identifier}: stopping sandbox at human gate")
+
+        case Karkhana.Bhatti.Client.stop_sandbox(state.sandbox_id) do
+          :ok -> :ok
+          {:error, reason} -> Logger.warning("Failed to stop sandbox: #{inspect(reason)}")
+        end
+      end
+    end
+  end
+
+  defp record_run(state, outcome, error_message \\ nil) do
+    run = %{
+      issue_id: state.issue.id,
+      issue_identifier: state.issue.identifier,
+      mode: state.mode,
+      config_hash: state.config_hash,
+      attempt: state.attempt,
+      sandbox_id: state.sandbox_id,
+      sandbox_name: state.sandbox_name || "",
+      session_id: state.session_id,
+      tokens: %{
+        input: state.tokens.input,
+        output: state.tokens.output,
+        cache_read: state.tokens.cache_read,
+        cache_write: state.tokens.cache_write,
+        total: state.tokens.total
+      },
+      cost_usd: state.cost_usd,
+      duration_seconds: duration_seconds(state),
+      outcome: outcome,
+      error_message: error_message,
+      gate: state.mode,
+      gate_result: gate_result_summary(state.gate_results),
+      gate_output: gate_output_summary(state.gate_results),
+      labels: Issue.label_names(state.issue),
+      started_at: state.started_at,
+      ended_at: DateTime.utc_now()
+    }
+
+    case Store.insert_run(run) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("Failed to persist run: #{inspect(reason)}")
+    end
+  end
+
+  defp post_error_comment(state, error_message) do
+    api_key = System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY")
+
+    if api_key && state.issue.id do
+      body = """
+      ⚠️ **Karkhana session failed**
+
+      **Mode:** #{state.mode || "default"}
+      **Error:** #{error_message}
+      **Duration:** #{format_duration(duration_seconds(state))}
+      **Attempt:** #{state.attempt}
+
+      ---
+      To retry → move to a dispatch state (Todo, Planning, Implementing)
+      """
+
+      case Karkhana.Linear.Client.post_comment(state.issue.id, body, api_key) do
+        {:ok, _} -> :ok
+        {:error, reason} -> Logger.warning("Failed to post error comment: #{inspect(reason)}")
+      end
+    end
+  end
+
+  # --- Helpers ---
+
+  defp resolve_mode(sandbox_id, issue) do
+    lifecycle = Config.settings!().lifecycle
+    lifecycle_mode = Karkhana.Config.Schema.Lifecycle.mode_for_state(lifecycle, issue.state)
+
+    if lifecycle_mode do
+      # Load prompt from .karkhana/modes/
+      workspace = Config.settings!().workspace.root
+
+      prompt_content =
+        case Protocol.load(workspace) do
+          {:ok, protocol} ->
+            prompt_path = Karkhana.Config.Schema.Modes.prompt_path(Config.settings!().modes, lifecycle_mode)
+
+            if prompt_path do
+              full_path = Path.join(protocol.dir, prompt_path)
+
+              case File.read(full_path) do
+                {:ok, content} -> content
+                _ -> nil
+              end
+            end
+
+          _ ->
+            nil
+        end
+
+      {lifecycle_mode, prompt_content}
+    else
+      # Fallback: protocol-based resolution
+      workspace = Config.settings!().workspace.root
+
+      case Protocol.load(workspace) do
+        {:ok, protocol} ->
+          checker = fn cmd -> Karkhana.Bhatti.Client.exec_check(sandbox_id, cmd) end
+          mode = Protocol.resolve_mode(protocol, issue, checker)
+          {mode.name, mode.prompt_content}
+
+        _ ->
+          {"default", nil}
+      end
+    end
+  end
+
+  defp load_gate_context(mode) do
+    settings = Config.settings!()
+    gate_specs = Karkhana.Config.Schema.Modes.gates(settings.modes, mode)
+
+    if gate_specs != [] do
+      workspace = settings.workspace.root
+
+      {protocol_dir, artifacts_config} =
+        case Protocol.load(workspace) do
+          {:ok, protocol} -> {protocol.dir, protocol.artifacts}
+          _ -> {nil, %{}}
+        end
+
+      {gate_specs, protocol_dir, artifacts_config}
+    else
+      {[], nil, %{}}
+    end
+  end
+
+  defp lookup_previous_session(%Issue{identifier: identifier}) when is_binary(identifier) do
+    case Store.last_session_id(identifier) do
+      {:ok, session_id} when is_binary(session_id) -> session_id
+      _ -> nil
+    end
+  end
+
+  defp lookup_previous_session(_), do: nil
+
+  defp summary(state) do
+    %{
+      issue_id: state.issue.id,
+      identifier: state.issue.identifier,
+      title: state.issue.title,
+      state: state.issue.state,
+      mode: state.mode,
+      status: state.status,
+      sandbox_id: state.sandbox_id,
+      session_id: state.session_id,
+      tokens: state.tokens,
+      cost_usd: state.cost_usd,
+      event_count: state.event_count,
+      turn_count: state.turn_count,
+      attempt: state.attempt,
+      started_at: state.started_at,
+      error: state.error,
+      gate_results: state.gate_results
+    }
+  end
+
+  defp summarize_event(:tool_use, event) do
+    tool = Map.get(event, "toolName") || Map.get(event, "tool") || "tool"
+    args = Map.get(event, "args") || %{}
+    detail = Map.get(args, "command") || Map.get(args, "path") || ""
+    "#{tool}: #{detail |> to_string() |> String.split("\n") |> hd() |> String.slice(0, 120)}"
+  end
+
+  defp summarize_event(:assistant, event) do
+    content =
+      Map.get(event, "content") ||
+        get_in(event, ["message", "content"]) || []
+
+    case content do
+      blocks when is_list(blocks) ->
+        text_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "text" end)
+        thinking_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "thinking" end)
+
+        cond do
+          text_block ->
+            (text_block["text"] || "") |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 150)
+
+          thinking_block ->
+            thinking = thinking_block["thinking"] || ""
+
+            if byte_size(thinking) > 20 do
+              snippet = thinking |> String.split("\n") |> List.last() |> String.trim() |> String.slice(0, 120)
+              "🤔 #{snippet}"
+            else
+              "🤔 Thinking…"
+            end
+
+          true ->
+            ""
+        end
+
+      _ ->
+        ""
+    end
+  end
+
+  defp summarize_event(:session_started, _event), do: "Session started"
+  defp summarize_event(:turn_start, _event), do: "Turn starting"
+  defp summarize_event(:turn_end, _event), do: "Turn ended"
+  defp summarize_event(:result, _event), do: "Turn completed"
+  defp summarize_event(:error, event), do: "Error: #{Map.get(event, "message", "unknown")}"
+  defp summarize_event(type, _event), do: to_string(type)
+
+  defp duration_seconds(state) do
+    DateTime.diff(DateTime.utc_now(), state.started_at, :second)
+  end
+
+  defp format_duration(seconds) when is_number(seconds) do
+    minutes = div(trunc(seconds), 60)
+    secs = rem(trunc(seconds), 60)
+    if minutes > 0, do: "#{minutes}m #{secs}s", else: "#{secs}s"
+  end
+
+  defp format_duration(_), do: "n/a"
+
+  defp gate_result_summary(nil), do: nil
+
+  defp gate_result_summary(results) when is_list(results) do
+    if Enum.any?(results, fn {_, s, _} -> s == :fail end), do: "fail", else: "pass"
+  end
+
+  defp gate_output_summary(nil), do: nil
+
+  defp gate_output_summary(results) when is_list(results) do
+    results
+    |> Enum.map(fn {name, status, output} -> "#{name}: #{status} — #{output}" end)
+    |> Enum.join("\n")
+  end
+
+  # --- PubSub ---
+
+  defp broadcast_sessions(message) do
+    Phoenix.PubSub.broadcast(@pubsub, @sessions_topic, message)
+  rescue
+    _ -> :ok
+  end
+
+  defp broadcast_session(identifier, message) do
+    Phoenix.PubSub.broadcast(@pubsub, "session:#{identifier}", message)
+  rescue
+    _ -> :ok
+  end
+end
