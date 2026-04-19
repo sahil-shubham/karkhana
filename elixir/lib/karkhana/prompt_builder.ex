@@ -18,6 +18,7 @@ defmodule Karkhana.PromptBuilder do
   def build_prompt(issue, opts \\ []) do
     mode = Keyword.get(opts, :mode)
     mode_prompt = Keyword.get(opts, :mode_prompt)
+    gate_feedback = Keyword.get(opts, :gate_feedback)
 
     template =
       if mode_prompt do
@@ -26,16 +27,56 @@ defmodule Karkhana.PromptBuilder do
         Workflow.current() |> prompt_template!() |> parse_template!()
       end
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "mode" => mode || "default",
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.iodata_to_binary()
+    base_prompt =
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "mode" => mode || "default",
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+
+    if gate_feedback do
+      base_prompt <> build_feedback_section(gate_feedback, Keyword.get(opts, :attempt))
+    else
+      base_prompt
+    end
+  end
+
+  @doc """
+  Build a feedback section from gate failure results.
+  Appended to the prompt when retrying after gate failures.
+  """
+  @spec build_feedback_section([%{gate: String.t(), output: String.t()}], integer() | nil) :: String.t()
+  def build_feedback_section(gate_feedback, attempt \\ nil) do
+    if gate_feedback == [] do
+      ""
+    else
+      feedback_items =
+        gate_feedback
+        |> Enum.map_join("\n\n", fn %{gate: name, output: output} ->
+          "**Gate '#{name}' failed:**\n#{output}"
+        end)
+
+      attempt_note = if attempt, do: " (attempt #{attempt})", else: ""
+
+      """
+
+
+      ---
+
+      ## Feedback from previous attempt#{attempt_note}
+
+      The previous attempt failed quality gates. Address each one:
+
+      #{feedback_items}
+
+      Focus on fixing what the gates identified. Don't redo work that was correct.
+      """
+    end
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
