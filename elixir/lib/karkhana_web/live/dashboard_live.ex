@@ -211,7 +211,7 @@ defmodule KarkhanaWeb.DashboardLive do
                 </div>
               </div>
 
-              <div style="margin-top: 0.75rem; padding: 0.5rem 0.75rem; background: var(--surface-raised, #1a1a2e); border-radius: 6px; font-size: 0.875rem;">
+              <div style="margin-top: 0.75rem; padding: 0.5rem 0.75rem; background: #f0f0f3; border-radius: 6px; font-size: 0.875rem; color: #333;">
                 <span style="opacity: 0.7;"><%= entry.last_event || "waiting" %></span>
                 <span style="margin-left: 0.5rem;"><%= entry.last_message || "No activity yet" %></span>
               </div>
