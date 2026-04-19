@@ -146,16 +146,13 @@ defmodule KarkhanaWeb.DashboardLive do
               </div>
             </div>
 
-            <div class="session-card-status">
-              <span style="opacity: 0.6;"><%= s.status %></span>
-              <span style="margin-left: 0.5rem;">
-                Tokens: <span class="numeric"><%= format_int(s.tokens.total) %></span>
-                · Turns: <span class="numeric"><%= s.turn_count %></span>
+            <div class="session-card-status" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+              <span>
+                <span style="opacity: 0.6;"><%= s.status %></span>
+                <span class="muted" style="margin-left: 0.75rem;">Tokens: <span class="numeric"><%= format_int(s.tokens.total) %></span></span>
+                <span class="muted" style="margin-left: 0.5rem;">Turns: <span class="numeric"><%= s.turn_count %></span></span>
               </span>
-            </div>
-
-            <div class="session-card-meta muted">
-              <a href={"/sessions/#{s.identifier}"}>View live →</a>
+              <a href={"/sessions/#{s.identifier}"} style="font-size: 0.85rem;">View live →</a>
             </div>
           </div>
         <% end %>
@@ -184,7 +181,11 @@ defmodule KarkhanaWeb.DashboardLive do
               </thead>
               <tbody>
                 <tr :for={run <- @recent_runs}>
-                  <td><span class="issue-id"><%= run.issue_identifier %></span></td>
+                  <td>
+                    <a href={"/sessions/#{run.issue_identifier}"} class="issue-id" style="text-decoration: none;">
+                      <%= run.issue_identifier %>
+                    </a>
+                  </td>
                   <td><span class="mode-badge"><%= run.mode || "—" %></span></td>
                   <td>
                     <span class={outcome_class(run.outcome)}>

@@ -14,8 +14,19 @@ defmodule KarkhanaWeb.SessionLive do
 
     {session_info, events, completed_run} =
       if session_pid do
-        info = Session.status(session_pid)
-        evts = Session.events(session_pid, 200)
+        info =
+          try do
+            Session.status(session_pid)
+          catch
+            :exit, _ -> nil
+          end
+
+        evts =
+          try do
+            Session.events(session_pid, 200)
+          catch
+            :exit, _ -> []
+          end
 
         if connected?(socket) do
           Phoenix.PubSub.subscribe(Karkhana.PubSub, "session:#{identifier}")
@@ -23,9 +34,16 @@ defmodule KarkhanaWeb.SessionLive do
 
         {info, evts, nil}
       else
-        # Session not running — check Store for completed run
+        # Session not running — show most recent completed run
         run = load_run(identifier)
         {nil, [], run}
+      end
+
+    # Load all runs for this issue (for the history section)
+    all_runs =
+      case Store.list_runs(issue_identifier: identifier, limit: 10) do
+        {:ok, runs} -> runs
+        _ -> []
       end
 
     socket =
@@ -34,6 +52,7 @@ defmodule KarkhanaWeb.SessionLive do
       |> assign(:session, session_info)
       |> assign(:events, events)
       |> assign(:completed_run, completed_run)
+      |> assign(:all_runs, all_runs)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) and session_pid, do: schedule_tick()
@@ -165,7 +184,7 @@ defmodule KarkhanaWeb.SessionLive do
         <%= if @events == [] do %>
           <p class="empty-state">No events yet.</p>
         <% else %>
-          <div class="event-stream" id="event-stream" phx-hook="ScrollBottom">
+          <div class="event-stream" id="event-stream">
             <div :for={event <- @events} class={"event-row event-#{event.type}"}>
               <span class="event-time"><%= format_time(event.at) %></span>
               <span class={"event-type-badge event-type-#{event.type}"}><%= event_type_label(event.type) %></span>
@@ -174,6 +193,52 @@ defmodule KarkhanaWeb.SessionLive do
           </div>
         <% end %>
       </section>
+
+      <%= if @all_runs != [] do %>
+        <section class="section-card" style="margin-top: 1rem;">
+          <div class="section-header">
+            <h2 class="section-title">Run history</h2>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table" style="min-width: 600px;">
+              <thead>
+                <tr>
+                  <th>Mode</th>
+                  <th>Outcome</th>
+                  <th>Gate</th>
+                  <th>Cost</th>
+                  <th>Duration</th>
+                  <th>Started</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={run <- @all_runs}>
+                  <td><span class="mode-badge"><%= run.mode || "—" %></span></td>
+                  <td><span class={outcome_class(run.outcome)}><%= run.outcome %></span></td>
+                  <td>
+                    <%= case run.gate_result do %>
+                      <% "pass" -> %><span style="color: #22c55e;">✓</span>
+                      <% "fail" -> %><span style="color: #ef4444;">✗</span>
+                      <% _ -> %><span class="muted">—</span>
+                    <% end %>
+                  </td>
+                  <td class="numeric">$<%= format_cost(run.cost_usd) %></td>
+                  <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
+                  <td class="muted" style="font-size: 0.8rem;"><%= run.started_at %></td>
+                  <td>
+                    <%= if run.error_message do %>
+                      <span style="font-size: 0.8rem; color: #ef4444;" title={run.error_message}>
+                        <%= String.slice(run.error_message, 0, 80) %>
+                      </span>
+                    <% end %>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      <% end %>
     </section>
     """
   end
