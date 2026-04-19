@@ -23,7 +23,8 @@ defmodule KarkhanaWeb.Presenter do
           agent_totals: snapshot.agent_totals,
           rate_limits: snapshot.rate_limits,
           outcomes: outcome_summary(),
-          methodology: methodology_stats()
+          methodology: methodology_stats(),
+          lifecycle: lifecycle_summary()
         }
 
       :timeout ->
@@ -99,11 +100,17 @@ defmodule KarkhanaWeb.Presenter do
   defp issue_status(_running, _retry), do: "running"
 
   defp running_entry_payload(entry) do
+    lifecycle = Config.settings!().lifecycle
+    state_name = entry.state
+    state_config = Karkhana.Config.Schema.Lifecycle.state_config(lifecycle, state_name)
+
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       mode: Map.get(entry, :mode),
-      state: entry.state,
+      state: state_name,
+      lifecycle_type: state_config && state_config["type"],
+      sandbox_id: Map.get(entry, :sandbox_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -116,7 +123,9 @@ defmodule KarkhanaWeb.Presenter do
         input_tokens: entry.agent_input_tokens,
         output_tokens: entry.agent_output_tokens,
         total_tokens: entry.agent_total_tokens
-      }
+      },
+      gate: Map.get(entry, :gate),
+      gate_result: Map.get(entry, :gate_result)
     }
   end
 
@@ -252,6 +261,24 @@ defmodule KarkhanaWeb.Presenter do
 
       {:error, _} ->
         nil
+    end
+  end
+
+  defp lifecycle_summary do
+    lifecycle = Config.settings!().lifecycle
+
+    if lifecycle.states == %{} do
+      nil
+    else
+      alias Karkhana.Config.Schema.Lifecycle
+
+      %{
+        auto_sync: lifecycle.auto_sync,
+        dispatch_states: Lifecycle.dispatch_states(lifecycle),
+        human_gate_states: Lifecycle.human_gate_states(lifecycle),
+        terminal_states: Lifecycle.terminal_states(lifecycle),
+        state_count: map_size(lifecycle.states)
+      }
     end
   end
 end

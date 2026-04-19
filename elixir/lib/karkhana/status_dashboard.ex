@@ -590,7 +590,9 @@ defmodule Karkhana.StatusDashboard do
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
     state = running_entry.state || "unknown"
-    state_display = format_cell(to_string(state), @running_stage_width)
+    mode = Map.get(running_entry, :mode)
+    stage_label = if mode, do: "#{state}/#{mode}", else: to_string(state)
+    state_display = format_cell(stage_label, @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.agent_pid || "n/a", @running_pid_width)
     total_tokens = running_entry.agent_total_tokens || 0

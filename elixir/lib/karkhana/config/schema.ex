@@ -50,6 +50,8 @@ defmodule Karkhana.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      # Derived from lifecycle.states when lifecycle is configured.
+      # Kept for orchestrator compatibility — active = dispatch states, terminal = terminal states.
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
