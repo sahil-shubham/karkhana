@@ -1,0 +1,26 @@
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "elixir-format"
+name = "mix format"
+language = "system"
+entry = "bash -c 'cd elixir && mix format --check-formatted'"
+pass_filenames = false
+types = ["elixir"]
+
+[[repos.hooks]]
+id = "elixir-compile"
+name = "mix compile --warnings-as-errors"
+language = "system"
+entry = "bash -c 'cd elixir && mix compile --warnings-as-errors'"
+pass_filenames = false
+types = ["elixir"]
+
+[[repos.hooks]]
+id = "elixir-specs"
+name = "specs check"
+language = "system"
+entry = "bash -c 'cd elixir && mix specs.check'"
+pass_filenames = false
+types = ["elixir"]

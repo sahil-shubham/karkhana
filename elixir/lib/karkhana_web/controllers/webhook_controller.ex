@@ -17,6 +17,7 @@ defmodule KarkhanaWeb.WebhookController do
   (even on parse errors — Linear will retry on non-200, and we don't
   want retries for payloads we intentionally skip).
   """
+  @spec linear(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def linear(conn, params) do
     raw_body = conn.assigns[:raw_body] || ""
 

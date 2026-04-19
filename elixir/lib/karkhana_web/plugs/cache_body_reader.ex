@@ -4,6 +4,8 @@ defmodule KarkhanaWeb.CacheBodyReader do
   in conn.assigns[:raw_body] for HMAC signature verification.
   """
 
+  @spec read_body(Plug.Conn.t(), keyword()) ::
+          {:ok, binary(), Plug.Conn.t()} | {:more, binary(), Plug.Conn.t()} | {:error, term()}
   def read_body(conn, opts) do
     case Plug.Conn.read_body(conn, opts) do
       {:ok, body, conn} ->
