@@ -1422,11 +1422,12 @@ defmodule Karkhana.Orchestrator do
     last_reported_total = Map.get(running_entry, :agent_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    # Extract cache + cost from raw usage (additive, not delta-tracked)
+    # Extract cache + cost from usage. Pi reports cumulative values (not deltas),
+    # so we track them the same way as tokens: keep the highest reported value.
     usage_from_event = extract_usage_from_update(update)
-    cache_read_delta = Map.get(usage_from_event, :cache_read_tokens, 0)
-    cache_write_delta = Map.get(usage_from_event, :cache_write_tokens, 0)
-    cost_delta = Map.get(usage_from_event, :cost_usd, 0.0)
+    reported_cache_read = Map.get(usage_from_event, :cache_read_tokens, 0)
+    reported_cache_write = Map.get(usage_from_event, :cache_write_tokens, 0)
+    reported_cost = Map.get(usage_from_event, :cost_usd, 0.0)
 
     {
       Map.merge(running_entry, %{
@@ -1438,9 +1439,9 @@ defmodule Karkhana.Orchestrator do
         agent_input_tokens: agent_input_tokens + token_delta.input_tokens,
         agent_output_tokens: agent_output_tokens + token_delta.output_tokens,
         agent_total_tokens: agent_total_tokens + token_delta.total_tokens,
-        agent_cache_read_tokens: Map.get(running_entry, :agent_cache_read_tokens, 0) + cache_read_delta,
-        agent_cache_write_tokens: Map.get(running_entry, :agent_cache_write_tokens, 0) + cache_write_delta,
-        agent_cost_usd: Map.get(running_entry, :agent_cost_usd, 0.0) + cost_delta,
+        agent_cache_read_tokens: max(Map.get(running_entry, :agent_cache_read_tokens, 0), reported_cache_read),
+        agent_cache_write_tokens: max(Map.get(running_entry, :agent_cache_write_tokens, 0), reported_cache_write),
+        agent_cost_usd: max(Map.get(running_entry, :agent_cost_usd, 0.0), reported_cost),
         agent_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         agent_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         agent_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
