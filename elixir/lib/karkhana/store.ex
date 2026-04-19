@@ -365,6 +365,7 @@ defmodule Karkhana.Store do
 
   defp do_run_stats(conn, _opts) do
     with {:ok, total} <- query_one_value(conn, "SELECT COUNT(*) FROM runs", []),
+         {:ok, total_cost} <- query_one_value(conn, "SELECT COALESCE(SUM(cost_usd), 0.0) FROM runs", []),
          {:ok, by_mode} <- query_kv(conn, "SELECT mode, COUNT(*) FROM runs GROUP BY mode", []),
          {:ok, by_outcome} <- query_kv(conn, "SELECT outcome, COUNT(*) FROM runs GROUP BY outcome", []),
          {:ok, gate_stats} <- query_gate_stats(conn),
@@ -372,6 +373,7 @@ defmodule Karkhana.Store do
       {:ok,
        %{
          total: total,
+         total_cost: total_cost || 0.0,
          by_mode: by_mode,
          by_outcome: by_outcome,
          gate_pass_rate: gate_stats,

@@ -30,6 +30,8 @@ defmodule KarkhanaWeb.Router do
     pipe_through(:browser)
 
     live("/", DashboardLive, :index)
+    live("/sessions/:identifier", SessionLive, :show)
+    live("/transcripts/:sandbox", TranscriptLive, :show)
   end
 
   scope "/", KarkhanaWeb do

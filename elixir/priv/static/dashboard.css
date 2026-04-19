@@ -461,3 +461,87 @@ pre,
     padding: 1rem;
   }
 }
+
+/* --- Session cards --- */
+.session-card {
+  margin-top: 0.75rem;
+  padding: 1rem;
+  background: #fafafa;
+  border-radius: 10px;
+  border: 1px solid #e5e5e5;
+}
+
+.session-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.session-card-status {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.session-card-meta {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+
+/* --- Event stream --- */
+.event-stream {
+  max-height: 600px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  padding: 0.5rem 0;
+}
+
+.event-row {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border-bottom: 1px solid #f0f0f0;
+  align-items: baseline;
+}
+
+.event-row:hover {
+  background: #f8f8f8;
+}
+
+.event-time {
+  flex-shrink: 0;
+  width: 5.5rem;
+  color: #888;
+}
+
+.event-type-badge {
+  flex-shrink: 0;
+  width: 5rem;
+  text-align: center;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.event-type-tool_use, .event-type-tool { background: #dbeafe; color: #1d4ed8; }
+.event-type-assistant { background: #f3e8ff; color: #7c3aed; }
+.event-type-session, .event-type-session_started { background: #d1fae5; color: #065f46; }
+.event-type-turn, .event-type-turn_start, .event-type-turn_end { background: #fef3c7; color: #92400e; }
+.event-type-result { background: #d1fae5; color: #065f46; }
+.event-type-error { background: #fee2e2; color: #991b1b; }
+
+.event-summary {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #333;
+}
+
+.state-badge-active { background: #dbeafe; color: #1d4ed8; }
+.state-badge-warning { background: #fef3c7; color: #92400e; }
+.state-badge-live { background: #d1fae5; color: #065f46; }
