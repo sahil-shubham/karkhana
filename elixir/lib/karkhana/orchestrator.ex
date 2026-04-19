@@ -144,10 +144,19 @@ defmodule Karkhana.Orchestrator do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}")
 
-              state
-              |> record_completed_run(running_entry, :success)
-              |> complete_issue(issue_id)
-              |> lifecycle_on_complete(issue_id, running_entry)
+              gate_result = Map.get(running_entry, :gate_result)
+
+              if gate_result == :fail do
+                # Agent exited normally but gates failed — don't advance
+                Logger.warning("Agent task exited normally but gates failed for issue_id=#{issue_id}; not advancing")
+
+                handle_abnormal_exit(state, issue_id, session_id, running_entry, {:gate_failed_normal_exit, Map.get(running_entry, :gate_output)})
+              else
+                state
+                |> record_completed_run(running_entry, :success)
+                |> complete_issue(issue_id)
+                |> lifecycle_on_complete(issue_id, running_entry)
+              end
 
             # Gate failure with structured feedback
             {%RuntimeError{message: msg}, _stack} ->
@@ -826,39 +835,50 @@ defmodule Karkhana.Orchestrator do
     }
   end
 
-  # Lifecycle on_complete: transition issue to next state, stop sandbox at human gates
+  # Lifecycle on_complete: transition issue to next state, stop sandbox at human gates.
+  # Only called after a verified successful run with passing gates.
   defp lifecycle_on_complete(state, issue_id, running_entry) do
     lifecycle = Config.settings!().lifecycle
     issue_state = running_entry.issue.state
     on_complete = Karkhana.Config.Schema.Lifecycle.on_complete_state(lifecycle, issue_state)
     sandbox_id = Map.get(running_entry, :sandbox_id)
+    identifier = running_entry.identifier
 
-    if on_complete do
-      Logger.info("Lifecycle transition: #{issue_state} → #{on_complete} for issue_id=#{issue_id}")
+    cond do
+      is_nil(on_complete) ->
+        # No lifecycle transition configured for this state
+        state
 
-      # Transition the issue to the on_complete state
-      case Tracker.update_issue_state(issue_id, on_complete) do
-        :ok ->
-          Logger.info("Moved issue #{running_entry.identifier} to #{on_complete}")
+      issue_state == on_complete ->
+        # Already in the target state (shouldn't happen, but guard)
+        Logger.warning("lifecycle_on_complete: #{identifier} already in #{on_complete}, skipping")
+        state
 
-        {:error, reason} ->
-          Logger.warning("Failed to move issue #{running_entry.identifier} to #{on_complete}: #{inspect(reason)}")
-      end
+      true ->
+        Logger.info("Lifecycle transition: #{issue_state} → #{on_complete} for #{identifier}")
 
-      # If the next state is a human_gate with sandbox: stop, pause the sandbox
-      next_sandbox_action = Karkhana.Config.Schema.Lifecycle.sandbox_action(lifecycle, on_complete)
+        case Tracker.update_issue_state(issue_id, on_complete) do
+          :ok ->
+            Logger.info("Moved #{identifier} to #{on_complete}")
 
-      if next_sandbox_action == "stop" and is_binary(sandbox_id) do
-        Logger.info("Stopping sandbox #{sandbox_id} at human gate #{on_complete}")
-
-        case Karkhana.Bhatti.Client.stop_sandbox(sandbox_id) do
-          :ok -> :ok
-          {:error, reason} -> Logger.warning("Failed to stop sandbox #{sandbox_id}: #{inspect(reason)}")
+          {:error, reason} ->
+            Logger.warning("Failed to move #{identifier} to #{on_complete}: #{inspect(reason)}")
         end
-      end
-    end
 
-    state
+        # If the next state is a human_gate with sandbox: stop, pause the sandbox
+        next_sandbox_action = Karkhana.Config.Schema.Lifecycle.sandbox_action(lifecycle, on_complete)
+
+        if next_sandbox_action == "stop" and is_binary(sandbox_id) do
+          Logger.info("Stopping sandbox #{sandbox_id} at human gate #{on_complete}")
+
+          case Karkhana.Bhatti.Client.stop_sandbox(sandbox_id) do
+            :ok -> :ok
+            {:error, reason} -> Logger.warning("Failed to stop sandbox #{sandbox_id}: #{inspect(reason)}")
+          end
+        end
+
+        state
+    end
   end
 
   defp handle_abnormal_exit(state, issue_id, session_id, running_entry, reason) do
