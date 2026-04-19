@@ -4,17 +4,27 @@ defmodule Karkhana do
   """
 
   @doc """
-  Start the orchestrator in the current BEAM node.
+  Start the dispatcher in the current BEAM node.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    Karkhana.Orchestrator.start_link(opts)
+    Karkhana.Dispatcher.start_link(opts)
   end
 end
 
 defmodule Karkhana.Application do
   @moduledoc """
-  OTP application entrypoint that starts core supervisors and workers.
+  OTP application entrypoint.
+
+  Supervision tree:
+  - PubSub: real-time event distribution
+  - Registry: session lookup by issue identifier
+  - Store: SQLite persistence
+  - WorkflowStore: config hot-reload
+  - WorkflowSync: Linear state sync
+  - SessionSupervisor: DynamicSupervisor for Session processes
+  - Dispatcher: polls Linear, starts sessions
+  - HttpServer: Phoenix dashboard
   """
 
   use Application
@@ -25,12 +35,13 @@ defmodule Karkhana.Application do
 
     children = [
       {Phoenix.PubSub, name: Karkhana.PubSub},
-      {Task.Supervisor, name: Karkhana.TaskSupervisor},
+      {Registry, keys: :unique, name: Karkhana.SessionRegistry},
       Karkhana.Store,
       Karkhana.WorkflowStore,
-      Karkhana.Orchestrator,
-      Karkhana.HttpServer,
-      Karkhana.StatusDashboard
+      Karkhana.Linear.WorkflowSync,
+      Karkhana.SessionSupervisor,
+      Karkhana.Dispatcher,
+      Karkhana.HttpServer
     ]
 
     Supervisor.start_link(
@@ -38,11 +49,5 @@ defmodule Karkhana.Application do
       strategy: :one_for_one,
       name: Karkhana.Supervisor
     )
-  end
-
-  @impl true
-  def stop(_state) do
-    Karkhana.StatusDashboard.render_offline_status()
-    :ok
   end
 end

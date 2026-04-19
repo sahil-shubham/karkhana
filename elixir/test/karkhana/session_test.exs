@@ -218,7 +218,11 @@ defmodule Karkhana.SessionTest do
     end
 
     test "lookup returns nil when registry is running and session doesn't exist" do
-      start_supervised!({Registry, keys: :unique, name: Karkhana.SessionRegistry})
+      # Only start if not already running (another test may have started it)
+      unless Process.whereis(Karkhana.SessionRegistry) do
+        start_supervised!({Registry, keys: :unique, name: Karkhana.SessionRegistry})
+      end
+
       assert Session.lookup("NONEXISTENT-999") == nil
     end
   end
