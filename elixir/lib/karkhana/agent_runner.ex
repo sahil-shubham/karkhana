@@ -190,7 +190,6 @@ defmodule Karkhana.AgentRunner do
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
-
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = String.downcase(String.trim(state_name))
 
@@ -208,9 +207,10 @@ defmodule Karkhana.AgentRunner do
       case Protocol.load(workspace) do
         {:ok, protocol} ->
           # Find the gate for the current mode
-          matched = Enum.find(protocol.modes, fn m ->
-            mode_name_matches?(m, mode)
-          end)
+          matched =
+            Enum.find(protocol.modes, fn m ->
+              mode_name_matches?(m, mode)
+            end)
 
           if matched && matched.gate do
             gate_path = Path.join(protocol.dir, matched.gate)
@@ -252,18 +252,24 @@ defmodule Karkhana.AgentRunner do
   end
 
   defp mode_name_matches?(%{match: %{"label" => label}}, mode), do: label == mode
+
   defp mode_name_matches?(%{prompt: prompt}, mode) when is_binary(prompt) do
     prompt |> Path.basename() |> Path.rootname() == mode
   end
+
   defp mode_name_matches?(_, _), do: false
 
   defp send_gate_result(recipient, %Issue{id: issue_id}, mode, result, output)
        when is_pid(recipient) and is_binary(issue_id) do
-    send(recipient, {:worker_runtime_info, issue_id, %{
-      gate: mode,
-      gate_result: result,
-      gate_output: output
-    }})
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id,
+       %{
+         gate: mode,
+         gate_result: result,
+         gate_output: output
+       }}
+    )
   end
 
   defp send_gate_result(_, _, _, _, _), do: :ok

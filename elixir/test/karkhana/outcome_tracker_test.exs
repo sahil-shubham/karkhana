@@ -10,9 +10,10 @@ defmodule Karkhana.OutcomeTrackerTest do
 
   describe "summarize/1" do
     test "all zero-touch produces 100% rate" do
-      outcomes = for i <- 1..5 do
-        %{issue_id: "#{i}", identifier: "T-#{i}", outcome: :zero_touch, touches: 0, closed_at: nil}
-      end
+      outcomes =
+        for i <- 1..5 do
+          %{issue_id: "#{i}", identifier: "T-#{i}", outcome: :zero_touch, touches: 0, closed_at: nil}
+        end
 
       summary = OutcomeTracker.summarize(outcomes)
       assert summary.total == 5
@@ -61,23 +62,26 @@ defmodule Karkhana.OutcomeTrackerTest do
     end
 
     test "direct Todo → In Review → Done is zero touch" do
-      issue = build_issue([
-        transition("Todo", "In Review"),
-        transition("In Review", "Done")
-      ])
+      issue =
+        build_issue([
+          transition("Todo", "In Review"),
+          transition("In Review", "Done")
+        ])
 
       assert classify(issue).touches == 0
       assert classify(issue).outcome == :zero_touch
     end
 
     test "one bounce In Review → In Progress is one touch" do
-      issue = build_issue([
-        transition("Todo", "In Progress"),
-        transition("In Progress", "In Review"),
-        transition("In Review", "In Progress"),    # ← bounce
-        transition("In Progress", "In Review"),
-        transition("In Review", "Done")
-      ])
+      issue =
+        build_issue([
+          transition("Todo", "In Progress"),
+          transition("In Progress", "In Review"),
+          # ← bounce
+          transition("In Review", "In Progress"),
+          transition("In Progress", "In Review"),
+          transition("In Review", "Done")
+        ])
 
       assert classify(issue).touches == 1
       assert classify(issue).outcome == :one_touch
@@ -87,11 +91,14 @@ defmodule Karkhana.OutcomeTrackerTest do
       history = [
         transition("Todo", "In Progress"),
         transition("In Progress", "In Review"),
-        transition("In Review", "In Progress"),     # bounce 1
+        # bounce 1
+        transition("In Review", "In Progress"),
         transition("In Progress", "In Review"),
-        transition("In Review", "In Progress"),     # bounce 2
+        # bounce 2
+        transition("In Review", "In Progress"),
         transition("In Progress", "In Review"),
-        transition("In Review", "In Progress"),     # bounce 3
+        # bounce 3
+        transition("In Review", "In Progress"),
         transition("In Progress", "In Review"),
         transition("In Review", "Done")
       ]
@@ -102,9 +109,10 @@ defmodule Karkhana.OutcomeTrackerTest do
     end
 
     test "five bounces is heavy touch" do
-      bounces = for _ <- 1..5 do
-        [transition("In Review", "In Progress"), transition("In Progress", "In Review")]
-      end
+      bounces =
+        for _ <- 1..5 do
+          [transition("In Review", "In Progress"), transition("In Progress", "In Review")]
+        end
 
       history = [transition("Todo", "In Review")] ++ List.flatten(bounces) ++ [transition("In Review", "Done")]
 
@@ -115,30 +123,33 @@ defmodule Karkhana.OutcomeTrackerTest do
 
     test "other state transitions don't count as bounces" do
       # Backlog → Todo → In Progress is not a review bounce
-      issue = build_issue([
-        transition("Backlog", "Todo"),
-        transition("Todo", "In Progress"),
-        transition("In Progress", "In Review"),
-        transition("In Review", "Done")
-      ])
+      issue =
+        build_issue([
+          transition("Backlog", "Todo"),
+          transition("Todo", "In Progress"),
+          transition("In Progress", "In Review"),
+          transition("In Review", "Done")
+        ])
 
       assert classify(issue).touches == 0
     end
 
     test "case-insensitive state matching" do
-      issue = build_issue([
-        transition("in review", "in progress"),
-        transition("in progress", "In Review")
-      ])
+      issue =
+        build_issue([
+          transition("in review", "in progress"),
+          transition("in progress", "In Review")
+        ])
 
       assert classify(issue).touches == 1
     end
 
     test "nil states in history are handled" do
-      issue = build_issue([
-        %{"fromState" => nil, "toState" => %{"name" => "Todo"}, "createdAt" => "2026-01-01T00:00:00Z"},
-        transition("Todo", "In Review")
-      ])
+      issue =
+        build_issue([
+          %{"fromState" => nil, "toState" => %{"name" => "Todo"}, "createdAt" => "2026-01-01T00:00:00Z"},
+          transition("Todo", "In Review")
+        ])
 
       assert classify(issue).touches == 0
     end
@@ -169,18 +180,20 @@ defmodule Karkhana.OutcomeTrackerTest do
   defp classify(issue) do
     history = get_in(issue, ["history", "nodes"]) || []
 
-    touches = Enum.count(history, fn node ->
-      from = get_in(node, ["fromState", "name"])
-      to = get_in(node, ["toState", "name"])
-      normalize(from) == "in review" and normalize(to) == "in progress"
-    end)
+    touches =
+      Enum.count(history, fn node ->
+        from = get_in(node, ["fromState", "name"])
+        to = get_in(node, ["toState", "name"])
+        normalize(from) == "in review" and normalize(to) == "in progress"
+      end)
 
-    outcome = cond do
-      touches == 0 -> :zero_touch
-      touches == 1 -> :one_touch
-      touches <= 3 -> :multi_touch
-      true -> :heavy_touch
-    end
+    outcome =
+      cond do
+        touches == 0 -> :zero_touch
+        touches == 1 -> :one_touch
+        touches <= 3 -> :multi_touch
+        true -> :heavy_touch
+      end
 
     %{touches: touches, outcome: outcome}
   end

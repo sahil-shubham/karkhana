@@ -119,7 +119,9 @@ defmodule Karkhana.OutcomeTracker do
             {:ok, dt, _} -> dt
             _ -> nil
           end
-        _ -> nil
+
+        _ ->
+          nil
       end
 
     %{

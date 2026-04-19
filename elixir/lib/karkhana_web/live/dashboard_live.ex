@@ -413,6 +413,7 @@ defmodule KarkhanaWeb.DashboardLive do
   defp outcome_badge_class(_), do: "status-badge status-badge-offline"
 
   defp format_duration(nil), do: "n/a"
+
   defp format_duration(seconds) when is_number(seconds) do
     minutes = div(trunc(seconds), 60)
     secs = rem(trunc(seconds), 60)
@@ -494,7 +495,6 @@ defmodule KarkhanaWeb.DashboardLive do
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
-
 
   defp short_hash(nil), do: "—"
   defp short_hash(hash) when is_binary(hash) and byte_size(hash) > 8, do: binary_part(hash, 0, 8)

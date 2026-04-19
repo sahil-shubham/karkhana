@@ -15,6 +15,5 @@ if config_env() == :prod do
   end
 
   # Log file path — writable location in the sandbox
-  config :karkhana, :log_file,
-    System.get_env("KARKHANA_LOG_FILE") || "/tmp/karkhana.log"
+  config :karkhana, :log_file, System.get_env("KARKHANA_LOG_FILE") || "/tmp/karkhana.log"
 end

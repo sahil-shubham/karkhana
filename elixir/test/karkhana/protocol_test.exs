@@ -203,22 +203,24 @@ defmodule Karkhana.ProtocolTest do
       {:ok, protocol} = Protocol.load(project)
       mode = Protocol.resolve_mode(protocol, make_issue(["qa"]))
 
-      result = Karkhana.PromptBuilder.build_prompt(
-        make_issue(["qa"]),
-        mode: mode.name,
-        mode_prompt: mode.prompt_content
-      )
+      result =
+        Karkhana.PromptBuilder.build_prompt(
+          make_issue(["qa"]),
+          mode: mode.name,
+          mode_prompt: mode.prompt_content
+        )
 
       assert result =~ "QA for TST-1"
       assert result =~ "mode=qa"
     end
 
     test "mode variable available when mode_prompt provided" do
-      result = Karkhana.PromptBuilder.build_prompt(
-        make_issue(["qa"]),
-        mode: "qa",
-        mode_prompt: "Mode is {{ mode }} for {{ issue.identifier }}"
-      )
+      result =
+        Karkhana.PromptBuilder.build_prompt(
+          make_issue(["qa"]),
+          mode: "qa",
+          mode_prompt: "Mode is {{ mode }} for {{ issue.identifier }}"
+        )
 
       assert result =~ "Mode is qa"
       assert result =~ "TST-1"

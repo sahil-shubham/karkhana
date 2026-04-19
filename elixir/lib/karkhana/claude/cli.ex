@@ -47,17 +47,19 @@ defmodule Karkhana.Claude.CLI do
     # If --continue is in the args but the session dir doesn't exist
     # (sandbox was destroyed and recreated between turns), fall back
     # to a fresh invocation instead of failing silently.
-    other_args = if "--continue" in other_args do
-      case Bhatti.exec(sandbox_id, ["test", "-d", @session_dir], timeout_sec: 5) do
-        {:ok, %{"exit_code" => 0}} ->
-          other_args
-        _ ->
-          Logger.warning("Session dir missing in sandbox #{sandbox_id}, falling back to fresh invocation")
-          List.delete(other_args, "--continue")
+    other_args =
+      if "--continue" in other_args do
+        case Bhatti.exec(sandbox_id, ["test", "-d", @session_dir], timeout_sec: 5) do
+          {:ok, %{"exit_code" => 0}} ->
+            other_args
+
+          _ ->
+            Logger.warning("Session dir missing in sandbox #{sandbox_id}, falling back to fresh invocation")
+            List.delete(other_args, "--continue")
+        end
+      else
+        other_args
       end
-    else
-      other_args
-    end
 
     with :ok <- Bhatti.write_file(sandbox_id, @prompt_file, prompt) do
       command = Config.settings!().claude.command
@@ -69,8 +71,7 @@ defmodule Karkhana.Claude.CLI do
       # Use detached exec: bhatti launches the process and returns immediately
       # with a PID and output file. We poll the output file for NDJSON events.
       # This avoids Cloudflare 524 timeouts on long-running agent sessions.
-      case Bhatti.exec_detached(sandbox_id, ["bash", "-lc", shell_cmd],
-             timeout_sec: div(turn_timeout_ms, 1000)) do
+      case Bhatti.exec_detached(sandbox_id, ["bash", "-lc", shell_cmd], timeout_sec: div(turn_timeout_ms, 1000)) do
         {:ok, %{"output_file" => output_file, "pid" => _pid}} ->
           poll_output(sandbox_id, output_file, on_event, turn_timeout_ms)
 
@@ -114,15 +115,11 @@ defmodule Karkhana.Claude.CLI do
 
         _ ->
           # Check if the process is still running
-          case Bhatti.exec(sandbox_id, ["bash", "-c",
-                 "test -f #{output_file} && ! pgrep -f 'pi\\|claude' > /dev/null && echo done || echo running"],
-                 timeout_sec: 10) do
+          case Bhatti.exec(sandbox_id, ["bash", "-c", "test -f #{output_file} && ! pgrep -f 'pi\\|claude' > /dev/null && echo done || echo running"], timeout_sec: 10) do
             {:ok, %{"exit_code" => 0, "stdout" => stdout}} ->
               if String.trim(stdout) == "done" do
                 # Process finished — read any remaining output
-                case Bhatti.exec(sandbox_id, ["bash", "-c",
-                       "tail -n +#{lines_seen + 1} #{output_file} 2>/dev/null"],
-                       timeout_sec: 15) do
+                case Bhatti.exec(sandbox_id, ["bash", "-c", "tail -n +#{lines_seen + 1} #{output_file} 2>/dev/null"], timeout_sec: 15) do
                   {:ok, %{"exit_code" => 0, "stdout" => final_stdout}} when byte_size(final_stdout) > 0 ->
                     final_lines = String.split(final_stdout, "\n", trim: true)
                     final_state = process_lines(final_lines, on_event, state)
@@ -204,9 +201,12 @@ defmodule Karkhana.Claude.CLI do
     continuation = is_integer(attempt) and attempt > 0
 
     base = [
-      "-p", prompt,
-      "--mode", "json",
-      "--session-dir", @session_dir
+      "-p",
+      prompt,
+      "--mode",
+      "json",
+      "--session-dir",
+      @session_dir
     ]
 
     base = if continuation, do: base ++ ["--continue"], else: base
@@ -217,10 +217,13 @@ defmodule Karkhana.Claude.CLI do
 
   defp build_claude_args(prompt, settings) do
     base = [
-      "-p", prompt,
+      "-p",
+      prompt,
       "--verbose",
-      "--output-format", "stream-json",
-      "--max-turns", to_string(settings.max_turns)
+      "--output-format",
+      "stream-json",
+      "--max-turns",
+      to_string(settings.max_turns)
     ]
 
     base

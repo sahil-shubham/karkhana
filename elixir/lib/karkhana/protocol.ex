@@ -98,7 +98,9 @@ defmodule Karkhana.Protocol do
         prompt_path = Path.join(protocol.dir, mode.prompt)
 
         case File.read(prompt_path) do
-          {:ok, content} -> content
+          {:ok, content} ->
+            content
+
           {:error, reason} ->
             Logger.warning("Failed to load mode prompt #{prompt_path}: #{inspect(reason)}")
             nil

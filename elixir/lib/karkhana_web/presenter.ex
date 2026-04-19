@@ -224,6 +224,7 @@ defmodule KarkhanaWeb.Presenter do
     case Karkhana.OutcomeTracker.scan_recent(days: 7) do
       {:ok, outcomes} ->
         summary = Karkhana.OutcomeTracker.summarize(outcomes)
+
         %{
           total: summary.total,
           zero_touch: summary.zero_touch,

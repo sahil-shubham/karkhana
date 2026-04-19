@@ -93,8 +93,7 @@ defmodule Karkhana.Bhatti.Client do
 
     request = {String.to_charlist(url), headers, ~c"application/json", body}
 
-    case :httpc.request(:post, request, [timeout: timeout_sec * 1000],
-           sync: false, stream: :self, body_format: :binary) do
+    case :httpc.request(:post, request, [timeout: timeout_sec * 1000], sync: false, stream: :self, body_format: :binary) do
       {:ok, request_id} ->
         stream_receive_loop(request_id, on_stdout_line, "", nil, timeout_sec * 1000)
 

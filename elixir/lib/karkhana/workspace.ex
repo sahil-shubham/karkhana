@@ -38,7 +38,9 @@ defmodule Karkhana.Workspace do
   @spec run_after_run_hook(String.t(), map()) :: :ok
   def run_after_run_hook(sandbox_id, issue) do
     case run_hook(sandbox_id, Config.settings!().hooks.after_run, "after_run", issue) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, reason} ->
         Logger.warning("after_run hook failed for #{issue_log(issue)}: #{inspect(reason)}")
         :ok
@@ -57,6 +59,7 @@ defmodule Karkhana.Workspace do
 
         # Run before_remove hook best-effort
         hook = Config.settings!().hooks.before_remove
+
         if hook do
           run_hook_raw(sandbox_id, hook, "before_remove")
         end
@@ -124,18 +127,25 @@ defmodule Karkhana.Workspace do
 
         # Inject sandbox identity so the agent can self-publish preview URLs
         bhatti_api_key = System.get_env("BHATTI_API_KEY") || ""
-        Client.exec(sandbox_id, ["bash", "-c",
-          "echo 'export BHATTI_SANDBOX_ID=#{sandbox_id}' >> /home/lohar/.bashrc && " <>
-          "echo 'export BHATTI_API_KEY=#{bhatti_api_key}' >> /home/lohar/.bashrc"
-        ], timeout_sec: 10)
+
+        Client.exec(
+          sandbox_id,
+          [
+            "bash",
+            "-c",
+            "echo 'export BHATTI_SANDBOX_ID=#{sandbox_id}' >> /home/lohar/.bashrc && " <>
+              "echo 'export BHATTI_API_KEY=#{bhatti_api_key}' >> /home/lohar/.bashrc"
+          ], timeout_sec: 10)
 
         # Run after_create hook (installs pi CLI, clones repo, etc)
         hook = settings.hooks.after_create
-        hook_result = if hook do
-          run_hook_raw(sandbox_id, hook, "after_create")
-        else
-          :ok
-        end
+
+        hook_result =
+          if hook do
+            run_hook_raw(sandbox_id, hook, "after_create")
+          else
+            :ok
+          end
 
         case hook_result do
           :ok ->

@@ -817,9 +817,9 @@ defmodule Karkhana.Orchestrator do
 
       Logger.error(
         "Retry cap reached for issue_id=#{issue_id} " <>
-        "issue_identifier=#{identifier} " <>
-        "attempts=#{next_attempt} error_class=#{error_class} " <>
-        "error=#{error}"
+          "issue_identifier=#{identifier} " <>
+          "attempts=#{next_attempt} error_class=#{error_class} " <>
+          "error=#{error}"
       )
 
       post_failure_comment(issue_id, identifier, error, next_attempt, error_class)
@@ -1052,6 +1052,7 @@ defmodule Karkhana.Orchestrator do
       case Karkhana.Linear.Client.post_comment(issue_id, body, api_key) do
         {:ok, _} ->
           Logger.info("Posted failure comment for #{identifier}")
+
         {:error, reason} ->
           Logger.warning("Failed to post failure comment for #{identifier}: #{inspect(reason)}")
       end
@@ -1060,6 +1061,7 @@ defmodule Karkhana.Orchestrator do
       case Karkhana.Linear.Adapter.update_issue_state(issue_id, "Backlog") do
         :ok ->
           Logger.info("Moved #{identifier} to Backlog")
+
         {:error, reason} ->
           Logger.warning("Failed to move #{identifier} to Backlog: #{inspect(reason)}")
       end
@@ -1439,6 +1441,7 @@ defmodule Karkhana.Orchestrator do
   defp record_session_completion_totals(state, _running_entry), do: state
 
   defp record_completed_run(state, running_entry, outcome, error_message \\ nil)
+
   defp record_completed_run(state, running_entry, outcome, error_message)
        when is_map(running_entry) do
     now = DateTime.utc_now()
@@ -1475,10 +1478,10 @@ defmodule Karkhana.Orchestrator do
 
     Logger.info(
       "Run completed: #{run.issue_identifier} " <>
-      "outcome=#{outcome} " <>
-      "tokens=#{run.tokens.total} " <>
-      "cost=$#{:erlang.float_to_binary(run.cost_usd, decimals: 4)} " <>
-      "duration=#{run.duration_seconds}s"
+        "outcome=#{outcome} " <>
+        "tokens=#{run.tokens.total} " <>
+        "cost=$#{:erlang.float_to_binary(run.cost_usd, decimals: 4)} " <>
+        "duration=#{run.duration_seconds}s"
     )
 
     # Persist to store (best-effort, don't crash orchestrator)
