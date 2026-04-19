@@ -194,84 +194,42 @@ defmodule KarkhanaWeb.DashboardLive do
           <%= if @payload.running == [] do %>
             <p class="empty-state">No active sessions.</p>
           <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Mode</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Agent update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class="mode-badge"><%= Map.get(entry, :mode) || "—" %></span>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+            <div :for={entry <- @payload.running} class="section-card" style="margin-top: 0.75rem; padding: 1rem;">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap;">
+                <div>
+                  <span class="issue-id" style="font-size: 1.1rem;"><%= entry.issue_identifier %></span>
+                  <span class={state_badge_class(entry.state)} style="margin-left: 0.5rem;"><%= entry.state %></span>
+                  <%= if Map.get(entry, :mode) do %>
+                    <span class="mode-badge" style="margin-left: 0.25rem;"><%= entry.mode %></span>
+                  <% end %>
+                </div>
+                <div class="numeric" style="text-align: right;">
+                  <span><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></span>
+                  <%= if Map.get(entry, :cost_usd, 0.0) > 0 do %>
+                    <span class="muted" style="margin-left: 0.75rem;">$<%= :erlang.float_to_binary((entry.cost_usd || 0.0) + 0.0, decimals: 2) %></span>
+                  <% end %>
+                </div>
+              </div>
+
+              <div style="margin-top: 0.75rem; padding: 0.5rem 0.75rem; background: var(--surface-raised, #1a1a2e); border-radius: 6px; font-size: 0.875rem;">
+                <span style="opacity: 0.7;"><%= entry.last_event || "waiting" %></span>
+                <span style="margin-left: 0.5rem;"><%= entry.last_message || "No activity yet" %></span>
+              </div>
+
+              <div style="margin-top: 0.5rem; display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: 0.8rem;" class="muted">
+                <span>Tokens: <span class="numeric"><%= format_int(entry.tokens.total_tokens) %></span></span>
+                <span>In: <span class="numeric"><%= format_int(entry.tokens.input_tokens) %></span></span>
+                <span>Out: <span class="numeric"><%= format_int(entry.tokens.output_tokens) %></span></span>
+                <%= if Map.get(entry.tokens, :cache_read, 0) > 0 do %>
+                  <span>Cache: <span class="numeric"><%= format_int(entry.tokens.cache_read) %></span></span>
+                <% end %>
+                <%= if entry.session_id do %>
+                  <span>Session: <span class="mono"><%= String.slice(entry.session_id, 0..7) %></span></span>
+                <% end %>
+                <%= if Map.get(entry, :sandbox_id) do %>
+                  <span>Sandbox: <span class="mono"><%= String.slice(entry.sandbox_id, 0..7) %></span></span>
+                <% end %>
+              </div>
             </div>
           <% end %>
         </section>
@@ -334,9 +292,9 @@ defmodule KarkhanaWeb.DashboardLive do
                     <th>Mode</th>
                     <th>Outcome</th>
                     <th>Gate</th>
-                    <th>Tokens</th>
                     <th>Cost</th>
                     <th>Duration</th>
+                    <th>Error</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -359,14 +317,17 @@ defmodule KarkhanaWeb.DashboardLive do
                         <% _ -> %><span class="muted">—</span>
                       <% end %>
                     </td>
-                    <td class="numeric">
-                      <div class="token-stack">
-                        <span><%= format_int(run.tokens.total) %></span>
-                        <span class="muted">cache: <%= format_int(run.tokens.cache_read) %></span>
-                      </div>
-                    </td>
-                    <td class="numeric">$<%= :erlang.float_to_binary(run.cost_usd || 0.0, decimals: 4) %></td>
+                    <td class="numeric">$<%= :erlang.float_to_binary(run.cost_usd || 0.0, decimals: 2) %></td>
                     <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
+                    <td>
+                      <%= if run.error_message do %>
+                        <span class="error-text" title={Map.get(run, :error_raw) || run.error_message} style="font-size: 0.8rem; color: var(--danger, #eb5757);">
+                          <%= String.slice(run.error_message, 0, 120) %>
+                        </span>
+                      <% else %>
+                        <span class="muted">—</span>
+                      <% end %>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -443,7 +404,8 @@ defmodule KarkhanaWeb.DashboardLive do
       end)
   end
 
-  defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
+  defp format_runtime_and_turns(started_at, turn_count, now)
+       when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
   end
 
@@ -461,7 +423,8 @@ defmodule KarkhanaWeb.DashboardLive do
     DateTime.diff(now, started_at, :second)
   end
 
-  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now) when is_binary(started_at) do
+  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now)
+       when is_binary(started_at) do
     case DateTime.from_iso8601(started_at) do
       {:ok, parsed, _offset} -> runtime_seconds_from_started_at(parsed, now)
       _ -> 0
@@ -485,10 +448,17 @@ defmodule KarkhanaWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
-      String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
-      true -> base
+      String.contains?(normalized, ["progress", "running", "active"]) ->
+        "#{base} state-badge-active"
+
+      String.contains?(normalized, ["blocked", "error", "failed"]) ->
+        "#{base} state-badge-danger"
+
+      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) ->
+        "#{base} state-badge-warning"
+
+      true ->
+        base
     end
   end
 
