@@ -135,7 +135,9 @@ defmodule Karkhana.Workspace do
             "-c",
             "echo 'export BHATTI_SANDBOX_ID=#{sandbox_id}' >> /home/lohar/.bashrc && " <>
               "echo 'export BHATTI_API_KEY=#{bhatti_api_key}' >> /home/lohar/.bashrc"
-          ], timeout_sec: 10)
+          ],
+          timeout_sec: 10
+        )
 
         # Run after_create hook (installs pi CLI, clones repo, etc)
         hook = settings.hooks.after_create
