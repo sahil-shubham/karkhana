@@ -87,3 +87,15 @@ SQLite at `~/.karkhana/store.db`. Three tables: `runs`, `config_events`,
 POST /webhooks/linear — receives Linear webhook pushes. Verifies HMAC
 signature with LINEAR_WEBHOOK_SECRET env var. Parses into Tracker.Event,
 pushes to orchestrator.
+
+## Architecture docs
+
+Local design docs at `docs/` (gitignored):
+- `docs/LIFECYCLE.md` — **the current architecture**: lifecycle model,
+  modes, gates, bhatti primitives, Linear workflow sync, all actionables.
+  This is the authoritative design doc.
+- `docs/SYSTEM.md` — early architecture (partially superseded by LIFECYCLE.md)
+- `docs/WORKSHOP.md` — engineering methodology model
+- `docs/SESSION-INSIGHTS.md` — evidence from 76 bhatti build sessions
+- `docs/PLAN.md` — original implementation plan (Parts 1-4 valid,
+  Parts 5-8 superseded by LIFECYCLE.md)

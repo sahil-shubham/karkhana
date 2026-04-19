@@ -317,6 +317,224 @@ defmodule Karkhana.Config.Schema do
     end
   end
 
+  defmodule Lifecycle do
+    @moduledoc """
+    Lifecycle configuration mapping Linear workflow states to karkhana behavior.
+
+    Each state has a type:
+    - `dispatch` — karkhana dispatches an agent with the configured mode
+    - `human_gate` — karkhana pauses, human reviews and advances
+    - `terminal` — karkhana destroys the sandbox
+    - `idle` — karkhana ignores (human-managed states)
+
+    State configs also carry:
+    - `linear_type` — Linear state type for auto-sync (backlog, unstarted, started, completed, canceled)
+    - `mode` — mode name for dispatch states
+    - `on_complete` — state to transition to when agent + gates succeed
+    - `sandbox` — sandbox action at this state (stop, destroy, or nil)
+    - `color` — hex color for Linear UI
+    - `description` — state description for Linear
+    """
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:auto_sync, :boolean, default: true)
+      field(:states, :map, default: %{})
+    end
+
+    @valid_types ["dispatch", "human_gate", "terminal", "idle"]
+    @valid_linear_types ["backlog", "unstarted", "started", "completed", "canceled"]
+    @valid_sandbox_actions ["stop", "destroy"]
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:auto_sync, :states], empty_values: [])
+      |> validate_states()
+    end
+
+    defp validate_states(changeset) do
+      validate_change(changeset, :states, fn :states, states ->
+        Enum.flat_map(states, fn {name, config} ->
+          validate_state_config(name, config)
+        end)
+      end)
+    end
+
+    defp validate_state_config(name, config) when is_map(config) do
+      type = config["type"] || config[:type]
+      errors = []
+
+      errors =
+        if type in @valid_types,
+          do: errors,
+          else: [{:states, "state '#{name}' has invalid type '#{type}'; must be one of #{inspect(@valid_types)}"}]
+
+      errors =
+        case config["linear_type"] || config[:linear_type] do
+          nil -> errors
+          lt when lt in @valid_linear_types -> errors
+          lt -> [{:states, "state '#{name}' has invalid linear_type '#{lt}'"} | errors]
+        end
+
+      errors =
+        if type == "dispatch" and (config["mode"] || config[:mode]) in [nil, ""] do
+          [{:states, "dispatch state '#{name}' must specify a mode"} | errors]
+        else
+          errors
+        end
+
+      errors =
+        case config["sandbox"] || config[:sandbox] do
+          nil -> errors
+          s when s in @valid_sandbox_actions -> errors
+          s -> [{:states, "state '#{name}' has invalid sandbox action '#{s}'"} | errors]
+        end
+
+      errors
+    end
+
+    defp validate_state_config(name, _config) do
+      [{:states, "state '#{name}' config must be a map"}]
+    end
+
+    @doc "Returns state names where karkhana should dispatch agents."
+    @spec dispatch_states(%__MODULE__{}) :: [String.t()]
+    def dispatch_states(%__MODULE__{states: states}) do
+      states
+      |> Enum.filter(fn {_name, config} -> state_type(config) == "dispatch" end)
+      |> Enum.map(fn {name, _config} -> name end)
+    end
+
+    @doc "Returns state names that are terminal (issue is done/cancelled)."
+    @spec terminal_states(%__MODULE__{}) :: [String.t()]
+    def terminal_states(%__MODULE__{states: states}) do
+      states
+      |> Enum.filter(fn {_name, config} -> state_type(config) == "terminal" end)
+      |> Enum.map(fn {name, _config} -> name end)
+    end
+
+    @doc "Returns state names that are human gates."
+    @spec human_gate_states(%__MODULE__{}) :: [String.t()]
+    def human_gate_states(%__MODULE__{states: states}) do
+      states
+      |> Enum.filter(fn {_name, config} -> state_type(config) == "human_gate" end)
+      |> Enum.map(fn {name, _config} -> name end)
+    end
+
+    @doc "Get the mode name for a given state. Returns nil for non-dispatch states."
+    @spec mode_for_state(%__MODULE__{}, String.t()) :: String.t() | nil
+    def mode_for_state(%__MODULE__{states: states}, state_name) do
+      case Map.get(states, state_name) do
+        %{"mode" => mode} -> mode
+        _ -> nil
+      end
+    end
+
+    @doc "Get the on_complete target state for a given state."
+    @spec on_complete_state(%__MODULE__{}, String.t()) :: String.t() | nil
+    def on_complete_state(%__MODULE__{states: states}, state_name) do
+      case Map.get(states, state_name) do
+        %{"on_complete" => target} -> target
+        _ -> nil
+      end
+    end
+
+    @doc "Get the sandbox action for a given state (stop, destroy, or nil)."
+    @spec sandbox_action(%__MODULE__{}, String.t()) :: String.t() | nil
+    def sandbox_action(%__MODULE__{states: states}, state_name) do
+      case Map.get(states, state_name) do
+        %{"sandbox" => action} -> action
+        _ -> nil
+      end
+    end
+
+    @doc "Get the state config map for a given state name."
+    @spec state_config(%__MODULE__{}, String.t()) :: map() | nil
+    def state_config(%__MODULE__{states: states}, state_name) do
+      Map.get(states, state_name)
+    end
+
+    defp state_type(%{"type" => type}), do: type
+    defp state_type(_), do: nil
+  end
+
+  defmodule Modes do
+    @moduledoc """
+    Mode configuration: prompt, agent tuning, artifact contracts, gates.
+    Stored as a map of mode_name => mode_config.
+    """
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:configs, :map, default: %{})
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:configs], empty_values: [])
+    end
+
+    @doc "Get mode config by name."
+    @spec get(%__MODULE__{}, String.t()) :: map() | nil
+    def get(%__MODULE__{configs: configs}, mode_name) do
+      Map.get(configs, mode_name)
+    end
+
+    @doc "Get the prompt path for a mode."
+    @spec prompt_path(%__MODULE__{}, String.t()) :: String.t() | nil
+    def prompt_path(%__MODULE__{} = modes, mode_name) do
+      case get(modes, mode_name) do
+        %{"prompt" => path} -> path
+        _ -> nil
+      end
+    end
+
+    @doc "Get the gate specs for a mode."
+    @spec gates(%__MODULE__{}, String.t()) :: [map()]
+    def gates(%__MODULE__{} = modes, mode_name) do
+      case get(modes, mode_name) do
+        %{"gates" => gates} when is_list(gates) -> gates
+        _ -> []
+      end
+    end
+
+    @doc "Get max_turns for a mode, with fallback."
+    @spec max_turns(%__MODULE__{}, String.t(), integer()) :: integer()
+    def max_turns(%__MODULE__{} = modes, mode_name, default \\ 20) do
+      case get(modes, mode_name) do
+        %{"agent" => %{"max_turns" => turns}} when is_integer(turns) -> turns
+        _ -> default
+      end
+    end
+  end
+
+  defmodule Project do
+    @moduledoc "Project metadata: name, language, build/test commands."
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:name, :string)
+      field(:language, :string)
+      field(:build, :string)
+      field(:test, :string)
+      field(:repo, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:name, :language, :build, :test, :repo], empty_values: [])
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -329,6 +547,9 @@ defmodule Karkhana.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:lifecycle, Lifecycle, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:modes, Modes, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:project, Project, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -336,6 +557,7 @@ defmodule Karkhana.Config.Schema do
     config
     |> normalize_keys()
     |> drop_nil_values()
+    |> reshape_modes()
     |> changeset()
     |> apply_action(:validate)
     |> case do
@@ -423,6 +645,9 @@ defmodule Karkhana.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:lifecycle, with: &Lifecycle.changeset/2)
+    |> cast_embed(:project, with: &Project.changeset/2)
+    |> cast_embed(:modes, with: &Modes.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -449,8 +674,33 @@ defmodule Karkhana.Config.Schema do
         api_key: resolve_secret_setting(settings.bhatti.api_key, System.get_env("BHATTI_API_KEY"))
     }
 
+    # When lifecycle is configured, derive active_states and terminal_states from it
+    # so existing orchestrator code continues to work until the lifecycle migration is complete.
+    tracker =
+      if settings.lifecycle.states != %{} do
+        derived_active = Lifecycle.dispatch_states(settings.lifecycle)
+        derived_terminal = Lifecycle.terminal_states(settings.lifecycle)
+        %{tracker | active_states: derived_active, terminal_states: derived_terminal}
+      else
+        tracker
+      end
+
     %{settings | tracker: tracker, workspace: workspace, codex: codex, bhatti: bhatti}
   end
+
+  # Modes in workflow.yaml is a map of mode_name => config.
+  # Reshape it into %{"modes" => %{"configs" => original_map}} so the
+  # Modes embed (which has a single :configs field) can receive it.
+  defp reshape_modes(%{"modes" => modes} = config) when is_map(modes) do
+    # If it already has a "configs" key, it's already shaped correctly
+    if Map.has_key?(modes, "configs") do
+      config
+    else
+      Map.put(config, "modes", %{"configs" => modes})
+    end
+  end
+
+  defp reshape_modes(config), do: config
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

@@ -27,6 +27,77 @@ defmodule Karkhana.Bhatti.Client do
     end
   end
 
+  @doc """
+  Checkpoint a running sandbox. Snapshots VM state to disk without
+  interrupting the running process. Used before gate checks so we
+  can resume from the checkpoint if a gate fails.
+  """
+  @spec checkpoint(String.t()) :: {:ok, map()} | {:error, term()}
+  def checkpoint(sandbox_id) do
+    post("/sandboxes/#{sandbox_id}/checkpoint", %{})
+  end
+
+  @doc """
+  Stop (pause) a sandbox. Snapshots the VM to disk and frees host
+  resources. Resume with start/1. Used at human gates to free RAM
+  while waiting for review.
+  """
+  @spec stop_sandbox(String.t()) :: :ok | {:error, term()}
+  def stop_sandbox(sandbox_id) do
+    case request(:post, "/sandboxes/#{sandbox_id}/stop") do
+      {:ok, %{status: 200}} -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, {:http_error, status, body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Start (resume) a stopped sandbox. Resumes from snapshot in ~3ms.
+  Used when a human approves work at a gate and karkhana dispatches
+  the next mode.
+  """
+  @spec start_sandbox(String.t()) :: :ok | {:error, term()}
+  def start_sandbox(sandbox_id) do
+    case request(:post, "/sandboxes/#{sandbox_id}/start") do
+      {:ok, %{status: 200}} -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, {:http_error, status, body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Generate a one-time shell token for browser-based terminal access.
+  Returns %{"token" => ..., "url" => ...}. Used in the dashboard
+  so reviewers can inspect sandbox state during human gates.
+  """
+  @spec create_shell_token(String.t()) :: {:ok, map()} | {:error, term()}
+  def create_shell_token(sandbox_id) do
+    post("/sandboxes/#{sandbox_id}/shell-token", %{})
+  end
+
+  @doc """
+  Publish a port inside the sandbox as a public URL.
+  Used by QA agents to expose running services for review.
+  """
+  @spec publish(String.t(), integer(), keyword()) :: {:ok, map()} | {:error, term()}
+  def publish(sandbox_id, port, opts \\ []) do
+    body = %{"port" => port}
+    body = if opts[:alias], do: Map.put(body, "alias", opts[:alias]), else: body
+    post("/sandboxes/#{sandbox_id}/publish", body)
+  end
+
+  @doc """
+  Update sandbox attributes (e.g. keep_hot toggle).
+  """
+  @spec update_sandbox(String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def update_sandbox(sandbox_id, attrs) when is_map(attrs) do
+    case request(:patch, "/sandboxes/#{sandbox_id}", attrs) do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: status, body: body}} -> {:error, {:http_error, status, body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec list_sandboxes() :: {:ok, [map()]} | {:error, term()}
   def list_sandboxes do
     get("/sandboxes")
@@ -238,13 +309,14 @@ defmodule Karkhana.Bhatti.Client do
         {:delete, _} ->
           {String.to_charlist(url), headers}
 
-        {:post, body} ->
+        {_, body} when body != nil ->
           {String.to_charlist(url), headers, ~c"application/json", Jason.encode!(body)}
+
+        _ ->
+          {String.to_charlist(url), headers}
       end
 
-    http_method = if method == :delete, do: :delete, else: method
-
-    case :httpc.request(http_method, http_req, [timeout: @timeout_ms], body_format: :binary) do
+    case :httpc.request(method, http_req, [timeout: @timeout_ms], body_format: :binary) do
       {:ok, {{_, status, _}, _resp_headers, resp_body}} ->
         decoded =
           case Jason.decode(resp_body) do
