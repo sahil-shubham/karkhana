@@ -10,7 +10,8 @@ defmodule Karkhana.Store do
   use GenServer
   require Logger
 
-  @default_path Path.join(System.user_home!(), ".karkhana/store.db")
+  @default_dir ".karkhana"
+  @default_filename "store.db"
 
   # --- Public API ---
 
@@ -526,6 +527,7 @@ defmodule Karkhana.Store do
   defp to_iso8601(_), do: DateTime.to_iso8601(DateTime.utc_now())
 
   defp store_path do
-    Application.get_env(:karkhana, :store_path) || @default_path
+    Application.get_env(:karkhana, :store_path) ||
+      Path.join([System.user_home!(), @default_dir, @default_filename])
   end
 end
