@@ -1718,18 +1718,31 @@ defmodule Karkhana.Orchestrator do
   end
 
   defp extract_token_usage(update) do
-    payloads = [
-      update[:usage],
-      Map.get(update, "usage"),
-      Map.get(update, :usage),
-      update[:payload],
-      Map.get(update, "payload"),
-      update
-    ]
+    # First: check if the update has a pre-normalized usage map from StreamParser.
+    # This is the fast path for pi events — StreamParser already extracted and
+    # normalized the usage into %{input_tokens: N, output_tokens: N, total_tokens: N}.
+    case update[:usage] || Map.get(update, :usage) do
+      %{total_tokens: total} = usage when is_integer(total) and total > 0 ->
+        usage
 
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
-      Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
-      %{}
+      %{input_tokens: input} = usage when is_integer(input) and input > 0 ->
+        usage
+
+      _ ->
+        # Fall back to deep extraction for Codex/Claude event formats
+        payloads = [
+          update[:usage],
+          Map.get(update, "usage"),
+          Map.get(update, :usage),
+          update[:payload],
+          Map.get(update, "payload"),
+          update
+        ]
+
+        Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+          Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
+          %{}
+    end
   end
 
   defp extract_rate_limits(update) do

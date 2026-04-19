@@ -179,19 +179,21 @@ defmodule KarkhanaWeb.Presenter do
   defp extract_tool_summary(%{message: raw}) when is_map(raw), do: extract_tool_summary(raw)
 
   defp extract_tool_summary(raw) when is_map(raw) do
-    # Pi tool events: %{"type" => "tool_execution_start", "tool" => "bash", ...}
-    tool = Map.get(raw, "tool") || Map.get(raw, :tool)
-    input = Map.get(raw, "input") || Map.get(raw, :input)
+    # Pi tool events: %{"type" => "tool_execution_start", "toolName" => "bash", "args" => %{"command" => "..."}}
+    tool =
+      Map.get(raw, "toolName") || Map.get(raw, "tool") ||
+        Map.get(raw, :toolName) || Map.get(raw, :tool)
+
+    args = Map.get(raw, "args") || Map.get(raw, :args) || %{}
 
     cond do
-      is_binary(tool) and is_binary(input) ->
-        cmd = input |> String.split("\n") |> hd() |> String.slice(0, 80)
-        "#{tool}: #{cmd}"
+      is_binary(tool) and is_map(args) ->
+        detail =
+          Map.get(args, "command") || Map.get(args, "path") ||
+            Map.get(args, :command) || Map.get(args, :path) || ""
 
-      is_binary(tool) and is_map(input) ->
-        # Structured input (e.g. edit tool)
-        path = Map.get(input, "path") || Map.get(input, "file_path") || ""
-        "#{tool}: #{Path.basename(to_string(path))}"
+        detail_str = detail |> to_string() |> String.split("\n") |> hd() |> String.slice(0, 100)
+        "#{tool}: #{detail_str}"
 
       is_binary(tool) ->
         tool
@@ -207,15 +209,35 @@ defmodule KarkhanaWeb.Presenter do
     do: extract_assistant_summary(raw)
 
   defp extract_assistant_summary(raw) when is_map(raw) do
-    # Pi assistant events: %{"type" => "message_update", "message" => %{"content" => [...]}}
+    # Pi message events: %{"message" => %{"content" => [%{"type" => "text", "text" => "..."}]}}
+    # During thinking: content has [%{"type" => "thinking", "thinking" => "..."}]
     content =
       Map.get(raw, "content") ||
         get_in(raw, ["message", "content"]) ||
         Map.get(raw, :content)
 
     case content do
-      [%{"text" => text} | _] when is_binary(text) ->
-        text |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 120)
+      blocks when is_list(blocks) ->
+        text_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "text" end)
+        thinking_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "thinking" end)
+
+        cond do
+          text_block && is_binary(Map.get(text_block, "text", "")) ->
+            text_block["text"] |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 120)
+
+          thinking_block ->
+            thinking = Map.get(thinking_block, "thinking", "")
+
+            if is_binary(thinking) and byte_size(thinking) > 20 do
+              snippet = thinking |> String.split("\n") |> List.last() |> String.trim() |> String.slice(0, 100)
+              "\u{1F914} #{snippet}"
+            else
+              "\u{1F914} Thinking\u2026"
+            end
+
+          true ->
+            nil
+        end
 
       text when is_binary(text) ->
         text |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 120)

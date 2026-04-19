@@ -335,35 +335,7 @@ defmodule KarkhanaWeb.DashboardLive do
           <% end %>
         </section>
 
-        <%= if Map.get(@payload, :outcomes) do %>
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Outcomes (last 7 days)</h2>
-                <p class="section-copy">Issue resolution quality. Zero-touch = merged without human feedback.</p>
-              </div>
-            </div>
 
-            <div class="metric-grid">
-              <div class="metric-card">
-                <p class="metric-label">Total closed</p>
-                <p class="metric-value"><%= @payload.outcomes.total %></p>
-              </div>
-              <div class="metric-card">
-                <p class="metric-label">Zero-touch rate</p>
-                <p class="metric-value"><%= @payload.outcomes.zero_touch_rate %>%%</p>
-              </div>
-              <div class="metric-card">
-                <p class="metric-label">Zero-touch</p>
-                <p class="metric-value"><%= @payload.outcomes.zero_touch %></p>
-              </div>
-              <div class="metric-card">
-                <p class="metric-label">One-touch</p>
-                <p class="metric-value"><%= @payload.outcomes.one_touch %></p>
-              </div>
-            </div>
-          </section>
-        <% end %>
       <% end %>
     </section>
     """

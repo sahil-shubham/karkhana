@@ -137,14 +137,14 @@ defmodule Karkhana.Gate do
     path = resolve_artifact_path(gate["artifact"], context)
 
     if is_nil(path) do
-      {name, :fail, failure_message(gate, "Artifact '#{gate["artifact"]}' has no configured path")}
+      {name, :fail, failure_message(gate, "Artifact '#{gate["artifact"]}' has no configured path", context)}
     else
       cmd = "test -f #{escape_path(path)} -o -d #{escape_path(path)}"
 
       if Bhatti.exec_check(sandbox_id, cmd, timeout_sec: 10) do
         {name, :pass, "Artifact exists at #{path}"}
       else
-        {name, maybe_warn(gate), failure_message(gate, "Artifact not found at #{path}")}
+        {name, maybe_warn(gate), failure_message(gate, "Artifact not found at #{path}", context)}
       end
     end
   end
@@ -155,7 +155,7 @@ defmodule Karkhana.Gate do
 
     cond do
       is_nil(path) ->
-        {name, :fail, failure_message(gate, "Artifact '#{gate["artifact"]}' has no configured path")}
+        {name, :fail, failure_message(gate, "Artifact '#{gate["artifact"]}' has no configured path", context)}
 
       is_nil(pattern) ->
         {name, :fail, "Gate #{name}: content_match requires a 'pattern'"}
@@ -166,7 +166,7 @@ defmodule Karkhana.Gate do
         if Bhatti.exec_check(sandbox_id, cmd, timeout_sec: 10) do
           {name, :pass, "Pattern matched in #{path}"}
         else
-          {name, maybe_warn(gate), failure_message(gate, "Pattern '#{pattern}' not found in #{path}")}
+          {name, maybe_warn(gate), failure_message(gate, "Pattern '#{pattern}' not found in #{path}", context)}
         end
     end
   end
@@ -237,8 +237,9 @@ defmodule Karkhana.Gate do
     gate["name"] || gate["check"] || "unnamed"
   end
 
-  defp failure_message(gate, default) do
-    gate["message"] || default
+  defp failure_message(gate, default, context \\ %{}) do
+    msg = gate["message"] || default
+    render_template(msg, context)
   end
 
   defp maybe_warn(gate) do
@@ -249,10 +250,29 @@ defmodule Karkhana.Gate do
 
   defp resolve_artifact_path(artifact_name, context) do
     case get_in(context, [:artifacts, artifact_name]) do
-      %{"paths" => [path | _]} -> path
+      %{"paths" => [path | _]} -> render_template(path, context)
       _ -> nil
     end
   end
+
+  # Render Liquid/Solid templates in gate paths and messages.
+  # Supports {{ issue.identifier }} etc.
+  defp render_template(text, context) when is_binary(text) do
+    if String.contains?(text, "{{") do
+      try do
+        text
+        |> Solid.parse!()
+        |> Solid.render!(%{"issue" => %{"identifier" => context[:issue_identifier] || ""}})
+        |> IO.iodata_to_binary()
+      rescue
+        _ -> text
+      end
+    else
+      text
+    end
+  end
+
+  defp render_template(text, _context), do: text
 
   defp gate_env_script(context) do
     vars = [

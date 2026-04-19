@@ -2,86 +2,142 @@
 
 कारखाना — a workshop. An engineering workshop of agents on [bhatti](https://github.com/sahil-shubham/bhatti) sandboxes.
 
-Karkhana encodes an engineering methodology — plan before you build, test what the plan says, record decisions that outlive conversations — and runs it through agents in isolated Firecracker VMs. You manage work in Linear. The methodology is enforced by the system, not by discipline.
+Karkhana manages the full engineering lifecycle — plan, implement, verify, review — through agents in isolated Firecracker VMs. Work lives in Linear. The methodology is enforced by the system, not by discipline.
 
-## The problem
+## How it works
 
-Every agent product has the same shape: ticket → agent → PR → hope it's good. The agent has no methodology. It doesn't plan before implementing. It doesn't check if tests cover the plan. It doesn't record decisions. It doesn't change its approach when debugging vs. building. It gets a ticket and starts writing code.
-
-This works for typo fixes. It breaks for real engineering.
-
-## How karkhana works
-
-Work lives in Linear. Each issue gets a bhatti sandbox — a Firecracker microVM with persistent storage that snapshots when idle and resumes in milliseconds. An agent (pi) runs inside the sandbox, but *how* it works depends on the **mode**.
-
-**Mode is derived from what exists.** Karkhana checks: is there a plan document? Test specs? An implementation branch? The answer determines the mode — planning, implementation, debugging, or QA. No manual tagging required (though labels can override).
+Linear workflow states drive everything. Each state maps to a karkhana behavior:
 
 ```
-Issue arrives (Linear Todo)
-    │
-    ├─ No plan artifact?  →  PLANNING MODE
-    │   Agent reads codebase, produces plan document.
-    │   Plan must have: dependency graph, file-level changes,
-    │   design decisions, test criteria per part.
-    │   → Gate: does plan have test criteria? (automated)
-    │   → Human reviews plan, approves or sends feedback.
-    │
-    ├─ Plan exists?  →  IMPLEMENTATION MODE
-    │   Agent follows the plan part by part.
-    │   Checkpoints between parts: run tests, verify, commit.
-    │   Decisions not in the plan → written to decisions.md.
-    │   → Gate: tests pass? branch pushed? (automated)
-    │   → Human reviews PR, merges or sends feedback.
-    │
-    ├─ Label: debug?  →  DEBUG MODE
-    │   Agent investigates before changing anything.
-    │   Read-only until root cause confirmed.
-    │   Findings documented, then minimal fix + test.
-    │
-    └─ Label: qa?  →  QA MODE
-        Agent exercises the system as a user would.
-        Tries intuitive approaches, reports friction.
-        Structured findings: bugs, friction, missing features.
-        → Filed as follow-up issues.
+Backlog ──→ Todo ──→ Planning ──→ Plan Review ──→ Implementing ──→ In Review ──→ Done
+             │         │              │                │              │
+          dispatch  dispatch     human gate        dispatch      human gate
+         (planning) (planning)  (sandbox stops)  (implementation) (sandbox stops)
 ```
+
+**Dispatch states** — karkhana creates a bhatti sandbox, runs an agent with the mode's prompt, checks gates on completion, and advances the issue.
+
+**Human gate states** — karkhana pauses the sandbox (frees resources), waits for human review. Move the issue forward to approve, backward to request changes.
+
+**Terminal states** — karkhana destroys the sandbox and cleans up.
+
+Karkhana auto-creates these workflow states in Linear on startup. You configure them in `workflow.yaml`, karkhana syncs them via the Linear API. No manual Linear setup.
+
+## The lifecycle
+
+```
+1. Human creates issue → Triage / Todo
+2. Karkhana dispatches planning mode
+   → Agent reads codebase, produces PLAN-ME-42.md
+   → Gates check: plan exists? has test criteria?
+   → Pass → karkhana moves to Plan Review, stops sandbox
+3. Human reviews plan
+   → Approve → move to Implementing
+   → Feedback → move back to Planning (agent gets feedback)
+4. Karkhana dispatches implementation mode
+   → Agent follows plan part by part, runs tests
+   → Gates check: builds? tests pass? branch pushed?
+   → Pass → karkhana moves to In Review, stops sandbox
+5. Human reviews PR
+   → Merge → Done (sandbox destroyed)
+   → Feedback → back to Implementing
+```
+
+## Gate system
+
+Gates are quality checkpoints that run after an agent session completes. Four types:
+
+- **artifact_exists** — does the plan file exist?
+- **content_match** — does the plan mention test criteria?
+- **command** — does `go build ./...` or `mix test` pass?
+- **script** — custom check script in `.karkhana/gates/`
+
+When a gate fails, the agent retries with the gate's output injected into its prompt: *"Gate 'plan-quality' failed: Plan missing test criteria for Part 3. Fix this specifically."*
+
+## Bhatti integration
+
+Karkhana uses bhatti's sandbox primitives beyond create/destroy:
+
+- **Checkpoint** — snapshot sandbox state before running gates. Resume from checkpoint on gate failure instead of re-running the whole session.
+- **Stop/Start** — pause sandboxes at human gates (free host RAM). Resume in ~3ms when human approves.
+- **Shell token** — generate browser terminal URLs so reviewers can inspect sandbox state.
+- **Publish** — QA agents expose preview URLs for human review.
 
 ## Configuration
 
-The methodology lives in your project repo as files — not in karkhana's code:
+The methodology lives in your project repo:
 
 ```
 your-project/.karkhana/
-  workflow.yaml          # orchestrator config + mode rules
+  workflow.yaml          # lifecycle states, modes, gates, bhatti config
   modes/
     planning.md          # prompt: produce a plan, don't code
     implementation.md    # prompt: follow the plan, checkpoint
     debugging.md         # prompt: investigate first
     qa.md                # prompt: exercise as a user
   gates/
-    plan-ready.sh        # check: plan has test criteria?
-    tests-pass.sh        # check: build + tests + branch pushed?
+    plan-quality.sh      # check: plan has test criteria?
 ```
 
-**workflow.yaml** is YAML — orchestrator settings (Linear project, bhatti config, polling, hooks) plus mode resolution rules and artifact path conventions.
+### workflow.yaml
 
-**Mode prompts** are Liquid-templated markdown — same format as before, just one per mode instead of one monolith. They receive `{{ issue.identifier }}`, `{{ issue.title }}`, `{{ issue.description }}`, `{{ attempt }}`.
+```yaml
+project:
+  name: my-project
+  language: go
+  build: "go build ./..."
+  test: "go test ./..."
 
-**Gate scripts** are shell scripts that run in the sandbox. Exit 0 = pass. Non-zero = agent loops. Start simple (does the file exist?), get stricter as confidence grows.
+lifecycle:
+  auto_sync: true  # create these states in Linear automatically
+  states:
+    Todo:          { type: dispatch, linear_type: unstarted, mode: planning, on_complete: Plan Review }
+    Planning:      { type: dispatch, linear_type: started, mode: planning, on_complete: Plan Review }
+    Plan Review:   { type: human_gate, linear_type: started, sandbox: stop }
+    Implementing:  { type: dispatch, linear_type: started, mode: implementation, on_complete: In Review }
+    In Review:     { type: human_gate, linear_type: completed, sandbox: stop }
+    Done:          { type: terminal, linear_type: completed, sandbox: destroy }
+    Cancelled:     { type: terminal, linear_type: canceled, sandbox: destroy }
 
-Projects without `.karkhana/` fall back to a single `WORKFLOW.md` — fully backward compatible.
+modes:
+  planning:
+    prompt: modes/planning.md
+    gates:
+      - { name: plan-exists, check: artifact_exists, artifact: plan, on_failure: retry_with_feedback }
+      - { name: plan-quality, check: script, script: gates/plan-quality.sh, on_failure: retry_with_feedback }
 
-Changing the methodology means editing markdown and shell scripts. No Elixir, no deploys. The orchestrator hot-reloads.
+  implementation:
+    prompt: modes/implementation.md
+    gates:
+      - { name: builds, check: command, command: "go build ./...", on_failure: retry_with_feedback }
+      - { name: tests-pass, check: command, command: "go test ./...", on_failure: retry_with_feedback }
+      - { name: branch-pushed, check: command, command: "git log -1 origin/$(git branch --show-current)", on_failure: retry_with_feedback }
 
-## What karkhana does and doesn't do
+artifacts:
+  plan:
+    paths: ["docs/PLAN-{{ issue.identifier }}.md"]
+```
 
-| Karkhana does | Karkhana doesn't |
-|---------------|------------------|
-| Derive mode from artifact state | Manage what happens inside a session |
-| Load mode-specific prompts | Replace human engineering judgment |
-| Run gate scripts at completion | Enforce one workflow for all work |
-| Track outcomes per mode | Automate everything from day one |
-| Create sandboxes, launch agents | Provide compute (bhatti does that) |
-| Hot-reload config changes | Require restarts for methodology changes |
+Changing the methodology means editing markdown and YAML. No Elixir, no deploys. The orchestrator hot-reloads.
+
+## Architecture
+
+```
+Karkhana.Application (supervision tree)
+├── Karkhana.Store              — SQLite persistence
+├── Karkhana.WorkflowStore      — Hot-reloads workflow.yaml
+├── Karkhana.Linear.WorkflowSync — Syncs lifecycle states to Linear
+├── Karkhana.Orchestrator       — Polls Linear, dispatches agents
+├── Karkhana.HttpServer         — Phoenix dashboard + API
+└── Karkhana.StatusDashboard    — TUI status output
+```
+
+Key modules:
+- `Karkhana.Gate` — runs quality gates (artifact, content, command, script)
+- `Karkhana.AgentRunner` — runs pi in a bhatti sandbox with mode-specific prompts
+- `Karkhana.Config.Schema.Lifecycle` — maps Linear states to karkhana behaviors
+- `Karkhana.Config.Schema.Modes` — mode configs (prompt, gates, agent tuning)
+- `Karkhana.PromptBuilder` — renders Liquid templates, injects gate feedback on retries
 
 ## Requirements
 
@@ -99,14 +155,18 @@ cp .env.example .env  # add LINEAR_API_KEY, BHATTI_API_KEY, GH_TOKEN
 mix deps.get && source .env && mix run --no-halt
 ```
 
-Dashboard at `http://localhost:4000/`. Create an issue in Linear, watch it get picked up.
+Dashboard at `http://localhost:4000/`.
 
-## Design docs
+## Deploy
 
-See [docs/](docs/) for the thinking behind this:
-- **[SYSTEM.md](docs/SYSTEM.md)** — architecture, primitives, code change surface
-- **[WORKSHOP.md](docs/WORKSHOP.md)** — the methodology and station model
-- **[SESSION-INSIGHTS.md](docs/SESSION-INSIGHTS.md)** — evidence from 76 sessions building bhatti
+Karkhana runs as an Elixir release inside a bhatti sandbox:
+
+```bash
+./deploy.sh                    # first time: create sandbox + deploy
+./deploy.sh upgrade v0.5.2     # download release, restart
+./deploy.sh workflow           # update WORKFLOW.md only (hot reload)
+./deploy.sh logs               # tail orchestrator logs
+```
 
 ## License
 
