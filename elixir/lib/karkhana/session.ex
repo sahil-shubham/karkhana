@@ -377,8 +377,9 @@ defmodule Karkhana.Session do
     # Record run
     record_run(state, outcome, error_message)
 
-    # Post error to Linear
+    # Post error to Linear and move to Backlog so Dispatcher doesn't re-dispatch
     post_error_comment(state, error_message)
+    move_to_backlog(state)
 
     # Broadcast
     broadcast_sessions({:session_failed, summary(state)})
@@ -447,6 +448,15 @@ defmodule Karkhana.Session do
       :ok -> :ok
       {:error, reason} -> Logger.warning("Failed to persist run: #{inspect(reason)}")
     end
+  end
+
+  defp move_to_backlog(state) do
+    case Tracker.update_issue_state(state.issue.id, "Backlog") do
+      :ok -> Logger.info("Session #{state.issue.identifier}: moved to Backlog")
+      {:error, reason} -> Logger.warning("Session #{state.issue.identifier}: failed to move to Backlog: #{inspect(reason)}")
+    end
+  rescue
+    _ -> :ok
   end
 
   defp post_error_comment(state, error_message) do

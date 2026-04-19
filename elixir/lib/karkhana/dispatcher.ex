@@ -20,7 +20,9 @@ defmodule Karkhana.Dispatcher do
     :poll_interval_ms,
     :max_concurrent,
     :max_retries,
-    dispatched: %{}
+    dispatched: %{},
+    # issue IDs that failed — skip on next poll
+    failed: MapSet.new()
   ]
 
   @type dispatch_entry :: %{pid: pid(), ref: reference(), attempt: non_neg_integer(), identifier: String.t()}
@@ -107,18 +109,23 @@ defmodule Karkhana.Dispatcher do
       {issue_id, entry} ->
         state = %{state | dispatched: Map.delete(state.dispatched, issue_id)}
 
-        case reason do
-          :normal ->
-            Logger.info("Session completed for #{entry.identifier}")
+        state =
+          case reason do
+            :normal ->
+              Logger.info("Session completed for #{entry.identifier}")
+              state
 
-          _ ->
-            Logger.warning("Session exited for #{entry.identifier}: #{inspect(reason)}")
+            _ ->
+              Logger.warning("Session exited for #{entry.identifier}: #{inspect(reason)}")
 
-            if entry.attempt < state.max_retries do
-              Logger.info("Scheduling retry #{entry.attempt + 1}/#{state.max_retries} for #{entry.identifier}")
-              Process.send_after(self(), {:retry, issue_id, entry.attempt + 1}, 10_000)
-            end
-        end
+              if entry.attempt < state.max_retries do
+                Logger.info("Scheduling retry #{entry.attempt + 1}/#{state.max_retries} for #{entry.identifier}")
+                Process.send_after(self(), {:retry, issue_id, entry.attempt + 1}, 10_000)
+                state
+              else
+                %{state | failed: MapSet.put(state.failed, issue_id)}
+              end
+          end
 
         {:noreply, state}
 
@@ -178,6 +185,7 @@ defmodule Karkhana.Dispatcher do
   defp should_dispatch?(issue, state) do
     dispatchable?(issue) and
       not dispatched?(state, issue.id) and
+      not failed?(state, issue.id) and
       available_slots(state) > 0
   end
 
@@ -199,6 +207,7 @@ defmodule Karkhana.Dispatcher do
   defp dispatchable?(_), do: false
 
   defp dispatched?(state, issue_id), do: Map.has_key?(state.dispatched, issue_id)
+  defp failed?(state, issue_id), do: MapSet.member?(state.failed, issue_id)
   defp available_slots(state), do: max(state.max_concurrent - map_size(state.dispatched), 0)
 
   # --- Session management ---
