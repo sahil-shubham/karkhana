@@ -47,6 +47,17 @@ defmodule Karkhana.Store do
   @spec run_stats(keyword()) :: {:ok, map()} | {:error, term()}
   def run_stats(opts \\ []), do: call({:run_stats, opts})
 
+  # --- Active sessions (checkpoint/recovery) ---
+
+  @spec upsert_active_session(map()) :: :ok | {:error, term()}
+  def upsert_active_session(session) when is_map(session), do: call({:upsert_active_session, session})
+
+  @spec delete_active_session(String.t()) :: :ok | {:error, term()}
+  def delete_active_session(issue_id) when is_binary(issue_id), do: call({:delete_active_session, issue_id})
+
+  @spec list_active_sessions() :: {:ok, [map()]} | {:error, term()}
+  def list_active_sessions, do: call(:list_active_sessions)
+
   # --- GenServer ---
 
   @impl true
@@ -104,6 +115,21 @@ defmodule Karkhana.Store do
 
   def handle_call({:run_stats, opts}, _from, %{conn: conn} = state) do
     result = do_run_stats(conn, opts)
+    {:reply, result, state}
+  end
+
+  def handle_call({:upsert_active_session, session}, _from, %{conn: conn} = state) do
+    result = do_upsert_active_session(conn, session)
+    {:reply, result, state}
+  end
+
+  def handle_call({:delete_active_session, issue_id}, _from, %{conn: conn} = state) do
+    result = do_delete_active_session(conn, issue_id)
+    {:reply, result, state}
+  end
+
+  def handle_call(:list_active_sessions, _from, %{conn: conn} = state) do
+    result = do_list_active_sessions(conn)
     {:reply, result, state}
   end
 
@@ -175,7 +201,28 @@ defmodule Karkhana.Store do
       )
       """,
       "CREATE INDEX IF NOT EXISTS idx_issue_events_issue ON issue_events(issue_identifier)",
-      "CREATE INDEX IF NOT EXISTS idx_issue_events_event ON issue_events(event)"
+      "CREATE INDEX IF NOT EXISTS idx_issue_events_event ON issue_events(event)",
+      """
+      CREATE TABLE IF NOT EXISTS active_sessions (
+        issue_id TEXT PRIMARY KEY,
+        issue_identifier TEXT NOT NULL,
+        issue_json TEXT NOT NULL,
+        sandbox_id TEXT NOT NULL,
+        sandbox_name TEXT NOT NULL,
+        mode TEXT,
+        output_file TEXT,
+        lines_seen INTEGER DEFAULT 0,
+        session_id TEXT,
+        tokens_input INTEGER DEFAULT 0,
+        tokens_output INTEGER DEFAULT 0,
+        tokens_total INTEGER DEFAULT 0,
+        tokens_cache_read INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0.0,
+        attempt INTEGER DEFAULT 0,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+      """
     ]
 
     Enum.each(statements, &(:ok = Exqlite.Sqlite3.execute(conn, &1)))
@@ -496,6 +543,61 @@ defmodule Karkhana.Store do
       inserted_at: map["inserted_at"]
     }
   end
+
+  # --- Active sessions ---
+
+  defp do_upsert_active_session(conn, session) do
+    sql = """
+    INSERT OR REPLACE INTO active_sessions
+      (issue_id, issue_identifier, issue_json, sandbox_id, sandbox_name,
+       mode, output_file, lines_seen, session_id,
+       tokens_input, tokens_output, tokens_total, tokens_cache_read,
+       cost_usd, attempt, started_at, updated_at)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+    """
+
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    params = [
+      session[:issue_id],
+      session[:issue_identifier],
+      session[:issue_json] || "{}",
+      session[:sandbox_id],
+      session[:sandbox_name] || "",
+      session[:mode],
+      session[:output_file],
+      session[:lines_seen] || 0,
+      session[:session_id],
+      session[:tokens_input] || 0,
+      session[:tokens_output] || 0,
+      session[:tokens_total] || 0,
+      session[:tokens_cache_read] || 0,
+      session[:cost_usd] || 0.0,
+      session[:attempt] || 0,
+      format_datetime(session[:started_at]),
+      now
+    ]
+
+    exec_insert(conn, sql, params)
+  end
+
+  defp do_delete_active_session(conn, issue_id) do
+    exec_insert(conn, "DELETE FROM active_sessions WHERE issue_id = ?1", [issue_id])
+  end
+
+  defp do_list_active_sessions(conn) do
+    query_all(conn, "SELECT * FROM active_sessions ORDER BY started_at", [], &row_to_map/2)
+  end
+
+  defp row_to_map(columns, values) do
+    columns
+    |> Enum.zip(values)
+    |> Map.new(fn {col, val} -> {String.to_atom(col), val} end)
+  end
+
+  defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+  defp format_datetime(dt) when is_binary(dt), do: dt
+  defp format_datetime(_), do: DateTime.utc_now() |> DateTime.to_iso8601()
 
   # --- Helpers ---
 
