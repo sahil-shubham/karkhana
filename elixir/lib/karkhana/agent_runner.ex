@@ -15,9 +15,12 @@ defmodule Karkhana.AgentRunner do
     case Workspace.create_for_issue(issue) do
       {:ok, sandbox_id} ->
         try do
-          # Resolve mode from .karkhana/ protocol or fall back to default
-          {mode, mode_prompt} = resolve_mode(sandbox_id, issue)
+          # Resolve mode: lifecycle-provided or .karkhana/ protocol fallback
+          {mode, mode_prompt} = resolve_mode(sandbox_id, issue, opts)
           opts = Keyword.merge(opts, mode: mode, mode_prompt: mode_prompt)
+
+          # Load gate specs from lifecycle modes config
+          opts = load_gate_specs(opts, mode)
 
           # Report mode to orchestrator for tracking
           send_runtime_info(claude_update_recipient, issue, %{
@@ -201,15 +204,51 @@ defmodule Karkhana.AgentRunner do
 
   defp run_gate(sandbox_id, issue, opts, recipient) do
     mode = Keyword.get(opts, :mode, "default")
+    gate_specs = Keyword.get(opts, :gate_specs, [])
+
+    if gate_specs == [] do
+      # No gates defined — try legacy .karkhana/ protocol gates
+      run_legacy_gate(sandbox_id, issue, opts, recipient)
+    else
+      Logger.info("Running #{length(gate_specs)} gates for mode=#{mode} #{issue_context(issue)}")
+
+      gate_context = %{
+        sandbox_id: sandbox_id,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        mode: mode,
+        attempt: Keyword.get(opts, :attempt),
+        protocol_dir: Keyword.get(opts, :protocol_dir),
+        artifacts: Keyword.get(opts, :artifacts)
+      }
+
+      case Karkhana.Gate.run_gates(gate_specs, gate_context) do
+        {:all_passed, results} ->
+          Logger.info("All gates passed for #{issue_context(issue)}")
+          send_gate_results(recipient, issue, mode, results)
+          :ok
+
+        {:failed, results} ->
+          feedback = Karkhana.Gate.failure_feedback(results)
+          failed_names = Enum.map(feedback, & &1.gate) |> Enum.join(", ")
+          Logger.warning("Gates failed for #{issue_context(issue)}: #{failed_names}")
+          send_gate_results(recipient, issue, mode, results)
+          {:error, {:gate_failed, mode, feedback}}
+      end
+    end
+  end
+
+  # Legacy gate support: reads single gate script from .karkhana/ protocol
+  defp run_legacy_gate(sandbox_id, issue, opts, recipient) do
+    mode = Keyword.get(opts, :mode, "default")
     workspace = Config.settings!().workspace.root
 
     gate_script =
       case Protocol.load(workspace) do
         {:ok, protocol} ->
-          # Find the gate for the current mode
           matched =
             Enum.find(protocol.modes, fn m ->
-              mode_name_matches?(m, mode)
+              legacy_mode_name_matches?(m, mode)
             end)
 
           if matched && matched.gate do
@@ -226,40 +265,65 @@ defmodule Karkhana.AgentRunner do
       end
 
     if gate_script do
-      Logger.info("Running gate for mode=#{mode} #{issue_context(issue)}")
+      Logger.info("Running legacy gate for mode=#{mode} #{issue_context(issue)}")
 
       case Karkhana.Bhatti.Client.exec(sandbox_id, ["bash", "-c", gate_script], timeout_sec: 60) do
         {:ok, %{"exit_code" => 0, "stdout" => output}} ->
           Logger.info("Gate passed for #{issue_context(issue)}: #{String.trim(output)}")
-          send_gate_result(recipient, issue, mode, :pass, String.trim(output))
+          send_gate_result_single(recipient, issue, mode, :pass, String.trim(output))
           :ok
 
         {:ok, %{"exit_code" => code} = result} ->
           output = Map.get(result, "stdout", "") <> "\n" <> Map.get(result, "stderr", "")
           Logger.warning("Gate failed (exit #{code}) for #{issue_context(issue)}: #{String.trim(output)}")
-          send_gate_result(recipient, issue, mode, :fail, String.trim(output))
-          {:error, {:gate_failed, mode, code, String.trim(output)}}
+          send_gate_result_single(recipient, issue, mode, :fail, String.trim(output))
+          feedback = [%{gate: mode, output: String.trim(output)}]
+          {:error, {:gate_failed, mode, feedback}}
 
         {:error, reason} ->
           Logger.warning("Gate exec failed for #{issue_context(issue)}: #{inspect(reason)}")
-          send_gate_result(recipient, issue, mode, :fail, inspect(reason))
-          {:error, {:gate_failed, mode, :exec_error, inspect(reason)}}
+          send_gate_result_single(recipient, issue, mode, :fail, inspect(reason))
+          feedback = [%{gate: mode, output: inspect(reason)}]
+          {:error, {:gate_failed, mode, feedback}}
       end
     else
-      # No gate defined for this mode — pass through
       :ok
     end
   end
 
-  defp mode_name_matches?(%{match: %{"label" => label}}, mode), do: label == mode
+  defp legacy_mode_name_matches?(%{match: %{"label" => label}}, mode), do: label == mode
 
-  defp mode_name_matches?(%{prompt: prompt}, mode) when is_binary(prompt) do
+  defp legacy_mode_name_matches?(%{prompt: prompt}, mode) when is_binary(prompt) do
     prompt |> Path.basename() |> Path.rootname() == mode
   end
 
-  defp mode_name_matches?(_, _), do: false
+  defp legacy_mode_name_matches?(_, _), do: false
 
-  defp send_gate_result(recipient, %Issue{id: issue_id}, mode, result, output)
+  defp send_gate_results(recipient, %Issue{id: issue_id}, mode, results)
+       when is_pid(recipient) and is_binary(issue_id) do
+    # Send summary of gate results to orchestrator
+    gate_result =
+      if Enum.any?(results, fn {_, status, _} -> status == :fail end), do: :fail, else: :pass
+
+    gate_output =
+      results
+      |> Enum.map(fn {name, status, output} -> "#{name}: #{status} — #{output}" end)
+      |> Enum.join("\n")
+
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id,
+       %{
+         gate: mode,
+         gate_result: gate_result,
+         gate_output: gate_output
+       }}
+    )
+  end
+
+  defp send_gate_results(_, _, _, _), do: :ok
+
+  defp send_gate_result_single(recipient, %Issue{id: issue_id}, mode, result, output)
        when is_pid(recipient) and is_binary(issue_id) do
     send(
       recipient,
@@ -272,7 +336,7 @@ defmodule Karkhana.AgentRunner do
     )
   end
 
-  defp send_gate_result(_, _, _, _, _), do: :ok
+  defp send_gate_result_single(_, _, _, _, _), do: :ok
 
   defp lookup_previous_session(%Issue{identifier: identifier}) when is_binary(identifier) do
     case Karkhana.Store.last_session_id(identifier) do
@@ -287,12 +351,78 @@ defmodule Karkhana.AgentRunner do
 
   defp lookup_previous_session(_), do: nil
 
-  defp resolve_mode(sandbox_id, issue) do
+  defp resolve_mode(sandbox_id, issue, opts) do
+    # If lifecycle provided a mode name, use it directly
+    lifecycle_mode = Keyword.get(opts, :lifecycle_mode)
+
+    if lifecycle_mode do
+      resolve_lifecycle_mode(lifecycle_mode)
+    else
+      resolve_protocol_mode(sandbox_id, issue)
+    end
+  end
+
+  defp load_gate_specs(opts, mode) do
+    settings = Config.settings!()
+    gate_specs = Karkhana.Config.Schema.Modes.gates(settings.modes, mode)
+
+    if gate_specs != [] do
+      workspace = settings.workspace.root
+
+      protocol_dir =
+        case Protocol.load(workspace) do
+          {:ok, protocol} -> protocol.dir
+          _ -> nil
+        end
+
+      artifacts_config =
+        case Protocol.load(workspace) do
+          {:ok, protocol} -> protocol.artifacts
+          _ -> %{}
+        end
+
+      opts
+      |> Keyword.put(:gate_specs, gate_specs)
+      |> Keyword.put(:protocol_dir, protocol_dir)
+      |> Keyword.put(:artifacts, artifacts_config)
+    else
+      opts
+    end
+  end
+
+  # Lifecycle mode: load prompt from .karkhana/modes/ by name
+  defp resolve_lifecycle_mode(mode_name) do
     workspace = Config.settings!().workspace.root
 
     case Protocol.load(workspace) do
       {:ok, protocol} ->
-        # Build an artifact checker that execs into the sandbox
+        prompt_path =
+          case Karkhana.Config.Schema.Modes.prompt_path(Config.settings!().modes, mode_name) do
+            nil -> nil
+            path -> Path.join(protocol.dir, path)
+          end
+
+        prompt_content =
+          if prompt_path do
+            case File.read(prompt_path) do
+              {:ok, content} -> content
+              {:error, _} -> nil
+            end
+          end
+
+        {mode_name, prompt_content}
+
+      {:error, _} ->
+        {mode_name, nil}
+    end
+  end
+
+  # Legacy: resolve mode from .karkhana/ protocol (label/artifact matching)
+  defp resolve_protocol_mode(sandbox_id, issue) do
+    workspace = Config.settings!().workspace.root
+
+    case Protocol.load(workspace) do
+      {:ok, protocol} ->
         checker = fn cmd ->
           Karkhana.Bhatti.Client.exec_check(sandbox_id, cmd)
         end
@@ -301,25 +431,13 @@ defmodule Karkhana.AgentRunner do
         {mode.name, mode.prompt_content}
 
       {:error, :not_found} ->
-        # No .karkhana/ — use WORKFLOW.md with label-based mode hint
-        mode_from_labels(issue)
+        {"default", nil}
 
       {:error, reason} ->
         Logger.warning("Failed to load .karkhana/ protocol: #{inspect(reason)}; using default mode")
         {"default", nil}
     end
   end
-
-  defp mode_from_labels(%Issue{labels: labels}) when is_list(labels) do
-    cond do
-      "qa" in labels -> {"qa", nil}
-      "debug" in labels -> {"debugging", nil}
-      "plan" in labels -> {"planning", nil}
-      true -> {"default", nil}
-    end
-  end
-
-  defp mode_from_labels(_), do: {"default", nil}
 
   defp send_runtime_info(recipient, %Issue{id: issue_id}, info)
        when is_pid(recipient) and is_binary(issue_id) do

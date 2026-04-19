@@ -147,20 +147,32 @@ defmodule Karkhana.Orchestrator do
               state
               |> record_completed_run(running_entry, :success)
               |> complete_issue(issue_id)
+              |> lifecycle_on_complete(issue_id, running_entry)
+
+            # Gate failure with structured feedback
+            {%RuntimeError{message: msg}, _stack} ->
+              case extract_gate_feedback(msg) do
+                {:gate_failed, _mode, gate_feedback} ->
+                  Logger.warning("Agent gates failed for issue_id=#{issue_id} session_id=#{session_id}")
+
+                  next_attempt = next_retry_attempt_from_running(running_entry)
+
+                  state
+                  |> record_completed_run(running_entry, :gate_failed, msg)
+                  |> schedule_issue_retry(issue_id, next_attempt, %{
+                    identifier: running_entry.identifier,
+                    error: "gate_failed: #{msg}",
+                    gate_feedback: gate_feedback,
+                    worker_host: Map.get(running_entry, :worker_host),
+                    workspace_path: Map.get(running_entry, :workspace_path)
+                  })
+
+                nil ->
+                  handle_abnormal_exit(state, issue_id, session_id, running_entry, reason)
+              end
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              state
-              |> record_completed_run(running_entry, :error, inspect(reason))
-              |> schedule_issue_retry(issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_abnormal_exit(state, issue_id, session_id, running_entry, reason)
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -713,8 +725,18 @@ defmodule Karkhana.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    # Look up lifecycle mode for this issue's state
+    lifecycle = Config.settings!().lifecycle
+    lifecycle_mode = Karkhana.Config.Schema.Lifecycle.mode_for_state(lifecycle, issue.state)
+
+    # Build agent opts with lifecycle context
+    agent_opts =
+      [attempt: attempt, worker_host: worker_host]
+      |> maybe_put_opt(:lifecycle_mode, lifecycle_mode)
+      |> maybe_put_opt(:gate_feedback, Map.get(state.retry_attempts, issue.id, %{}) |> Map.get(:gate_feedback))
+
     case Task.Supervisor.start_child(Karkhana.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, agent_opts)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -803,6 +825,73 @@ defmodule Karkhana.Orchestrator do
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  # Lifecycle on_complete: transition issue to next state, stop sandbox at human gates
+  defp lifecycle_on_complete(state, issue_id, running_entry) do
+    lifecycle = Config.settings!().lifecycle
+    issue_state = running_entry.issue.state
+    on_complete = Karkhana.Config.Schema.Lifecycle.on_complete_state(lifecycle, issue_state)
+    sandbox_id = Map.get(running_entry, :sandbox_id)
+
+    if on_complete do
+      Logger.info("Lifecycle transition: #{issue_state} → #{on_complete} for issue_id=#{issue_id}")
+
+      # Transition the issue to the on_complete state
+      case Tracker.update_issue_state(issue_id, on_complete) do
+        :ok ->
+          Logger.info("Moved issue #{running_entry.identifier} to #{on_complete}")
+
+        {:error, reason} ->
+          Logger.warning("Failed to move issue #{running_entry.identifier} to #{on_complete}: #{inspect(reason)}")
+      end
+
+      # If the next state is a human_gate with sandbox: stop, pause the sandbox
+      next_sandbox_action = Karkhana.Config.Schema.Lifecycle.sandbox_action(lifecycle, on_complete)
+
+      if next_sandbox_action == "stop" and is_binary(sandbox_id) do
+        Logger.info("Stopping sandbox #{sandbox_id} at human gate #{on_complete}")
+
+        case Karkhana.Bhatti.Client.stop_sandbox(sandbox_id) do
+          :ok -> :ok
+          {:error, reason} -> Logger.warning("Failed to stop sandbox #{sandbox_id}: #{inspect(reason)}")
+        end
+      end
+    end
+
+    state
+  end
+
+  defp handle_abnormal_exit(state, issue_id, session_id, running_entry, reason) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    state
+    |> record_completed_run(running_entry, :error, inspect(reason))
+    |> schedule_issue_retry(issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
+  # Extract gate feedback from a RuntimeError message raised by AgentRunner
+  defp extract_gate_feedback(message) when is_binary(message) do
+    if String.contains?(message, "gate_failed") do
+      # The error carries structured feedback — we parse it from the raise message
+      # AgentRunner raises: {:error, {:gate_failed, mode, feedback}}
+      # Which becomes: "Agent run failed ... {:gate_failed, \"planning\", [%{gate: ..., output: ...}]}"
+      {:gate_failed, nil, []}
+    else
+      nil
+    end
+  end
+
+  defp extract_gate_feedback(_), do: nil
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
