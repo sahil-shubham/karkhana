@@ -669,8 +669,17 @@ defmodule Karkhana.Session do
       attempt: state.attempt,
       started_at: state.started_at,
       error: state.error,
-      gate_results: state.gate_results
+      gate_results: serialize_gate_results(state.gate_results)
     }
+  end
+
+  defp serialize_gate_results(nil), do: nil
+
+  defp serialize_gate_results(results) when is_list(results) do
+    Enum.map(results, fn
+      {name, status, output} -> %{name: name, status: to_string(status), output: output}
+      other -> other
+    end)
   end
 
   defp summarize_event(:tool_use, event) do

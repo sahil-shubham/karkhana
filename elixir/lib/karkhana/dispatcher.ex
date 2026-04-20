@@ -147,7 +147,7 @@ defmodule Karkhana.Dispatcher do
     info = %{
       dispatched:
         Map.new(state.dispatched, fn {id, entry} ->
-          {id, %{identifier: entry.identifier, attempt: entry.attempt, pid: entry.pid}}
+          {id, %{identifier: entry.identifier, attempt: entry.attempt, pid: inspect(entry.pid)}}
         end),
       dispatched_count: map_size(state.dispatched),
       max_concurrent: state.max_concurrent,
