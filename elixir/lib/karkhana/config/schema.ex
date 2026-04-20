@@ -209,6 +209,7 @@ defmodule Karkhana.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "claude")
+      field(:provider, :string)
       field(:model, :string)
       field(:max_turns, :integer, default: 50)
       field(:dangerously_skip_permissions, :boolean, default: true)
@@ -222,7 +223,7 @@ defmodule Karkhana.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:command, :model, :max_turns, :dangerously_skip_permissions, :allowed_tools, :turn_timeout_ms, :stall_timeout_ms],
+        [:command, :provider, :model, :max_turns, :dangerously_skip_permissions, :allowed_tools, :turn_timeout_ms, :stall_timeout_ms],
         empty_values: []
       )
       |> validate_number(:max_turns, greater_than: 0)

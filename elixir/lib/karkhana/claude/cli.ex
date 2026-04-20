@@ -212,6 +212,7 @@ defmodule Karkhana.Claude.CLI do
     base = if continuation, do: base ++ ["--continue"], else: base
 
     base
+    |> maybe_add_option(settings.provider, "--provider")
     |> maybe_add_option(settings.model, "--model")
   end
 

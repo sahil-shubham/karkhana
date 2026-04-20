@@ -25,7 +25,8 @@ agent:
 
 claude:
   command: pi
-  model: claude-opus-4-6
+  provider: openrouter
+  model: anthropic/claude-opus-4-6
   dangerously_skip_permissions: true
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
