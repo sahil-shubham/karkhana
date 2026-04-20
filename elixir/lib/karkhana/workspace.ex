@@ -98,6 +98,7 @@ defmodule Karkhana.Workspace do
     env =
       %{}
       |> maybe_put_env("ANTHROPIC_API_KEY", System.get_env("ANTHROPIC_API_KEY"))
+      |> maybe_put_env("OPENROUTER_API_KEY", System.get_env("OPENROUTER_API_KEY"))
       |> maybe_put_env("GH_TOKEN", System.get_env("GH_TOKEN"))
       |> maybe_put_env("GITHUB_TOKEN", System.get_env("GH_TOKEN"))
       |> maybe_put_env("LINEAR_API_KEY", System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY"))

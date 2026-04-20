@@ -1,12 +1,16 @@
 defmodule KarkhanaWeb.SessionLive do
   @moduledoc """
-  Live session detail — real-time event stream for a running session.
-  Subscribes to PubSub "session:<identifier>" for per-event updates.
+  Session detail — real-time event stream for running sessions,
+  run summary + archived transcript for past sessions.
   """
 
   use Phoenix.LiveView, layout: {KarkhanaWeb.Layouts, :app}
 
-  alias Karkhana.{Session, Store}
+  import KarkhanaWeb.Formatters
+
+  alias Karkhana.{Session, SessionReader, Store}
+
+  @max_events 500
 
   @impl true
   def mount(%{"identifier" => identifier}, _session, socket) do
@@ -14,19 +18,8 @@ defmodule KarkhanaWeb.SessionLive do
 
     {session_info, events, completed_run} =
       if session_pid do
-        info =
-          try do
-            Session.status(session_pid)
-          catch
-            :exit, _ -> nil
-          end
-
-        evts =
-          try do
-            Session.events(session_pid, 200)
-          catch
-            :exit, _ -> []
-          end
+        info = safe_call(fn -> Session.status(session_pid) end)
+        evts = safe_call(fn -> Session.events(session_pid, 200) end, [])
 
         if connected?(socket) do
           Phoenix.PubSub.subscribe(Karkhana.PubSub, "session:#{identifier}")
@@ -34,31 +27,36 @@ defmodule KarkhanaWeb.SessionLive do
 
         {info, evts, nil}
       else
-        # Session not running — show most recent completed run
-        run = load_run(identifier)
+        run = load_latest_run(identifier)
         {nil, [], run}
       end
 
-    # Load all runs for this issue (for the history section)
     all_runs =
-      case Store.list_runs(issue_identifier: identifier, limit: 10) do
+      case Store.list_runs(issue_identifier: identifier, limit: 20) do
         {:ok, runs} -> runs
         _ -> []
       end
+
+    # Load archived transcript for past sessions
+    transcript = if is_nil(session_pid), do: load_transcript(identifier), else: nil
 
     socket =
       socket
       |> assign(:identifier, identifier)
       |> assign(:session, session_info)
       |> assign(:events, events)
+      |> assign(:event_count, length(events))
       |> assign(:completed_run, completed_run)
       |> assign(:all_runs, all_runs)
+      |> assign(:transcript, transcript)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) and session_pid, do: schedule_tick()
 
     {:ok, socket}
   end
+
+  # --- PubSub handlers ---
 
   @impl true
   def handle_info(:tick, socket) do
@@ -67,28 +65,53 @@ defmodule KarkhanaWeb.SessionLive do
   end
 
   def handle_info({:session_event, event}, socket) do
-    events = socket.assigns.events ++ [event]
-    # Cap at 500 in the LiveView (generous for scrolling)
-    events = if length(events) > 500, do: Enum.drop(events, length(events) - 500), else: events
-    {:noreply, assign(socket, :events, events)}
+    count = socket.assigns.event_count + 1
+
+    events =
+      if count > @max_events do
+        Enum.drop(socket.assigns.events, 1) ++ [event]
+      else
+        socket.assigns.events ++ [event]
+      end
+
+    {:noreply,
+     socket
+     |> assign(:events, events)
+     |> assign(:event_count, min(count, @max_events))}
   end
 
   def handle_info({:session_completed, summary}, socket) do
-    run = load_run(socket.assigns.identifier)
+    run = load_latest_run(socket.assigns.identifier)
+    transcript = load_transcript(socket.assigns.identifier)
+
+    all_runs =
+      case Store.list_runs(issue_identifier: socket.assigns.identifier, limit: 20) do
+        {:ok, runs} -> runs
+        _ -> socket.assigns.all_runs
+      end
 
     {:noreply,
      socket
      |> assign(:session, summary)
-     |> assign(:completed_run, run)}
+     |> assign(:completed_run, run)
+     |> assign(:transcript, transcript)
+     |> assign(:all_runs, all_runs)}
   end
 
   def handle_info({:session_failed, summary}, socket) do
-    run = load_run(socket.assigns.identifier)
+    run = load_latest_run(socket.assigns.identifier)
+
+    all_runs =
+      case Store.list_runs(issue_identifier: socket.assigns.identifier, limit: 20) do
+        {:ok, runs} -> runs
+        _ -> socket.assigns.all_runs
+      end
 
     {:noreply,
      socket
      |> assign(:session, summary)
-     |> assign(:completed_run, run)}
+     |> assign(:completed_run, run)
+     |> assign(:all_runs, all_runs)}
   end
 
   def handle_info({:session_status, summary}, socket) do
@@ -97,225 +120,225 @@ defmodule KarkhanaWeb.SessionLive do
 
   def handle_info(_msg, socket), do: {:noreply, socket}
 
+  # --- Render ---
+
   @impl true
   def render(assigns) do
     ~H"""
-    <section class="dashboard-shell">
-      <header class="hero-card" style="padding: 1rem 1.5rem;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <div>
-            <a href="/" style="color: inherit; text-decoration: none; opacity: 0.6;">← Dashboard</a>
-            <h1 class="hero-title" style="margin-top: 0.25rem; font-size: 1.5rem;">
-              <%= @identifier %>
-              <%= if @session do %>
-                <span class="mode-badge" style="margin-left: 0.5rem; font-size: 0.9rem;"><%= @session.mode || "—" %></span>
-                <span class={state_class(@session.status)} style="margin-left: 0.5rem; font-size: 0.9rem;"><%= @session.status %></span>
-              <% end %>
-            </h1>
-          </div>
-          <%= if @session && @session.started_at do %>
-            <div class="numeric" style="text-align: right;">
-              <div><%= format_runtime(@session.started_at, @now) %></div>
-              <div class="muted">$<%= format_cost(@session && @session.cost_usd) %></div>
-            </div>
+    <div class="dash">
+      <header class="dash-header">
+        <a href="/" class="back">← Dashboard</a>
+        <div class="session-title">
+          <h1><%= @identifier %></h1>
+          <%= if @session do %>
+            <span class={status_class(@session.status)}><%= @session.status %></span>
+            <span class="mode"><%= @session.mode || "—" %></span>
           <% end %>
         </div>
       </header>
 
       <%= if @session do %>
-        <section class="metric-grid" style="margin-top: 1rem;">
-          <article class="metric-card">
-            <p class="metric-label">Tokens</p>
-            <p class="metric-value numeric"><%= format_int(@session.tokens.total) %></p>
-            <p class="metric-detail numeric muted">In <%= format_int(@session.tokens.input) %> / Out <%= format_int(@session.tokens.output) %></p>
-          </article>
-          <article class="metric-card">
-            <p class="metric-label">Turns</p>
-            <p class="metric-value numeric"><%= @session.turn_count %></p>
-          </article>
-          <article class="metric-card">
-            <p class="metric-label">Events</p>
-            <p class="metric-value numeric"><%= @session.event_count %></p>
-          </article>
-          <article class="metric-card">
-            <p class="metric-label">Sandbox</p>
-            <p class="metric-value" style="font-size: 0.9rem;"><%= short_id(@session.sandbox_id) %></p>
-          </article>
-        </section>
+        <.live_metrics session={@session} now={@now} />
       <% end %>
 
       <%= if @completed_run do %>
-        <section class="section-card" style="margin-top: 1rem;">
-          <div class="section-header">
-            <h2 class="section-title">Run result</h2>
-          </div>
-          <div class="metric-grid">
-            <article class="metric-card">
-              <p class="metric-label">Outcome</p>
-              <p class={outcome_class(@completed_run.outcome)}><%= @completed_run.outcome %></p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Cost</p>
-              <p class="metric-value numeric">$<%= format_cost(@completed_run.cost_usd) %></p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Duration</p>
-              <p class="metric-value numeric"><%= format_duration(@completed_run.duration_seconds) %></p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Gate</p>
-              <p class="metric-value"><%= @completed_run.gate_result || "—" %></p>
-            </article>
-          </div>
-          <%= if @completed_run.error_message do %>
-            <div style="margin-top: 1rem; padding: 0.75rem; background: #fef2f2; border-radius: 6px; color: #991b1b; font-size: 0.875rem;">
-              <%= @completed_run.error_message %>
-            </div>
-          <% end %>
-        </section>
+        <.run_result run={@completed_run} />
       <% end %>
 
-      <section class="section-card" style="margin-top: 1rem;">
-        <div class="section-header">
-          <h2 class="section-title">Event stream</h2>
-          <span class="muted"><%= length(@events) %> events</span>
-        </div>
+      <%= if @events != [] do %>
+        <.event_stream events={@events} />
+      <% end %>
 
-        <%= if @events == [] do %>
-          <p class="empty-state">No events yet.</p>
-        <% else %>
-          <div class="event-stream" id="event-stream">
-            <div :for={event <- @events} class={"event-row event-#{event.type}"}>
-              <span class="event-time"><%= format_time(event.at) %></span>
-              <span class={"event-type-badge event-type-#{event.type}"}><%= event_type_label(event.type) %></span>
-              <span class="event-summary"><%= event.summary %></span>
-            </div>
-          </div>
-        <% end %>
-      </section>
+      <%= if @transcript && @events == [] do %>
+        <.transcript_section transcript={@transcript} />
+      <% end %>
 
       <%= if @all_runs != [] do %>
-        <section class="section-card" style="margin-top: 1rem;">
-          <div class="section-header">
-            <h2 class="section-title">Run history</h2>
-          </div>
-          <div class="table-wrap">
-            <table class="data-table" style="min-width: 600px;">
-              <thead>
-                <tr>
-                  <th>Mode</th>
-                  <th>Outcome</th>
-                  <th>Gate</th>
-                  <th>Cost</th>
-                  <th>Duration</th>
-                  <th>Started</th>
-                  <th>Error</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr :for={run <- @all_runs}>
-                  <td><span class="mode-badge"><%= run.mode || "—" %></span></td>
-                  <td><span class={outcome_class(run.outcome)}><%= run.outcome %></span></td>
-                  <td>
-                    <%= case run.gate_result do %>
-                      <% "pass" -> %><span style="color: #22c55e;">✓</span>
-                      <% "fail" -> %><span style="color: #ef4444;">✗</span>
-                      <% _ -> %><span class="muted">—</span>
-                    <% end %>
-                  </td>
-                  <td class="numeric">$<%= format_cost(run.cost_usd) %></td>
-                  <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
-                  <td class="muted" style="font-size: 0.8rem;"><%= run.started_at %></td>
-                  <td>
-                    <%= if run.error_message do %>
-                      <span style="font-size: 0.8rem; color: #ef4444;" title={run.error_message}>
-                        <%= String.slice(run.error_message, 0, 80) %>
-                      </span>
-                    <% end %>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
+        <.run_history runs={@all_runs} />
       <% end %>
+    </div>
+    """
+  end
+
+  # --- Components ---
+
+  defp live_metrics(assigns) do
+    ~H"""
+    <div class="stat-row">
+      <div class="stat"><span class="stat-n"><%= format_int(@session.tokens.total) %></span> tokens</div>
+      <div class="stat"><span class="stat-n mono">$<%= format_cost(@session.cost_usd) %></span> cost</div>
+      <div class="stat"><span class="stat-n"><%= @session.turn_count %></span> turns</div>
+      <div class="stat"><span class="stat-n"><%= format_runtime(@session.started_at, @now) %></span> elapsed</div>
+      <div class="stat"><span class="stat-n dim"><%= short_id(@session.sandbox_id) %></span> sandbox</div>
+    </div>
+    """
+  end
+
+  defp run_result(assigns) do
+    ~H"""
+    <section class="card">
+      <h2>Result</h2>
+      <div class="stat-row">
+        <div class="stat"><span class={outcome_class(@run.outcome)}><%= @run.outcome %></span></div>
+        <div class="stat"><span class="stat-n mono">$<%= format_cost(@run.cost_usd) %></span> cost</div>
+        <div class="stat"><span class="stat-n"><%= format_duration(@run.duration_seconds) %></span> duration</div>
+        <div class="stat"><span class="stat-n"><%= @run.gate_result || "—" %></span> gate</div>
+      </div>
+      <%= if @run.error_message do %>
+        <div class="err-block"><%= @run.error_message %></div>
+      <% end %>
+    </section>
+    """
+  end
+
+  defp event_stream(assigns) do
+    ~H"""
+    <section class="card">
+      <div class="card-head">
+        <h2>Events</h2>
+        <span class="dim"><%= length(@events) %></span>
+      </div>
+      <div class="events" id="event-stream" phx-hook="AutoScroll">
+        <div :for={event <- @events} class={"ev ev-#{event.type}"}>
+          <span class="ev-time mono"><%= format_time(event.at) %></span>
+          <span class={"ev-type ev-type-#{event.type}"}><%= event_label(event.type) %></span>
+          <span class="ev-body"><%= event.summary %></span>
+        </div>
+      </div>
+    </section>
+    """
+  end
+
+  defp transcript_section(assigns) do
+    ~H"""
+    <section class="card">
+      <div class="card-head">
+        <h2>Transcript</h2>
+        <span class="dim"><%= length(@transcript.turns) %> turns</span>
+      </div>
+      <div class="events" id="transcript-stream">
+        <div :for={turn <- @transcript.turns} class={"ev ev-#{String.downcase(turn.role)}"}>
+          <span class={"ev-type ev-type-#{String.downcase(turn.role)}"}><%= turn.role %></span>
+          <span class="ev-body">
+            <%= if turn.tools != [] do %>
+              <div :for={tool <- turn.tools} class="ev-tool">🔧 <%= tool %></div>
+            <% end %>
+            <div class="ev-text"><%= turn.text %></div>
+          </span>
+        </div>
+      </div>
+    </section>
+    """
+  end
+
+  defp run_history(assigns) do
+    ~H"""
+    <section class="card">
+      <h2>Run history</h2>
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>Outcome</th>
+            <th>Gate</th>
+            <th class="r">Cost</th>
+            <th class="r">Duration</th>
+            <th>Started</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={run <- @runs}>
+            <td><span class="mode"><%= run.mode || "—" %></span></td>
+            <td><span class={outcome_class(run.outcome)}><%= run.outcome %></span></td>
+            <td><%= gate_icon(run.gate_result) %></td>
+            <td class="r mono">$<%= format_cost(run.cost_usd) %></td>
+            <td class="r mono"><%= format_duration(run.duration_seconds) %></td>
+            <td class="dim"><%= format_started(run.started_at) %></td>
+            <td>
+              <%= if run.error_message do %>
+                <span class="err" title={run.error_message}><%= String.slice(run.error_message, 0, 80) %></span>
+              <% end %>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </section>
     """
   end
 
   # --- Data ---
 
-  defp load_run(identifier) do
+  defp load_latest_run(identifier) do
     case Store.list_runs(limit: 1, issue_identifier: identifier) do
       {:ok, [run | _]} -> run
       _ -> nil
     end
   end
 
-  # --- Formatters ---
+  defp load_transcript(identifier) do
+    # Try to find archived sessions by sandbox name pattern
+    sandbox_name = "karkhana-#{identifier}"
 
-  defp format_runtime(%DateTime{} = started, %DateTime{} = now) do
-    secs = max(DateTime.diff(now, started, :second), 0)
-    m = div(secs, 60)
-    s = rem(secs, 60)
-    "#{m}m #{s}s"
-  end
+    case SessionReader.list_sessions(sandbox_name) do
+      [latest | _] ->
+        case SessionReader.read_session(sandbox_name, latest) do
+          {:ok, summary} -> summary
+          _ -> nil
+        end
 
-  defp format_runtime(started, now) when is_binary(started) do
-    case DateTime.from_iso8601(started) do
-      {:ok, dt, _} -> format_runtime(dt, now)
-      _ -> "—"
+      _ ->
+        nil
     end
   end
 
-  defp format_runtime(_, _), do: "—"
-
-  defp format_cost(nil), do: "0.00"
-  defp format_cost(cost) when is_float(cost), do: :erlang.float_to_binary(cost, decimals: 2)
-  defp format_cost(_), do: "0.00"
-
-  defp format_int(n) when is_integer(n) do
-    n |> Integer.to_string() |> String.reverse() |> String.replace(~r/.{3}(?=.)/, "\\0,") |> String.reverse()
+  defp safe_call(fun, default \\ nil) do
+    try do
+      fun.()
+    catch
+      :exit, _ -> default
+    end
   end
 
-  defp format_int(_), do: "0"
+  # --- Helpers ---
 
-  defp format_duration(nil), do: "—"
+  defp event_label(:tool_use), do: "tool"
+  defp event_label(:assistant), do: "llm"
+  defp event_label(:session_started), do: "start"
+  defp event_label(:turn_start), do: "turn"
+  defp event_label(:turn_end), do: "turn"
+  defp event_label(:result), do: "done"
+  defp event_label(:error), do: "error"
+  defp event_label(type), do: to_string(type)
 
-  defp format_duration(secs) when is_number(secs) do
-    m = div(trunc(secs), 60)
-    s = rem(trunc(secs), 60)
-    if m > 0, do: "#{m}m #{s}s", else: "#{s}s"
+  defp status_class(:running), do: "tag tag-active"
+  defp status_class(:gates), do: "tag tag-warn"
+  defp status_class(:completed), do: "tag tag-ok"
+  defp status_class(:failed), do: "tag tag-err"
+  defp status_class(_), do: "tag"
+
+  defp outcome_class(outcome) do
+    case to_string(outcome) do
+      "success" -> "tag tag-ok"
+      "gate_failed" -> "tag tag-warn"
+      _ -> "tag tag-err"
+    end
   end
 
-  defp format_time(%DateTime{} = dt) do
-    Calendar.strftime(dt, "%H:%M:%S")
+  defp gate_icon("pass"), do: {:safe, ~s(<span class="gate-pass">✓</span>)}
+  defp gate_icon("fail"), do: {:safe, ~s(<span class="gate-fail">✗</span>)}
+  defp gate_icon(_), do: {:safe, ~s(<span class="dim">—</span>)}
+
+  defp format_started(nil), do: "—"
+
+  defp format_started(dt) when is_binary(dt) do
+    case DateTime.from_iso8601(dt) do
+      {:ok, dt, _} -> Calendar.strftime(dt, "%b %d %H:%M")
+      _ -> dt
+    end
   end
 
-  defp format_time(_), do: ""
-
-  defp short_id(nil), do: "—"
-  defp short_id(id) when byte_size(id) > 8, do: String.slice(id, 0, 8)
-  defp short_id(id), do: id
-
-  defp event_type_label(:tool_use), do: "tool"
-  defp event_type_label(:assistant), do: "assistant"
-  defp event_type_label(:session_started), do: "session"
-  defp event_type_label(:turn_start), do: "turn"
-  defp event_type_label(:turn_end), do: "turn"
-  defp event_type_label(:result), do: "result"
-  defp event_type_label(:error), do: "error"
-  defp event_type_label(type), do: to_string(type)
-
-  defp state_class(:completed), do: "status-badge status-badge-live"
-  defp state_class(:failed), do: "status-badge status-badge-offline"
-  defp state_class(:running), do: "status-badge status-badge-active"
-  defp state_class(:gates), do: "status-badge status-badge-warning"
-  defp state_class(_), do: "status-badge"
-
-  defp outcome_class("success"), do: "metric-value status-badge status-badge-live"
-  defp outcome_class(:success), do: "metric-value status-badge status-badge-live"
-  defp outcome_class(_), do: "metric-value status-badge status-badge-offline"
+  defp format_started(%DateTime{} = dt), do: Calendar.strftime(dt, "%b %d %H:%M")
 
   defp schedule_tick, do: Process.send_after(self(), :tick, 1_000)
 end
