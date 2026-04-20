@@ -44,7 +44,7 @@ defmodule Karkhana.SessionTest do
       assert :queue.len(state.events) == 5
     end
 
-    test "ring buffer caps at max_events" do
+    test "all events are retained (no cap)" do
       state = %Session{
         issue: make_issue(),
         events: :queue.new(),
@@ -55,7 +55,7 @@ defmodule Karkhana.SessionTest do
         started_at: DateTime.utc_now()
       }
 
-      # Add 250 events (buffer caps at 200)
+      # Add 250 events — all should be retained
       state =
         Enum.reduce(1..250, state, fn i, acc ->
           event = %{"type" => "message_update", :event_type => :assistant, "content" => "msg #{i}"}
@@ -63,11 +63,11 @@ defmodule Karkhana.SessionTest do
         end)
 
       assert state.event_count == 250
-      assert :queue.len(state.events) == 200
+      assert :queue.len(state.events) == 250
 
-      # Oldest events should be dropped
+      # First event should still be there
       first = :queue.peek(state.events) |> elem(1)
-      assert first.raw["content"] == "msg 51"
+      assert first.raw["content"] == "msg 1"
     end
   end
 
@@ -259,14 +259,6 @@ defmodule Karkhana.SessionTest do
     }
 
     events = :queue.in(display_event, state.events)
-
-    events =
-      if :queue.len(events) > 200 do
-        {_, trimmed} = :queue.out(events)
-        trimmed
-      else
-        events
-      end
 
     turn_count =
       if event_type in [:turn_start, :result, :turn_end],

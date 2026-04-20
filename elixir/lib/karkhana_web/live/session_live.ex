@@ -68,8 +68,6 @@ defmodule KarkhanaWeb.SessionLive do
 
   def handle_info({:session_event, event}, socket) do
     events = socket.assigns.events ++ [event]
-    # Cap at 500 in the LiveView (generous for scrolling)
-    events = if length(events) > 500, do: Enum.drop(events, length(events) - 500), else: events
     {:noreply, assign(socket, :events, events)}
   end
 
@@ -185,11 +183,9 @@ defmodule KarkhanaWeb.SessionLive do
           <p class="empty-state">No events yet.</p>
         <% else %>
           <div class="event-stream" id="event-stream">
-            <div :for={event <- @events} class={"event-row event-#{event.type}"}>
-              <span class="event-time"><%= format_time(event.at) %></span>
-              <span class={"event-type-badge event-type-#{event.type}"}><%= event_type_label(event.type) %></span>
-              <span class="event-summary"><%= event.summary %></span>
-            </div>
+            <%= for event <- @events do %>
+              <.render_event event={event} />
+            <% end %>
           </div>
         <% end %>
       </section>
@@ -242,6 +238,118 @@ defmodule KarkhanaWeb.SessionLive do
     </section>
     """
   end
+
+  # --- Event rendering ---
+
+  defp render_event(%{event: %{type: :tool_use, raw: raw}} = assigns) do
+    tool = Map.get(raw, "toolName") || Map.get(raw, "tool") || "tool"
+    args = Map.get(raw, "args") || %{}
+    result = Map.get(raw, "result")
+    is_error = Map.get(raw, "isError", false)
+    subtype = Map.get(raw, "type", "")
+
+    detail =
+      cond do
+        args["command"] -> args["command"]
+        args["path"] && args["content"] -> args["path"]
+        args["path"] -> args["path"]
+        true -> nil
+      end
+
+    assigns =
+      assigns
+      |> assign(:tool, tool)
+      |> assign(:detail, detail)
+      |> assign(:result, result)
+      |> assign(:is_error, is_error)
+      |> assign(:subtype, subtype)
+
+    ~H"""
+    <div class={"event-row event-tool_use #{if @is_error, do: "event-error"}"}>
+      <span class="event-time"><%= format_time(@event.at) %></span>
+      <span class="event-type-badge event-type-tool_use"><%= @tool %></span>
+      <div class="event-detail">
+        <%= if @detail do %>
+          <pre class="event-pre"><%= @detail %></pre>
+        <% end %>
+        <%= if @result && @subtype == "tool_execution_end" do %>
+          <pre class={"event-pre event-result #{if @is_error, do: "event-result-error"}"}><%= format_result(@result) %></pre>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
+  defp render_event(%{event: %{type: :assistant, raw: raw}} = assigns) do
+    content =
+      Map.get(raw, "content") ||
+        get_in(raw, ["message", "content"]) || []
+
+    blocks =
+      case content do
+        blocks when is_list(blocks) -> blocks
+        _ -> []
+      end
+
+    assigns = assign(assigns, :blocks, blocks)
+
+    ~H"""
+    <div class="event-row event-assistant">
+      <span class="event-time"><%= format_time(@event.at) %></span>
+      <span class="event-type-badge event-type-assistant">llm</span>
+      <div class="event-detail">
+        <%= for block <- @blocks do %>
+          <%= case Map.get(block, "type") do %>
+            <% "thinking" -> %>
+              <div class="event-thinking">
+                <pre class="event-pre"><%= Map.get(block, "thinking", "") %></pre>
+              </div>
+            <% "text" -> %>
+              <pre class="event-pre"><%= Map.get(block, "text", "") %></pre>
+            <% _ -> %>
+          <% end %>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
+  defp render_event(%{event: %{type: type}} = assigns) when type in [:turn_start, :turn_end] do
+    ~H"""
+    <div class="event-row event-turn">
+      <span class="event-time"><%= format_time(@event.at) %></span>
+      <span class="event-type-badge event-type-turn"><%= event_type_label(@event.type) %></span>
+      <span class="event-summary"><%= @event.summary %></span>
+    </div>
+    """
+  end
+
+  defp render_event(%{event: %{type: :error, raw: raw}} = assigns) do
+    message = Map.get(raw, "message") || Map.get(raw, "error") || "Unknown error"
+    assigns = assign(assigns, :message, message)
+
+    ~H"""
+    <div class="event-row event-error">
+      <span class="event-time"><%= format_time(@event.at) %></span>
+      <span class="event-type-badge event-type-error">error</span>
+      <pre class="event-pre event-result-error"><%= @message %></pre>
+    </div>
+    """
+  end
+
+  defp render_event(assigns) do
+    ~H"""
+    <div class="event-row">
+      <span class="event-time"><%= format_time(@event.at) %></span>
+      <span class={"event-type-badge event-type-#{@event.type}"}><%= event_type_label(@event.type) %></span>
+      <span class="event-summary"><%= @event.summary %></span>
+    </div>
+    """
+  end
+
+  defp format_result(result) when is_binary(result), do: result
+  defp format_result(result) when is_map(result) or is_list(result), do: Jason.encode!(result, pretty: true)
+  defp format_result(result), do: inspect(result)
 
   # --- Data ---
 

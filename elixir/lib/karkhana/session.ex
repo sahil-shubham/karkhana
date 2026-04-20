@@ -21,7 +21,6 @@ defmodule Karkhana.Session do
   alias Karkhana.Claude.StreamParser
   alias Karkhana.{Config, Gate, Linear.Issue, PromptBuilder, Protocol, Store, Tracker, Workspace}
 
-  @max_events 200
   @pubsub Karkhana.PubSub
   @sessions_topic "sessions"
 
@@ -308,16 +307,7 @@ defmodule Karkhana.Session do
       raw: event
     }
 
-    # Add to ring buffer (cap at @max_events)
     events = :queue.in(display_event, state.events)
-
-    events =
-      if :queue.len(events) > @max_events do
-        {_, trimmed} = :queue.out(events)
-        trimmed
-      else
-        events
-      end
 
     turn_count =
       if event_type in [:turn_start, :result, :turn_end] do
