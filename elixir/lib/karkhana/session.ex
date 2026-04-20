@@ -479,33 +479,28 @@ defmodule Karkhana.Session do
     lifecycle_mode = Karkhana.Config.Schema.Lifecycle.mode_for_state(lifecycle, issue.state)
 
     if lifecycle_mode do
-      # Load prompt from .karkhana/modes/
-      workspace = Config.settings!().workspace.root
+      # Load prompt from .karkhana/modes/ inside the agent sandbox
+      prompt_path = Karkhana.Config.Schema.Modes.prompt_path(Config.settings!().modes, lifecycle_mode)
 
       prompt_content =
-        case Protocol.load(workspace) do
-          {:ok, protocol} ->
-            prompt_path = Karkhana.Config.Schema.Modes.prompt_path(Config.settings!().modes, lifecycle_mode)
+        if prompt_path do
+          remote_path = "/workspace/.karkhana/#{prompt_path}"
+          Logger.info("Loading prompt from sandbox #{sandbox_id}: #{remote_path}")
 
-            if prompt_path do
-              full_path = Path.join(protocol.dir, prompt_path)
+          case Karkhana.Bhatti.Client.read_file(sandbox_id, remote_path) do
+            {:ok, content} when is_binary(content) and content != "" ->
+              content
 
-              case File.read(full_path) do
-                {:ok, content} -> content
-                _ -> nil
-              end
-            end
-
-          _ ->
-            nil
+            {:error, reason} ->
+              Logger.warning("Failed to read prompt from sandbox: #{inspect(reason)}, falling back to local")
+              read_prompt_local(prompt_path)
+          end
         end
 
       {lifecycle_mode, prompt_content}
     else
-      # Fallback: protocol-based resolution
-      workspace = Config.settings!().workspace.root
-
-      case Protocol.load(workspace) do
+      # Fallback: protocol-based resolution from sandbox
+      case read_protocol_from_sandbox(sandbox_id) do
         {:ok, protocol} ->
           checker = fn cmd -> Karkhana.Bhatti.Client.exec_check(sandbox_id, cmd) end
           mode = Protocol.resolve_mode(protocol, issue, checker)
@@ -517,20 +512,48 @@ defmodule Karkhana.Session do
     end
   end
 
+  # Read prompt file from local .karkhana/ (fallback if sandbox read fails)
+  defp read_prompt_local(prompt_path) do
+    workspace = Config.settings!().workspace.root
+
+    case Protocol.load(workspace) do
+      {:ok, protocol} ->
+        full_path = Path.join(protocol.dir, prompt_path)
+
+        case File.read(full_path) do
+          {:ok, content} -> content
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  # Load .karkhana/ protocol from inside the sandbox
+  defp read_protocol_from_sandbox(_sandbox_id) do
+    workspace = Config.settings!().workspace.root
+
+    # Try local first (orchestrator may have a copy)
+    case Protocol.load(workspace) do
+      {:ok, _protocol} = ok -> ok
+      _ -> {:error, :not_found}
+    end
+  end
+
   defp load_gate_context(mode) do
     settings = Config.settings!()
     gate_specs = Karkhana.Config.Schema.Modes.gates(settings.modes, mode)
 
     if gate_specs != [] do
-      workspace = settings.workspace.root
-
-      {protocol_dir, artifacts_config} =
-        case Protocol.load(workspace) do
-          {:ok, protocol} -> {protocol.dir, protocol.artifacts}
-          _ -> {nil, %{}}
+      # Artifacts config lives in the raw WORKFLOW.md YAML, not in the Schema
+      artifacts_config =
+        case Karkhana.Workflow.current() do
+          {:ok, %{config: config}} -> config["artifacts"] || %{}
+          _ -> %{}
         end
 
-      {gate_specs, protocol_dir, artifacts_config}
+      {gate_specs, nil, artifacts_config}
     else
       {[], nil, %{}}
     end
