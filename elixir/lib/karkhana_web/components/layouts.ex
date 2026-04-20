@@ -28,7 +28,27 @@ defmodule KarkhanaWeb.Layouts do
 
             if (!window.Phoenix || !window.LiveView) return;
 
+            var Hooks = {};
+            Hooks.AutoScroll = {
+              mounted() {
+                this._stick = true;
+                this.el.addEventListener("scroll", () => {
+                  var el = this.el;
+                  this._stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+                });
+                this._obs = new MutationObserver(() => {
+                  if (this._stick) this.el.scrollTop = this.el.scrollHeight;
+                });
+                this._obs.observe(this.el, { childList: true, subtree: true });
+                this.el.scrollTop = this.el.scrollHeight;
+              },
+              destroyed() {
+                if (this._obs) this._obs.disconnect();
+              }
+            };
+
             var liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
+              hooks: Hooks,
               params: {_csrf_token: csrfToken}
             });
 

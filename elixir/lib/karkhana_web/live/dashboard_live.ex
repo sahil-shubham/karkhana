@@ -127,7 +127,7 @@ defmodule KarkhanaWeb.DashboardLive do
           <div :for={{_id, s} <- Enum.sort_by(@sessions, fn {_, s} -> s.identifier end)} class="session-card">
             <div class="session-card-header">
               <div>
-                <a href={"/sessions/#{s.identifier}"} class="issue-id" style="font-size: 1.1rem; text-decoration: none;">
+                <a href={"/s/#{s.identifier}"} target="_blank" class="issue-id" style="font-size: 1.1rem; text-decoration: none;">
                   <%= s.identifier %>
                 </a>
                 <span class={state_badge_class(s.state)} style="margin-left: 0.5rem;"><%= s.state %></span>
@@ -152,7 +152,7 @@ defmodule KarkhanaWeb.DashboardLive do
                 <span class="muted" style="margin-left: 0.75rem;">Tokens: <span class="numeric"><%= format_int(s.tokens.total) %></span></span>
                 <span class="muted" style="margin-left: 0.5rem;">Turns: <span class="numeric"><%= s.turn_count %></span></span>
               </span>
-              <a href={"/sessions/#{s.identifier}"} style="font-size: 0.85rem;">View live →</a>
+              <a href={"/s/#{s.identifier}"} target="_blank" style="font-size: 0.85rem;">View live →</a>
             </div>
           </div>
         <% end %>
@@ -182,7 +182,7 @@ defmodule KarkhanaWeb.DashboardLive do
               <tbody>
                 <tr :for={run <- @recent_runs}>
                   <td>
-                    <a href={"/sessions/#{run.issue_identifier}"} class="issue-id" style="text-decoration: none;">
+                    <a href={"/s/#{run.issue_identifier}"} target="_blank" class="issue-id" style="text-decoration: none;">
                       <%= run.issue_identifier %>
                     </a>
                   </td>
