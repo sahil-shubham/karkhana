@@ -234,7 +234,16 @@ defmodule Karkhana.Store do
     ]
 
     Enum.each(statements, &(:ok = Exqlite.Sqlite3.execute(conn, &1)))
+    migrate(conn)
     :ok
+  end
+
+  defp migrate(conn) do
+    # Add session_file column if it doesn't exist
+    case Exqlite.Sqlite3.execute(conn, "ALTER TABLE runs ADD COLUMN session_file TEXT") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
   end
 
   # --- Inserts ---
@@ -244,12 +253,12 @@ defmodule Karkhana.Store do
 
     sql = """
     INSERT INTO runs (id, issue_id, issue_identifier, mode, config_hash, attempt,
-      sandbox_id, sandbox_name, session_id,
+      sandbox_id, sandbox_name, session_id, session_file,
       tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
       cost_usd, duration_seconds, outcome, error_message,
       artifacts_before, artifacts_after, gate, gate_result, gate_output,
       labels, started_at, ended_at)
-    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
     """
 
     tokens = Map.get(run, :tokens, %{})
@@ -264,6 +273,7 @@ defmodule Karkhana.Store do
       run[:sandbox_id],
       run[:sandbox_name],
       run[:session_id],
+      run[:session_file],
       tokens[:input] || 0,
       tokens[:output] || 0,
       tokens[:cache_read] || 0,
@@ -513,6 +523,7 @@ defmodule Karkhana.Store do
       sandbox_id: map["sandbox_id"],
       sandbox_name: map["sandbox_name"],
       session_id: map["session_id"],
+      session_file: map["session_file"],
       tokens: %{
         input: map["tokens_input"],
         output: map["tokens_output"],

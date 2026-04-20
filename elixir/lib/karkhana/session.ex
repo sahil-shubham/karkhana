@@ -79,6 +79,7 @@ defmodule Karkhana.Session do
     :mode,
     :mode_prompt,
     :session_id,
+    :session_file,
     :output_file,
     :started_at,
     :error,
@@ -178,6 +179,10 @@ defmodule Karkhana.Session do
     }
 
     Logger.info("Session #{state.issue.identifier}: mode=#{mode}")
+
+    # Clean up stale documents from previous failed runs for this mode
+    cleanup_stale_documents(state.issue, mode, gate_specs)
+
     send(self(), :launch_agent)
     {:noreply, state}
   end
@@ -199,7 +204,8 @@ defmodule Karkhana.Session do
     case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.attempt) do
       {:ok, %{session_id: sid}} ->
         # Agent turn completed normally
-        state = %{state | session_id: sid || state.session_id, status: :gates}
+        session_file = resolve_session_file(state.sandbox_id, sid)
+        state = %{state | session_id: sid || state.session_id, session_file: session_file, status: :gates}
         Logger.info("Session #{state.issue.identifier}: agent completed, running gates")
         broadcast_sessions({:session_status, summary(state)})
         send(self(), :run_gates)
@@ -462,6 +468,7 @@ defmodule Karkhana.Session do
       sandbox_id: state.sandbox_id,
       sandbox_name: state.sandbox_name || "",
       session_id: state.session_id,
+      session_file: state.session_file,
       tokens: %{
         input: state.tokens.input,
         output: state.tokens.output,
@@ -591,6 +598,62 @@ defmodule Karkhana.Session do
       _ -> {:error, :not_found}
     end
   end
+
+  # Find the session JSONL file in the sandbox for this session ID.
+  defp resolve_session_file(sandbox_id, session_id) when is_binary(sandbox_id) do
+    cmd =
+      if session_id do
+        "ls /home/lohar/karkhana-sessions/*#{session_id}*.jsonl 2>/dev/null | tail -1"
+      else
+        "ls -t /home/lohar/karkhana-sessions/*.jsonl 2>/dev/null | head -1"
+      end
+
+    case Karkhana.Bhatti.Client.exec(sandbox_id, ["bash", "-c", cmd], timeout_sec: 5) do
+      {:ok, %{"exit_code" => 0, "stdout" => path}} when byte_size(path) > 0 ->
+        String.trim(path)
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp resolve_session_file(_, _), do: nil
+
+  # Clean up stale documents from previous failed runs.
+  # Finds document_exists gates for this mode, extracts title patterns,
+  # and deletes all matching documents on the issue.
+  defp cleanup_stale_documents(%{id: issue_id} = _issue, _mode, gate_specs) when is_binary(issue_id) do
+    # Find title patterns from document_exists gates
+    title_patterns =
+      (gate_specs || [])
+      |> Enum.filter(fn spec -> spec["check"] == "document_exists" end)
+      |> Enum.map(fn spec -> spec["title"] || spec["pattern"] end)
+      |> Enum.reject(&is_nil/1)
+
+    if title_patterns != [] do
+      case Karkhana.Linear.Client.get_issue_documents(issue_id) do
+        {:ok, docs} ->
+          docs
+          |> Enum.filter(fn doc ->
+            title = String.downcase(doc["title"] || "")
+            Enum.any?(title_patterns, fn pattern -> String.contains?(title, String.downcase(pattern)) end)
+          end)
+          |> Enum.each(fn doc ->
+            Logger.info("Cleaning up stale document: #{doc["title"]} (#{doc["id"]})")
+            Karkhana.Linear.Client.delete_document(doc["id"])
+          end)
+
+        {:error, reason} ->
+          Logger.warning("Failed to clean up documents: #{inspect(reason)}")
+      end
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp cleanup_stale_documents(_, _, _), do: :ok
 
   # Fetch documents attached to the issue from Linear.
   # Returns a map of title => content for use in prompt templates.

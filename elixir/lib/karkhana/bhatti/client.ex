@@ -107,10 +107,18 @@ defmodule Karkhana.Bhatti.Client do
   def exec(sandbox_id, cmd, opts \\ []) do
     timeout_sec = Keyword.get(opts, :timeout_sec, 3600)
 
-    post("/sandboxes/#{sandbox_id}/exec", %{
-      "cmd" => cmd,
-      "timeout_sec" => timeout_sec
-    })
+    # HTTP timeout must exceed the command timeout to avoid
+    # the client aborting before bhatti returns the result.
+    http_timeout_ms = timeout_sec * 1000 + 10_000
+
+    post(
+      "/sandboxes/#{sandbox_id}/exec",
+      %{
+        "cmd" => cmd,
+        "timeout_sec" => timeout_sec
+      },
+      http_timeout_ms: http_timeout_ms
+    )
   end
 
   @doc """
@@ -281,15 +289,15 @@ defmodule Karkhana.Bhatti.Client do
     end
   end
 
-  defp post(path, body) do
-    case request(:post, path, body) do
+  defp post(path, body, opts \\ []) do
+    case request(:post, path, body, opts) do
       {:ok, %{status: status, body: resp}} when status in [200, 201] -> {:ok, resp}
       {:ok, %{status: status, body: resp}} -> {:error, {:http_error, status, resp}}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp request(method, path, body \\ nil) do
+  defp request(method, path, body \\ nil, opts \\ []) do
     %{url: base_url, api_key: api_key} = config()
     url = base_url <> path
 
@@ -316,7 +324,9 @@ defmodule Karkhana.Bhatti.Client do
           {String.to_charlist(url), headers}
       end
 
-    case :httpc.request(method, http_req, [timeout: @timeout_ms], body_format: :binary) do
+    http_timeout = Keyword.get(opts, :http_timeout_ms, @timeout_ms)
+
+    case :httpc.request(method, http_req, [timeout: http_timeout], body_format: :binary) do
       {:ok, {{_, status, _}, _resp_headers, resp_body}} ->
         decoded =
           case Jason.decode(resp_body) do

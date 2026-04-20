@@ -113,25 +113,47 @@ defmodule KarkhanaWeb.RunLive do
   # --- Data loading ---
 
   defp load_transcript(run) do
+    # Try specific session file first (exact match for this run)
+    case try_specific_session(run) do
+      {:ok, transcript} -> transcript
+      :not_found -> try_archive(run) || try_live_read(run)
+    end
+  end
+
+  # Load the exact session file recorded for this run
+  defp try_specific_session(%{sandbox_id: sandbox_id, session_file: session_file})
+       when is_binary(sandbox_id) and is_binary(session_file) and session_file != "" do
+    case SessionReader.read_live_session(sandbox_id, session_file) do
+      {:ok, summary} -> {:ok, summary}
+      _ -> :not_found
+    end
+  rescue
+    _ -> :not_found
+  end
+
+  defp try_specific_session(_), do: :not_found
+
+  # Try archived sessions by sandbox name
+  defp try_archive(run) do
     sandbox_name = run.sandbox_name || "karkhana-#{run.issue_identifier}"
 
-    # Try archive first
     case SessionReader.list_sessions(sandbox_name) do
       [latest | _] ->
         case SessionReader.read_session(sandbox_name, latest) do
           {:ok, summary} -> summary
-          _ -> try_live_read(run)
+          _ -> nil
         end
 
       _ ->
-        try_live_read(run)
+        nil
     end
   end
 
+  # Try live-read from sandbox (latest file)
   defp try_live_read(%{sandbox_id: sandbox_id}) when is_binary(sandbox_id) do
     case Karkhana.Bhatti.Client.exec(
            sandbox_id,
-           ["bash", "-c", "ls /home/lohar/karkhana-sessions/*.jsonl 2>/dev/null | tail -1"],
+           ["bash", "-c", "ls -t /home/lohar/karkhana-sessions/*.jsonl 2>/dev/null | head -1"],
            timeout_sec: 5
          ) do
       {:ok, %{"exit_code" => 0, "stdout" => path}} when byte_size(path) > 0 ->

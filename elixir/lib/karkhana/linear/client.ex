@@ -244,6 +244,22 @@ defmodule Karkhana.Linear.Client do
     end
   end
 
+  @doc "Delete a document by ID."
+  @spec delete_document(String.t()) :: :ok | {:error, term()}
+  def delete_document(document_id) when is_binary(document_id) do
+    query = """
+    mutation KarkhanaDeleteDocument($id: String!) {
+      documentDelete(id: $id) { success }
+    }
+    """
+
+    case graphql(query, %{"id" => document_id}) do
+      {:ok, %{"data" => %{"documentDelete" => %{"success" => true}}}} -> :ok
+      {:ok, _} -> {:error, :delete_failed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do
