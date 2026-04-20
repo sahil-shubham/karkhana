@@ -72,7 +72,6 @@ artifacts:
 modes:
   planning:
     prompt: modes/planning.md
-    agent: { max_turns: 8 }
     gates:
       - name: plan-exists
         check: artifact_exists
@@ -82,7 +81,6 @@ modes:
 
   implementation:
     prompt: modes/implementation.md
-    agent: { max_turns: 10 }
     gates:
       - name: builds
         check: command

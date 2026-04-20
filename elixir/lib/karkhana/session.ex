@@ -23,6 +23,7 @@ defmodule Karkhana.Session do
 
   @pubsub Karkhana.PubSub
   @sessions_topic "sessions"
+  @max_gate_retries 3
 
   # --- Public API ---
 
@@ -87,6 +88,7 @@ defmodule Karkhana.Session do
     :artifacts_config,
     :attempt,
     :config_hash,
+    gate_retries: 0,
     lines_seen: 0,
     tokens: %{input: 0, output: 0, total: 0, cache_read: 0, cache_write: 0},
     cost_usd: 0.0,
@@ -243,11 +245,49 @@ defmodule Karkhana.Session do
         {:failed, results} ->
           feedback = Gate.failure_feedback(results)
           failed_names = Enum.map(feedback, & &1.gate) |> Enum.join(", ")
-          Logger.warning("Session #{state.issue.identifier}: gates failed: #{failed_names}")
           state = %{state | gate_results: results}
-          fail(state, "Gates failed: #{failed_names}", :gate_failed)
+
+          # Check if any failed gate wants retry_with_feedback
+          retryable = has_retryable_gates?(results, state.gate_specs)
+
+          if retryable and state.gate_retries < @max_gate_retries do
+            Logger.info("Session #{state.issue.identifier}: gates failed (#{failed_names}), retrying with feedback (#{state.gate_retries + 1}/#{@max_gate_retries})")
+            state = %{state | gate_retries: state.gate_retries + 1, status: :running}
+            send(self(), {:retry_with_feedback, feedback})
+            {:noreply, state}
+          else
+            Logger.warning("Session #{state.issue.identifier}: gates failed: #{failed_names}")
+            fail(state, "Gates failed: #{failed_names}", :gate_failed)
+          end
       end
     end
+  end
+
+  def handle_info({:retry_with_feedback, feedback}, state) do
+    Logger.info("Session #{state.issue.identifier}: re-launching agent with gate feedback")
+
+    prompt =
+      PromptBuilder.build_prompt(state.issue,
+        mode: state.mode,
+        mode_prompt: state.mode_prompt,
+        attempt: state.attempt,
+        gate_feedback: feedback
+      )
+
+    case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.gate_retries) do
+      {:ok, %{session_id: sid}} ->
+        state = %{state | session_id: sid || state.session_id, status: :gates}
+        Logger.info("Session #{state.issue.identifier}: retry agent completed, running gates")
+        broadcast_sessions({:session_status, summary(state)})
+        send(self(), :run_gates)
+        {:noreply, state}
+
+      {:error, reason} ->
+        fail(state, "Agent retry failed: #{inspect(reason)}")
+    end
+  rescue
+    e ->
+      fail(state, "Agent retry crashed: #{Exception.message(e)}")
   end
 
   def handle_info({:stream_event, event}, state) do
@@ -546,6 +586,20 @@ defmodule Karkhana.Session do
       {:ok, _protocol} = ok -> ok
       _ -> {:error, :not_found}
     end
+  end
+
+  # Check if any failed gate has on_failure: "retry_with_feedback"
+  defp has_retryable_gates?(results, gate_specs) do
+    failed_names =
+      results
+      |> Enum.filter(fn {_name, status, _output} -> status == :fail end)
+      |> Enum.map(fn {name, _, _} -> name end)
+      |> MapSet.new()
+
+    Enum.any?(gate_specs || [], fn spec ->
+      name = spec["name"] || spec["check"] || ""
+      MapSet.member?(failed_names, name) and spec["on_failure"] == "retry_with_feedback"
+    end)
   end
 
   defp load_gate_context(mode) do
