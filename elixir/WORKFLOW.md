@@ -65,19 +65,15 @@ lifecycle:
     Plan Review:   { type: human_gate, linear_type: started, sandbox: stop, color: "#f2994a", description: "Awaiting human review of plan" }
     Implementing:  { type: dispatch, linear_type: started, mode: implementation, on_complete: In Review, color: "#4ea7fc", description: "Agent is implementing" }
 
-artifacts:
-  plan:
-    paths: ["docs/PLAN-{{ issue.identifier }}.md"]
-
 modes:
   planning:
     prompt: modes/planning.md
     gates:
-      - name: plan-exists
-        check: artifact_exists
-        artifact: plan
+      - name: plan-document
+        check: document_exists
+        title: plan
         on_failure: retry_with_feedback
-        message: "Write the plan to docs/PLAN-{{ issue.identifier }}.md"
+        message: "Create a Linear document titled 'Plan: {{ issue.identifier }}' on this issue with the plan content using the documentCreate GraphQL mutation."
 
   implementation:
     prompt: modes/implementation.md

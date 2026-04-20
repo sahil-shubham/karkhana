@@ -210,6 +210,40 @@ defmodule Karkhana.Linear.Client do
     end
   end
 
+  # --- Documents ---
+
+  @doc "Fetch documents attached to an issue."
+  @spec get_issue_documents(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def get_issue_documents(issue_id) when is_binary(issue_id) do
+    query = """
+    query KarkhanaIssueDocuments($id: String!) {
+      issue(id: $id) {
+        documents(first: 20) {
+          nodes {
+            id
+            title
+            content
+            url
+            createdAt
+            updatedAt
+          }
+        }
+      }
+    }
+    """
+
+    case graphql(query, %{"id" => issue_id}) do
+      {:ok, %{"data" => %{"issue" => %{"documents" => %{"nodes" => docs}}}}} ->
+        {:ok, docs}
+
+      {:ok, %{"data" => %{"issue" => nil}}} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do

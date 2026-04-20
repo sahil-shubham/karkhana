@@ -125,6 +125,9 @@ defmodule Karkhana.Gate do
       "script" ->
         run_script(name, gate, sandbox_id, context)
 
+      "document_exists" ->
+        run_document_exists(name, gate, context)
+
       other ->
         Logger.warning("Unknown gate check type: #{inspect(other)} for gate #{name}")
         {name, :fail, "Unknown gate check type: #{inspect(other)}"}
@@ -228,6 +231,36 @@ defmodule Karkhana.Gate do
           {:error, reason} ->
             {name, :fail, "Gate script not found at #{full_path}: #{inspect(reason)}"}
         end
+    end
+  end
+
+  defp run_document_exists(name, gate, context) do
+    issue_id = context[:issue_id]
+    title_pattern = gate["title"] || gate["pattern"]
+
+    if is_nil(issue_id) do
+      {name, :fail, failure_message(gate, "No issue_id in context for document check", context)}
+    else
+      case Karkhana.Linear.Client.get_issue_documents(issue_id) do
+        {:ok, docs} when is_list(docs) ->
+          match =
+            if title_pattern do
+              Enum.find(docs, fn doc ->
+                (doc["title"] || "") |> String.downcase() |> String.contains?(String.downcase(title_pattern))
+              end)
+            else
+              List.first(docs)
+            end
+
+          if match do
+            {name, :pass, "Document found: #{match["title"]}"}
+          else
+            {name, maybe_warn(gate), failure_message(gate, "No document found on issue", context)}
+          end
+
+        {:error, reason} ->
+          {name, :fail, "Document check failed: #{inspect(reason)}"}
+      end
     end
   end
 

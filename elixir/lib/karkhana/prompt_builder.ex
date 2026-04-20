@@ -27,13 +27,16 @@ defmodule Karkhana.PromptBuilder do
         Workflow.current() |> prompt_template!() |> parse_template!()
       end
 
+    documents = Keyword.get(opts, :documents, %{})
+
     base_prompt =
       template
       |> Solid.render!(
         %{
           "attempt" => Keyword.get(opts, :attempt),
           "mode" => mode || "default",
-          "issue" => issue |> Map.from_struct() |> to_solid_map()
+          "issue" => issue |> Map.from_struct() |> to_solid_map(),
+          "documents" => to_solid_map(documents)
         },
         @render_opts
       )

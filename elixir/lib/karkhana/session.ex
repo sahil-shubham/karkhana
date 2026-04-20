@@ -183,12 +183,15 @@ defmodule Karkhana.Session do
   end
 
   def handle_info(:launch_agent, state) do
+    documents = fetch_issue_documents(state.issue)
+
     prompt =
       PromptBuilder.build_prompt(state.issue,
         mode: state.mode,
         mode_prompt: state.mode_prompt,
         attempt: state.attempt,
-        gate_feedback: nil
+        gate_feedback: nil,
+        documents: documents
       )
 
     _previous_session_id = lookup_previous_session(state.issue)
@@ -266,12 +269,15 @@ defmodule Karkhana.Session do
   def handle_info({:retry_with_feedback, feedback}, state) do
     Logger.info("Session #{state.issue.identifier}: re-launching agent with gate feedback")
 
+    documents = fetch_issue_documents(state.issue)
+
     prompt =
       PromptBuilder.build_prompt(state.issue,
         mode: state.mode,
         mode_prompt: state.mode_prompt,
         attempt: state.attempt,
-        gate_feedback: feedback
+        gate_feedback: feedback,
+        documents: documents
       )
 
     case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.gate_retries) do
@@ -587,6 +593,25 @@ defmodule Karkhana.Session do
       _ -> {:error, :not_found}
     end
   end
+
+  # Fetch documents attached to the issue from Linear.
+  # Returns a map of title => content for use in prompt templates.
+  defp fetch_issue_documents(%{id: issue_id}) when is_binary(issue_id) do
+    case Karkhana.Linear.Client.get_issue_documents(issue_id) do
+      {:ok, docs} when is_list(docs) ->
+        Map.new(docs, fn doc ->
+          key = (doc["title"] || "untitled") |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "_")
+          {key, doc["content"] || ""}
+        end)
+
+      _ ->
+        %{}
+    end
+  rescue
+    _ -> %{}
+  end
+
+  defp fetch_issue_documents(_), do: %{}
 
   # Check if any failed gate has on_failure: "retry_with_feedback"
   defp has_retryable_gates?(results, gate_specs) do
