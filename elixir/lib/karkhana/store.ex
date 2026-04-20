@@ -30,6 +30,9 @@ defmodule Karkhana.Store do
   @spec insert_issue_event(map()) :: :ok | {:error, term()}
   def insert_issue_event(event) when is_map(event), do: call({:insert_issue_event, event})
 
+  @spec get_run(String.t()) :: {:ok, map()} | {:error, :not_found} | {:error, term()}
+  def get_run(run_id) when is_binary(run_id), do: call({:get_run, run_id})
+
   @spec list_runs(keyword()) :: {:ok, [map()]} | {:error, term()}
   def list_runs(opts \\ []), do: call({:list_runs, opts})
 
@@ -90,6 +93,11 @@ defmodule Karkhana.Store do
 
   def handle_call({:insert_issue_event, event}, _from, %{conn: conn} = state) do
     result = do_insert_issue_event(conn, event)
+    {:reply, result, state}
+  end
+
+  def handle_call({:get_run, run_id}, _from, %{conn: conn} = state) do
+    result = do_get_run(conn, run_id)
     {:reply, result, state}
   end
 
@@ -319,6 +327,16 @@ defmodule Karkhana.Store do
   end
 
   # --- Queries ---
+
+  defp do_get_run(conn, run_id) do
+    sql = "SELECT * FROM runs WHERE id = ?1 LIMIT 1"
+
+    case query_all(conn, sql, [run_id], &row_to_run/2) do
+      {:ok, [run]} -> {:ok, run}
+      {:ok, []} -> {:error, :not_found}
+      error -> error
+    end
+  end
 
   defp do_list_runs(conn, opts) do
     limit = Keyword.get(opts, :limit, 100)

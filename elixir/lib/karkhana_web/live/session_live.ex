@@ -72,36 +72,12 @@ defmodule KarkhanaWeb.SessionLive do
     {:noreply, assign(socket, :events, socket.assigns.events ++ [event])}
   end
 
-  def handle_info({:session_completed, summary}, socket) do
-    run = load_latest_run(socket.assigns.identifier)
-
-    # Try to load transcript — sandbox may still be alive
-    {events, mode} =
-      case load_transcript_from_sandbox(socket.assigns.identifier) do
-        {:ok, transcript} ->
-          {transcript.turns, :transcript}
-
-        :not_found ->
-          # Keep the live events we already have
-          {socket.assigns.events, :ended}
-      end
-
-    {:noreply,
-     socket
-     |> assign(:session, summary)
-     |> assign(:completed_run, run)
-     |> assign(:events, events)
-     |> assign(:mode, mode)}
+  def handle_info({:session_completed, _summary}, socket) do
+    redirect_to_run(socket)
   end
 
-  def handle_info({:session_failed, summary}, socket) do
-    run = load_latest_run(socket.assigns.identifier)
-
-    {:noreply,
-     socket
-     |> assign(:session, summary)
-     |> assign(:completed_run, run)
-     |> assign(:mode, :ended)}
+  def handle_info({:session_failed, _summary}, socket) do
+    redirect_to_run(socket)
   end
 
   def handle_info({:session_status, summary}, socket) do
@@ -109,6 +85,17 @@ defmodule KarkhanaWeb.SessionLive do
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  defp redirect_to_run(socket) do
+    case load_latest_run(socket.assigns.identifier) do
+      %{id: run_id} when is_binary(run_id) ->
+        {:noreply, push_navigate(socket, to: "/r/#{run_id}")}
+
+      _ ->
+        # Run not yet committed to store — show what we have
+        {:noreply, assign(socket, :mode, :ended)}
+    end
+  end
 
   # --- Render ---
 
@@ -496,8 +483,9 @@ defmodule KarkhanaWeb.SessionLive do
 
   defp outcome_class(outcome) do
     case to_string(outcome) do
-      "success" -> "metric-value status-badge status-badge-live"
-      _ -> "metric-value status-badge status-badge-offline"
+      "success" -> "metric-value outcome-success"
+      "gate_failed" -> "metric-value outcome-gate-failed"
+      _ -> "metric-value outcome-error"
     end
   end
 

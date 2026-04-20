@@ -31,6 +31,7 @@ defmodule KarkhanaWeb.Router do
 
     live("/", DashboardLive, :index)
     live("/s/:identifier", SessionLive, :show)
+    live("/r/:run_id", RunLive, :show)
   end
 
   scope "/", KarkhanaWeb do

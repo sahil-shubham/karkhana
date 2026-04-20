@@ -172,8 +172,6 @@ defmodule KarkhanaWeb.DashboardLive do
                 <tr>
                   <th>Issue</th>
                   <th>Mode</th>
-                  <th>Outcome</th>
-                  <th>Gate</th>
                   <th>Cost</th>
                   <th>Duration</th>
                   <th>Error</th>
@@ -182,23 +180,11 @@ defmodule KarkhanaWeb.DashboardLive do
               <tbody>
                 <tr :for={run <- @recent_runs}>
                   <td>
-                    <a href={"/s/#{run.issue_identifier}"} target="_blank" class="issue-id" style="text-decoration: none;">
+                    <a href={"/r/#{run.id}"} target="_blank" class="issue-id" style="text-decoration: none;">
                       <%= run.issue_identifier %>
                     </a>
                   </td>
                   <td><span class="mode-badge"><%= run.mode || "—" %></span></td>
-                  <td>
-                    <span class={outcome_class(run.outcome)}>
-                      <%= run.outcome %>
-                    </span>
-                  </td>
-                  <td>
-                    <%= case run.gate_result do %>
-                      <% "pass" -> %><span style="color: #22c55e;">✓</span>
-                      <% "fail" -> %><span style="color: #ef4444;">✗</span>
-                      <% _ -> %><span class="muted">—</span>
-                    <% end %>
-                  </td>
                   <td class="numeric">$<%= format_cost(run.cost_usd) %></td>
                   <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
                   <td>
@@ -312,13 +298,6 @@ defmodule KarkhanaWeb.DashboardLive do
       n in ["plan review", "in review"] -> "#{base} state-badge-warning"
       n in ["done"] -> "#{base} state-badge-live"
       true -> base
-    end
-  end
-
-  defp outcome_class(outcome) do
-    case to_string(outcome) do
-      "success" -> "status-badge status-badge-live"
-      _ -> "status-badge status-badge-offline"
     end
   end
 

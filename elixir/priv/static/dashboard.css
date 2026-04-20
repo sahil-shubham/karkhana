@@ -596,3 +596,8 @@ pre,
 .state-badge-active { background: #dbeafe; color: #1d4ed8; }
 .state-badge-warning { background: #fef3c7; color: #92400e; }
 .state-badge-live { background: #d1fae5; color: #065f46; }
+
+/* --- Outcome badges (always visible, not tied to connection state) --- */
+.outcome-success { color: #065f46; }
+.outcome-gate-failed { color: #92400e; }
+.outcome-error { color: #991b1b; }
