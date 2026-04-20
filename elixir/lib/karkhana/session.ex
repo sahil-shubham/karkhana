@@ -138,22 +138,9 @@ defmodule Karkhana.Session do
     case Workspace.create_for_issue(state.issue) do
       {:ok, sandbox_id} ->
         sandbox_name = Workspace.sandbox_name_for_issue(state.issue)
+        state = %{state | sandbox_id: sandbox_id, sandbox_name: sandbox_name}
 
-        {mode, mode_prompt} = resolve_mode(sandbox_id, state.issue)
-        {gate_specs, protocol_dir, artifacts_config} = load_gate_context(mode)
-
-        state = %{
-          state
-          | sandbox_id: sandbox_id,
-            sandbox_name: sandbox_name,
-            mode: mode,
-            mode_prompt: mode_prompt,
-            gate_specs: gate_specs,
-            protocol_dir: protocol_dir,
-            artifacts_config: artifacts_config
-        }
-
-        Logger.info("Session #{state.issue.identifier}: sandbox=#{sandbox_id} mode=#{mode}")
+        Logger.info("Session #{state.issue.identifier}: sandbox=#{sandbox_id}")
         send(self(), :run_hooks)
         {:noreply, state}
 
@@ -165,12 +152,32 @@ defmodule Karkhana.Session do
   def handle_info(:run_hooks, state) do
     case Workspace.run_before_run_hook(state.sandbox_id, state.issue) do
       :ok ->
-        send(self(), :launch_agent)
+        send(self(), :resolve_and_launch)
         {:noreply, state}
 
       {:error, reason} ->
         fail(state, "before_run hook failed: #{inspect(reason)}")
     end
+  end
+
+  def handle_info(:resolve_and_launch, state) do
+    # Resolve mode AFTER hooks — before_run may git pull to update
+    # .karkhana/modes/ in the sandbox.
+    {mode, mode_prompt} = resolve_mode(state.sandbox_id, state.issue)
+    {gate_specs, protocol_dir, artifacts_config} = load_gate_context(mode)
+
+    state = %{
+      state
+      | mode: mode,
+        mode_prompt: mode_prompt,
+        gate_specs: gate_specs,
+        protocol_dir: protocol_dir,
+        artifacts_config: artifacts_config
+    }
+
+    Logger.info("Session #{state.issue.identifier}: mode=#{mode}")
+    send(self(), :launch_agent)
+    {:noreply, state}
   end
 
   def handle_info(:launch_agent, state) do

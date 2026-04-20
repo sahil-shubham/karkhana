@@ -44,6 +44,8 @@ hooks:
     cd /workspace
     git clone https://github.com/sahil-shubham/bhatti.sh.git .
     yarn install
+  before_run: |
+    cd /workspace && git pull --ff-only origin main
 
 observability:
   dashboard_enabled: false
