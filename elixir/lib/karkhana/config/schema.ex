@@ -445,6 +445,15 @@ defmodule Karkhana.Config.Schema do
       end
     end
 
+    @doc "Get the on_reject target state for a given state (where to go on failure)."
+    @spec on_reject_state(%__MODULE__{}, String.t()) :: String.t() | nil
+    def on_reject_state(%__MODULE__{states: states}, state_name) do
+      case Map.get(states, state_name) do
+        %{"on_reject" => target} -> target
+        _ -> nil
+      end
+    end
+
     @doc "Get the sandbox action for a given state (stop, destroy, or nil)."
     @spec sandbox_action(%__MODULE__{}, String.t()) :: String.t() | nil
     def sandbox_action(%__MODULE__{states: states}, state_name) do

@@ -267,18 +267,12 @@ defmodule Karkhana.Session do
   end
 
   def handle_info({:retry_with_feedback, feedback}, state) do
-    Logger.info("Session #{state.issue.identifier}: re-launching agent with gate feedback")
+    Logger.info("Session #{state.issue.identifier}: continuing session with gate feedback (retry #{state.gate_retries}/#{@max_gate_retries})")
 
-    documents = fetch_issue_documents(state.issue)
-
-    prompt =
-      PromptBuilder.build_prompt(state.issue,
-        mode: state.mode,
-        mode_prompt: state.mode_prompt,
-        attempt: state.attempt,
-        gate_feedback: feedback,
-        documents: documents
-      )
+    # Send ONLY the gate feedback — pi --continue loads the previous
+    # session context. The agent already knows the task and has its
+    # research. It just needs to hear what's missing.
+    prompt = PromptBuilder.build_feedback_section(feedback, state.gate_retries)
 
     case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.gate_retries) do
       {:ok, %{session_id: sid}} ->
@@ -420,9 +414,9 @@ defmodule Karkhana.Session do
     # Record run
     record_run(state, outcome, error_message)
 
-    # Post error to Linear and move to Backlog so Dispatcher doesn't re-dispatch
+    # Post error to Linear and move to fallback state
     post_error_comment(state, error_message)
-    move_to_backlog(state)
+    move_to_failure_state(state)
 
     # Broadcast
     broadcast_sessions({:session_failed, summary(state)})
@@ -493,10 +487,14 @@ defmodule Karkhana.Session do
     end
   end
 
-  defp move_to_backlog(state) do
-    case Tracker.update_issue_state(state.issue.id, "Backlog") do
-      :ok -> Logger.info("Session #{state.issue.identifier}: moved to Backlog")
-      {:error, reason} -> Logger.warning("Session #{state.issue.identifier}: failed to move to Backlog: #{inspect(reason)}")
+  defp move_to_failure_state(state) do
+    # Use on_reject if configured, otherwise fall back to Backlog
+    lifecycle = Config.settings!().lifecycle
+    target = Karkhana.Config.Schema.Lifecycle.on_reject_state(lifecycle, state.issue.state) || "Backlog"
+
+    case Tracker.update_issue_state(state.issue.id, target) do
+      :ok -> Logger.info("Session #{state.issue.identifier}: moved to #{target}")
+      {:error, reason} -> Logger.warning("Session #{state.issue.identifier}: failed to move to #{target}: #{inspect(reason)}")
     end
   rescue
     _ -> :ok

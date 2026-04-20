@@ -253,7 +253,13 @@ defmodule Karkhana.Gate do
             end
 
           if match do
-            {name, :pass, "Document found: #{match["title"]}"}
+            title = match["title"] || ""
+
+            if String.downcase(title) |> String.contains?("rejected") do
+              {name, :fail, "Review rejected: #{title}"}
+            else
+              {name, :pass, "Document found: #{title}"}
+            end
           else
             {name, maybe_warn(gate), failure_message(gate, "No document found on issue", context)}
           end

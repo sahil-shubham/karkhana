@@ -62,7 +62,7 @@ lifecycle:
     Done:          { type: terminal, linear_type: completed, sandbox: destroy, color: "#5e6ad2" }
     Canceled:      { type: terminal, linear_type: canceled, sandbox: destroy, color: "#95a2b3" }
     Planning:      { type: dispatch, linear_type: started, mode: planning, on_complete: Plan Review, color: "#f2c94c", description: "Agent is producing a plan" }
-    Plan Review:   { type: human_gate, linear_type: started, sandbox: stop, color: "#f2994a", description: "Awaiting human review of plan" }
+    Plan Review:   { type: dispatch, linear_type: started, mode: plan_review, on_complete: Implementing, on_reject: Planning, color: "#f2994a", description: "Reviewing the plan" }
     Implementing:  { type: dispatch, linear_type: started, mode: implementation, on_complete: In Review, color: "#4ea7fc", description: "Agent is implementing" }
 
 modes:
@@ -74,6 +74,15 @@ modes:
         title: plan
         on_failure: retry_with_feedback
         message: "Create a Linear document titled 'Plan: {{ issue.identifier }}' on this issue with the plan content using the documentCreate GraphQL mutation."
+
+  plan_review:
+    prompt: modes/review.md
+    gates:
+      - name: review-decision
+        check: document_exists
+        title: "review:"
+        on_failure: retry_with_feedback
+        message: "You must create a Linear document on the issue titled either 'Review: Approved' or 'Review: Rejected' with your assessment. Use curl to call the Linear API as shown in your instructions."
 
   implementation:
     prompt: modes/implementation.md
