@@ -145,7 +145,7 @@ defmodule KarkhanaWeb.DashboardLive do
                 <td><span class="mode"><%= run.mode || "—" %></span></td>
                 <td><span class={outcome_class(run.outcome)}><%= run.outcome %></span></td>
                 <td><%= gate_icon(run.gate_result) %></td>
-                <td class="r mono"><%= format_int(run.tokens_total || 0) %></td>
+                <td class="r mono"><%= format_int(run.tokens.total) %></td>
                 <td class="r mono">$<%= format_cost(run.cost_usd) %></td>
                 <td class="r mono"><%= format_duration(run.duration_seconds) %></td>
                 <td>
