@@ -78,7 +78,6 @@ defmodule Karkhana.Session do
     :mode_prompt,
     :session_id,
     :session_file,
-    :output_file,
     :started_at,
     :error,
     :gate_results,
@@ -89,7 +88,6 @@ defmodule Karkhana.Session do
     :config_hash,
     :agent,
     gate_retries: 0,
-    lines_seen: 0,
     tokens: %{input: 0, output: 0, total: 0, cache_read: 0, cache_write: 0},
     cost_usd: 0.0,
     events: :queue.new(),
@@ -116,17 +114,19 @@ defmodule Karkhana.Session do
           state
           | sandbox_id: saved.sandbox_id,
             sandbox_name: saved[:sandbox_name],
-            output_file: saved.output_file,
-            lines_seen: saved[:lines_seen] || 0,
+            session_id: saved[:session_id],
             tokens: saved[:tokens] || state.tokens,
             cost_usd: saved[:cost_usd] || 0.0,
             mode: saved[:mode],
-            status: :running
+            status: :starting
         }
 
-        Logger.info("Resuming session for #{issue.identifier} from line #{state.lines_seen}")
+        Logger.info("Resuming session for #{issue.identifier}")
         broadcast_sessions({:session_started, summary(state)})
-        send(self(), :poll_output)
+        # Resume from where we left off — re-enter the normal launch flow
+        # which will start AgentRPC (the piped session in the sandbox may
+        # still be running, but we create a fresh RPC connection).
+        send(self(), :resolve_and_launch)
         {:ok, state}
 
       nil ->
@@ -230,17 +230,18 @@ defmodule Karkhana.Session do
       fail(state, "Agent crashed: #{Exception.message(e)}")
   end
 
-  def handle_info(:poll_output, state) do
-    {:noreply, state}
-  end
-
   def handle_info({:rpc_event, event}, state) do
     state = process_rpc_event(state, event)
     {:noreply, state}
   end
 
   def handle_info({:agent_completed, result}, state) do
-    session_file = result[:session_file] || resolve_session_file(state.sandbox_id, state.session_id)
+    # Try session_file from result first, then ask pi via RPC, then fallback to ls
+    session_file =
+      result[:session_file] ||
+        fetch_session_file_via_rpc(state.agent) ||
+        resolve_session_file(state.sandbox_id, state.session_id)
+
     state = %{state | session_file: session_file, status: :gates}
     Logger.info("Session #{state.issue.identifier}: agent completed, running gates")
     broadcast_sessions({:session_status, summary(state)})
@@ -323,12 +324,6 @@ defmodule Karkhana.Session do
       fail(state, "Agent retry crashed: #{Exception.message(e)}")
   end
 
-  def handle_info({:stream_event, event}, state) do
-    # Received from the on_event callback during ClaudeCLI.run
-    state = process_event(state, event)
-    {:noreply, state}
-  end
-
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -365,62 +360,6 @@ defmodule Karkhana.Session do
   end
 
   # --- Event processing ---
-
-  defp process_event(state, event) do
-    event_type = Map.get(event, :event_type, :unknown)
-    session_id = Karkhana.Claude.StreamParser.extract_session_id(event) || state.session_id
-    usage = Karkhana.Claude.StreamParser.extract_usage(event)
-
-    # Update tokens/cost from usage (cumulative — take max)
-    {tokens, cost} =
-      if usage do
-        tokens = %{
-          input: max(state.tokens.input, Map.get(usage, :input_tokens, 0)),
-          output: max(state.tokens.output, Map.get(usage, :output_tokens, 0)),
-          total: max(state.tokens.total, Map.get(usage, :total_tokens, 0)),
-          cache_read: max(state.tokens.cache_read, Map.get(usage, :cache_read_tokens, 0)),
-          cache_write: max(state.tokens.cache_write, Map.get(usage, :cache_write_tokens, 0))
-        }
-
-        cost = max(state.cost_usd, Map.get(usage, :cost_usd, 0.0))
-        {tokens, cost}
-      else
-        {state.tokens, state.cost_usd}
-      end
-
-    # Build display event for ring buffer
-    display_event = %{
-      at: DateTime.utc_now(),
-      type: event_type,
-      summary: summarize_event(event_type, event),
-      raw: event
-    }
-
-    events = :queue.in(display_event, state.events)
-
-    turn_count =
-      if event_type in [:turn_start, :result, :turn_end] do
-        state.turn_count + 1
-      else
-        state.turn_count
-      end
-
-    state = %{
-      state
-      | session_id: session_id,
-        tokens: tokens,
-        cost_usd: cost,
-        events: events,
-        event_count: state.event_count + 1,
-        # ensure integer
-        turn_count: div(turn_count, 1)
-    }
-
-    # Broadcast event to per-session topic
-    broadcast_session(state.issue.identifier, {:session_event, display_event})
-
-    state
-  end
 
   # --- RPC event processing ---
 
@@ -708,6 +647,17 @@ defmodule Karkhana.Session do
     end
   end
 
+  defp fetch_session_file_via_rpc(nil), do: nil
+
+  defp fetch_session_file_via_rpc(agent) do
+    case AgentRPC.get_state(agent) do
+      {:ok, %{"sessionFile" => file}} when is_binary(file) and file != "" -> file
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
   # Find the session JSONL file in the sandbox for this session ID.
   defp resolve_session_file(sandbox_id, session_id) when is_binary(sandbox_id) do
     cmd =
@@ -844,53 +794,6 @@ defmodule Karkhana.Session do
       other -> other
     end)
   end
-
-  defp summarize_event(:tool_use, event) do
-    tool = Map.get(event, "toolName") || Map.get(event, "tool") || "tool"
-    args = Map.get(event, "args") || %{}
-    detail = Map.get(args, "command") || Map.get(args, "path") || ""
-    "#{tool}: #{detail |> to_string() |> String.split("\n") |> hd() |> String.slice(0, 120)}"
-  end
-
-  defp summarize_event(:assistant, event) do
-    content =
-      Map.get(event, "content") ||
-        get_in(event, ["message", "content"]) || []
-
-    case content do
-      blocks when is_list(blocks) ->
-        text_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "text" end)
-        thinking_block = Enum.find(blocks, fn b -> Map.get(b, "type") == "thinking" end)
-
-        cond do
-          text_block ->
-            (text_block["text"] || "") |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 150)
-
-          thinking_block ->
-            thinking = thinking_block["thinking"] || ""
-
-            if byte_size(thinking) > 20 do
-              snippet = thinking |> String.split("\n") |> List.last() |> String.trim() |> String.slice(0, 120)
-              "🤔 #{snippet}"
-            else
-              "🤔 Thinking…"
-            end
-
-          true ->
-            ""
-        end
-
-      _ ->
-        ""
-    end
-  end
-
-  defp summarize_event(:session_started, _event), do: "Session started"
-  defp summarize_event(:turn_start, _event), do: "Turn starting"
-  defp summarize_event(:turn_end, _event), do: "Turn ended"
-  defp summarize_event(:result, _event), do: "Turn completed"
-  defp summarize_event(:error, event), do: "Error: #{Map.get(event, "message", "unknown")}"
-  defp summarize_event(type, _event), do: to_string(type)
 
   defp duration_seconds(state) do
     DateTime.diff(DateTime.utc_now(), state.started_at, :second)

@@ -218,16 +218,94 @@ defmodule Karkhana.AgentRPC do
   def handle_info({:ws_closed, reason}, state) do
     Logger.warning("AgentRPC: WebSocket closed: #{inspect(reason)}")
 
-    for waiter <- state.completion_waiters do
-      GenServer.reply(waiter, {:error, {:ws_closed, reason}})
-    end
-
+    # Fail pending request-response calls immediately (get_state, get_session_stats)
     for {_id, from} <- state.pending_responses do
       GenServer.reply(from, {:error, {:ws_closed, reason}})
     end
 
-    {:noreply, %{state | status: :disconnected, completion_waiters: [], pending_responses: %{}}}
+    state = %{state | pending_responses: %{}}
+
+    if state.status == :running do
+      # Agent may still be working inside the sandbox — attempt reconnect
+      send(self(), {:reconnect, 1})
+      {:noreply, %{state | status: :reconnecting}}
+    else
+      # Agent was idle — notify completion waiters and give up
+      for waiter <- state.completion_waiters do
+        GenServer.reply(waiter, {:error, {:ws_closed, reason}})
+      end
+
+      {:noreply, %{state | status: :disconnected, completion_waiters: []}}
+    end
   end
+
+  @max_reconnect_attempts 5
+
+  def handle_info({:reconnect, attempt}, state) when attempt <= @max_reconnect_attempts do
+    backoff_ms = min(1000 * Integer.pow(2, attempt - 1), 30_000)
+    Process.sleep(backoff_ms)
+
+    me = self()
+
+    {:ok, ws} =
+      WS.start_link(
+        on_message: fn msg -> send(me, {:ws_message, msg}) end,
+        on_close: fn reason -> send(me, {:ws_closed, reason}) end
+      )
+
+    case WS.reattach(ws, state.sandbox_id, state.session_id) do
+      {:ok, _session_id} ->
+        Logger.info("AgentRPC: reconnected (attempt #{attempt})")
+        # Close the old WS if it's still alive
+        if state.ws, do: WS.close(state.ws)
+
+        # After reconnect, scrollback replay may contain agent_end.
+        # Those arrive as regular {:ws_message, ...} and process_rpc_event
+        # handles them. If agent finished during disconnect, we'll get
+        # agent_end in the replay and notify completion waiters.
+        #
+        # If scrollback overflowed and agent_end was lost, poll get_state
+        # after a short delay to detect idle status.
+        Process.send_after(self(), :check_idle_after_reconnect, 2_000)
+
+        {:noreply, %{state | ws: ws, status: :running}}
+
+      {:error, reason} ->
+        Logger.warning("AgentRPC: reconnect failed (attempt #{attempt}): #{inspect(reason)}")
+        WS.close(ws)
+        send(self(), {:reconnect, attempt + 1})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:reconnect, _attempt}, state) do
+    Logger.error("AgentRPC: reconnect failed after #{@max_reconnect_attempts} attempts")
+
+    for waiter <- state.completion_waiters do
+      GenServer.reply(waiter, {:error, :reconnect_exhausted})
+    end
+
+    {:noreply, %{state | status: :disconnected, completion_waiters: []}}
+  end
+
+  def handle_info(:check_idle_after_reconnect, %{status: :running} = state) do
+    # If we reconnected but haven't received agent_end from scrollback,
+    # check if pi is actually idle. This handles the case where agent_end
+    # was lost due to scrollback overflow.
+    {id, state} = next_request_id(state)
+    cmd = Jason.encode!(%{type: "get_state", id: id})
+
+    case WS.send_text(state.ws, cmd) do
+      :ok ->
+        state = %{state | pending_responses: Map.put(state.pending_responses, id, {:internal, :check_idle})}
+        {:noreply, state}
+
+      {:error, _} ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(:check_idle_after_reconnect, state), do: {:noreply, state}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -246,6 +324,31 @@ defmodule Karkhana.AgentRPC do
       {nil, _} ->
         state.on_event.(event)
         state
+
+      {{:internal, :check_idle}, pending} ->
+        # Internal get_state check after reconnect
+        state = %{state | pending_responses: pending}
+
+        if event["success"] && get_in(event, ["data", "isStreaming"]) == false &&
+             state.status == :running do
+          # Pi is idle but we never got agent_end (scrollback overflow).
+          # Treat this as completion.
+          Logger.info("AgentRPC: detected idle after reconnect (missed agent_end)")
+
+          result = %{
+            session_id: state.session_id,
+            session_file: get_in(event, ["data", "sessionFile"]),
+            messages: nil
+          }
+
+          for waiter <- state.completion_waiters do
+            GenServer.reply(waiter, {:ok, result})
+          end
+
+          %{state | is_streaming: false, status: :idle, completion_waiters: []}
+        else
+          state
+        end
 
       {from, pending} ->
         if event["success"] do

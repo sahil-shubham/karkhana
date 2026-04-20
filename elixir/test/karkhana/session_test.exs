@@ -14,7 +14,6 @@ defmodule Karkhana.SessionTest do
       assert state.status == :starting
       assert state.tokens == %{input: 0, output: 0, total: 0, cache_read: 0, cache_write: 0}
       assert state.cost_usd == 0.0
-      assert state.lines_seen == 0
       assert state.event_count == 0
       assert state.turn_count == 0
       assert :queue.len(state.events) == 0
