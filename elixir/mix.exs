@@ -76,6 +76,7 @@ defmodule Karkhana.MixProject do
       {:solid, "~> 1.2"},
       {:ecto, "~> 3.13"},
       {:exqlite, "~> 0.27"},
+      {:mint_web_socket, "~> 1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]

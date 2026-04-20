@@ -17,9 +17,7 @@ defmodule Karkhana.Session do
   use GenServer
   require Logger
 
-  alias Karkhana.Claude.CLI, as: ClaudeCLI
-  alias Karkhana.Claude.StreamParser
-  alias Karkhana.{Config, Gate, Linear.Issue, PromptBuilder, Protocol, Store, Tracker, Workspace}
+  alias Karkhana.{AgentRPC, Config, Gate, Linear.Issue, PromptBuilder, Protocol, Store, Tracker, Workspace}
 
   @pubsub Karkhana.PubSub
   @sessions_topic "sessions"
@@ -89,6 +87,7 @@ defmodule Karkhana.Session do
     :artifacts_config,
     :attempt,
     :config_hash,
+    :agent,
     gate_retries: 0,
     lines_seen: 0,
     tokens: %{input: 0, output: 0, total: 0, cache_read: 0, cache_write: 0},
@@ -199,20 +198,32 @@ defmodule Karkhana.Session do
         documents: documents
       )
 
-    _previous_session_id = lookup_previous_session(state.issue)
+    settings = Config.settings!().claude
+    me = self()
 
-    case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.attempt) do
-      {:ok, %{session_id: sid}} ->
-        # Agent turn completed normally
-        session_file = resolve_session_file(state.sandbox_id, sid)
-        state = %{state | session_id: sid || state.session_id, session_file: session_file, status: :gates}
-        Logger.info("Session #{state.issue.identifier}: agent completed, running gates")
+    case AgentRPC.start(state.sandbox_id,
+           on_event: fn event -> send(me, {:rpc_event, event}) end,
+           provider: settings.provider,
+           model: settings.model
+         ) do
+      {:ok, agent} ->
+        :ok = AgentRPC.prompt(agent, prompt)
+        state = %{state | agent: agent, status: :running}
+        Logger.info("Session #{state.issue.identifier}: agent launched via RPC")
         broadcast_sessions({:session_status, summary(state)})
-        send(self(), :run_gates)
+
+        # Wait for completion asynchronously
+        spawn_link(fn ->
+          case AgentRPC.await_completion(agent) do
+            {:ok, result} -> send(me, {:agent_completed, result})
+            {:error, reason} -> send(me, {:agent_failed, reason})
+          end
+        end)
+
         {:noreply, state}
 
       {:error, reason} ->
-        fail(state, "Agent failed: #{inspect(reason)}")
+        fail(state, "Agent RPC start failed: #{inspect(reason)}")
     end
   rescue
     e ->
@@ -220,13 +231,25 @@ defmodule Karkhana.Session do
   end
 
   def handle_info(:poll_output, state) do
-    # Used for resumed sessions — poll the output file manually
-    # For fresh sessions, ClaudeCLI.run handles the polling internally
-    # and calls on_event for each parsed line.
-    #
-    # TODO: When we move to Session-owned polling (replacing ClaudeCLI's
-    # internal poll loop), this will be the main event consumption path.
     {:noreply, state}
+  end
+
+  def handle_info({:rpc_event, event}, state) do
+    state = process_rpc_event(state, event)
+    {:noreply, state}
+  end
+
+  def handle_info({:agent_completed, result}, state) do
+    session_file = result[:session_file] || resolve_session_file(state.sandbox_id, state.session_id)
+    state = %{state | session_file: session_file, status: :gates}
+    Logger.info("Session #{state.issue.identifier}: agent completed, running gates")
+    broadcast_sessions({:session_status, summary(state)})
+    send(self(), :run_gates)
+    {:noreply, state}
+  end
+
+  def handle_info({:agent_failed, reason}, state) do
+    fail(state, "Agent failed: #{inspect(reason)}")
   end
 
   def handle_info(:run_gates, state) do
@@ -273,23 +296,27 @@ defmodule Karkhana.Session do
   end
 
   def handle_info({:retry_with_feedback, feedback}, state) do
-    Logger.info("Session #{state.issue.identifier}: continuing session with gate feedback (retry #{state.gate_retries}/#{@max_gate_retries})")
+    Logger.info("Session #{state.issue.identifier}: sending gate feedback via follow_up (retry #{state.gate_retries}/#{@max_gate_retries})")
 
-    # Send ONLY the gate feedback — pi --continue loads the previous
-    # session context. The agent already knows the task and has its
-    # research. It just needs to hear what's missing.
     prompt = PromptBuilder.build_feedback_section(feedback, state.gate_retries)
+    me = self()
 
-    case ClaudeCLI.run(prompt, state.sandbox_id, on_event: &handle_stream_event/1, attempt: state.gate_retries) do
-      {:ok, %{session_id: sid}} ->
-        state = %{state | session_id: sid || state.session_id, status: :gates}
-        Logger.info("Session #{state.issue.identifier}: retry agent completed, running gates")
+    case AgentRPC.follow_up(state.agent, prompt) do
+      :ok ->
+        state = %{state | status: :running}
         broadcast_sessions({:session_status, summary(state)})
-        send(self(), :run_gates)
+
+        spawn_link(fn ->
+          case AgentRPC.await_completion(state.agent) do
+            {:ok, result} -> send(me, {:agent_completed, result})
+            {:error, reason} -> send(me, {:agent_failed, reason})
+          end
+        end)
+
         {:noreply, state}
 
       {:error, reason} ->
-        fail(state, "Agent retry failed: #{inspect(reason)}")
+        fail(state, "Follow-up failed: #{inspect(reason)}")
     end
   rescue
     e ->
@@ -320,6 +347,15 @@ defmodule Karkhana.Session do
 
   @impl true
   def terminate(_reason, state) do
+    # Stop the RPC agent if still running
+    if state.agent do
+      try do
+        AgentRPC.stop(state.agent)
+      rescue
+        _ -> :ok
+      end
+    end
+
     # Best-effort: run after_run hook if sandbox exists
     if state.sandbox_id do
       Workspace.run_after_run_hook(state.sandbox_id, state.issue)
@@ -332,8 +368,8 @@ defmodule Karkhana.Session do
 
   defp process_event(state, event) do
     event_type = Map.get(event, :event_type, :unknown)
-    session_id = StreamParser.extract_session_id(event) || state.session_id
-    usage = StreamParser.extract_usage(event)
+    session_id = Karkhana.Claude.StreamParser.extract_session_id(event) || state.session_id
+    usage = Karkhana.Claude.StreamParser.extract_usage(event)
 
     # Update tokens/cost from usage (cumulative — take max)
     {tokens, cost} =
@@ -386,13 +422,86 @@ defmodule Karkhana.Session do
     state
   end
 
-  defp handle_stream_event(event) do
-    # Called from within ClaudeCLI.run's poll loop (same process)
-    # We send it as a message so it goes through handle_info
-    # and updates the GenServer state properly
-    send(self(), {:stream_event, event})
-    :ok
+  # --- RPC event processing ---
+
+  defp process_rpc_event(state, %{"type" => "turn_start"}) do
+    %{state | turn_count: state.turn_count + 1}
   end
+
+  defp process_rpc_event(state, %{"type" => "message_update"} = event) do
+    usage = extract_rpc_usage(event)
+    {tokens, cost} = merge_usage(state, usage)
+
+    display_event = %{
+      at: DateTime.utc_now(),
+      type: :assistant,
+      summary: summarize_rpc_message(event),
+      raw: event
+    }
+
+    broadcast_session(state.issue.identifier, {:session_event, display_event})
+
+    %{state | tokens: tokens, cost_usd: cost, events: :queue.in(display_event, state.events), event_count: state.event_count + 1}
+  end
+
+  defp process_rpc_event(state, %{"type" => "tool_execution_start"} = event) do
+    tool = event["toolName"] || "tool"
+    args = event["args"] || %{}
+    detail = args["command"] || args["path"] || ""
+    summary = "#{tool}: #{detail |> to_string() |> String.split("\n") |> hd() |> String.slice(0, 120)}"
+
+    display_event = %{
+      at: DateTime.utc_now(),
+      type: :tool_use,
+      summary: summary,
+      raw: event
+    }
+
+    broadcast_session(state.issue.identifier, {:session_event, display_event})
+
+    %{state | events: :queue.in(display_event, state.events), event_count: state.event_count + 1}
+  end
+
+  defp process_rpc_event(state, %{"type" => "auto_retry_start"} = event) do
+    Logger.warning("Session #{state.issue.identifier}: auto-retry attempt #{event["attempt"]}: #{event["errorMessage"]}")
+    state
+  end
+
+  defp process_rpc_event(state, _event), do: state
+
+  defp extract_rpc_usage(%{"message" => %{"usage" => usage}}) when is_map(usage) do
+    %{
+      input_tokens: usage["input"] || 0,
+      output_tokens: usage["output"] || 0,
+      total_tokens: usage["totalTokens"] || 0,
+      cache_read_tokens: usage["cacheRead"] || 0,
+      cache_write_tokens: usage["cacheWrite"] || 0,
+      cost_usd: get_in(usage, ["cost", "total"]) || 0.0
+    }
+  end
+
+  defp extract_rpc_usage(_), do: nil
+
+  defp merge_usage(state, nil), do: {state.tokens, state.cost_usd}
+
+  defp merge_usage(state, usage) do
+    tokens = %{
+      input: max(state.tokens.input, usage.input_tokens),
+      output: max(state.tokens.output, usage.output_tokens),
+      total: max(state.tokens.total, usage.total_tokens),
+      cache_read: max(state.tokens.cache_read, usage.cache_read_tokens),
+      cache_write: max(state.tokens.cache_write, usage.cache_write_tokens)
+    }
+
+    cost = max(state.cost_usd, usage.cost_usd)
+    {tokens, cost}
+  end
+
+  defp summarize_rpc_message(%{"assistantMessageEvent" => %{"type" => "text_delta", "delta" => delta}}) do
+    delta |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 150)
+  end
+
+  defp summarize_rpc_message(_), do: ""
 
   # --- Completion ---
 
@@ -705,15 +814,6 @@ defmodule Karkhana.Session do
       {[], nil, %{}}
     end
   end
-
-  defp lookup_previous_session(%Issue{identifier: identifier}) when is_binary(identifier) do
-    case Store.last_session_id(identifier) do
-      {:ok, session_id} when is_binary(session_id) -> session_id
-      _ -> nil
-    end
-  end
-
-  defp lookup_previous_session(_), do: nil
 
   defp summary(state) do
     %{
