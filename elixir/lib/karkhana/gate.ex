@@ -237,12 +237,15 @@ defmodule Karkhana.Gate do
   defp run_document_exists(name, gate, context) do
     issue_id = context[:issue_id]
     title_pattern = gate["title"] || gate["pattern"]
+    Logger.info("Gate #{name}: checking documents for issue #{issue_id}, title pattern: #{inspect(title_pattern)}")
 
     if is_nil(issue_id) do
       {name, :fail, failure_message(gate, "No issue_id in context for document check", context)}
     else
       case Karkhana.Linear.Client.get_issue_documents(issue_id) do
         {:ok, docs} when is_list(docs) ->
+          Logger.info("Gate #{name}: found #{length(docs)} documents: #{inspect(Enum.map(docs, & &1["title"]))}")
+
           match =
             if title_pattern do
               Enum.find(docs, fn doc ->
