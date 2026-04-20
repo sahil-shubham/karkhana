@@ -174,6 +174,7 @@ defmodule KarkhanaWeb.DashboardLive do
                   <th>Mode</th>
                   <th>Cost</th>
                   <th>Duration</th>
+                  <th>When</th>
                   <th>Error</th>
                 </tr>
               </thead>
@@ -187,6 +188,7 @@ defmodule KarkhanaWeb.DashboardLive do
                   <td><span class="mode-badge"><%= run.mode || "—" %></span></td>
                   <td class="numeric">$<%= format_cost(run.cost_usd) %></td>
                   <td class="numeric"><%= format_duration(run.duration_seconds) %></td>
+                  <td class="muted" style="font-size: 0.8rem;"><%= relative_time(run.started_at, @now) %></td>
                   <td>
                     <%= if run.error_message do %>
                       <span style="font-size: 0.8rem; color: #ef4444;" title={run.error_message}>
@@ -300,6 +302,26 @@ defmodule KarkhanaWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp relative_time(started_at, now) when is_binary(started_at) do
+    case DateTime.from_iso8601(started_at) do
+      {:ok, dt, _} -> relative_time(dt, now)
+      _ -> "—"
+    end
+  end
+
+  defp relative_time(%DateTime{} = started_at, %DateTime{} = now) do
+    secs = max(DateTime.diff(now, started_at, :second), 0)
+
+    cond do
+      secs < 60 -> "just now"
+      secs < 3600 -> "#{div(secs, 60)}m ago"
+      secs < 86400 -> "#{div(secs, 3600)}h ago"
+      true -> "#{div(secs, 86400)}d ago"
+    end
+  end
+
+  defp relative_time(_, _), do: "—"
 
   defp schedule_tick, do: Process.send_after(self(), :tick, @tick_ms)
 end
