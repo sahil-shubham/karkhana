@@ -126,8 +126,6 @@ defmodule Karkhana.Bhatti.WS do
 
   @impl true
   def handle_info(message, state) when state.conn != nil do
-    Logger.debug("WS recv: #{inspect(elem(message, 0), limit: 50)}")
-
     case Mint.WebSocket.stream(state.conn, message) do
       {:ok, conn, [{:data, ref, data}]} when ref == state.ref ->
         case Mint.WebSocket.decode(state.websocket, data) do
@@ -259,15 +257,42 @@ defmodule Karkhana.Bhatti.WS do
   defp process_frames([], state), do: state
 
   defp process_frames([{:text, data} | rest], state) do
+    # Each WS text frame may be:
+    # 1. A complete JSON object (session info, exit message from bhatti server)
+    # 2. Raw stdout bytes from pi (may contain multiple newline-delimited JSON lines,
+    #    or partial lines split across frames)
+    # Strategy: append to buffer, extract all complete lines, process each.
+    # A "line" is any \n-terminated segment. Unterminated remainder stays buffered.
+    # Also try the whole buffer as a single JSON object for frames without newlines
+    # (like the session info message from bhatti).
     buffer = state.buffer <> data
     {lines, remainder} = split_lines(buffer)
 
     state = %{state | buffer: remainder}
 
+    # Process complete lines
     state =
       Enum.reduce(lines, state, fn line, acc ->
         handle_text_line(line, acc)
       end)
+
+    # If no lines were extracted but we have a non-empty remainder that
+    # looks like complete JSON, try it directly. This handles WS frames
+    # that are complete JSON objects without a trailing newline (e.g.
+    # the session info message from bhatti's handleSandboxExecWS).
+    state =
+      if lines == [] and remainder != "" do
+        case Jason.decode(remainder) do
+          {:ok, _} ->
+            state = handle_text_line(remainder, %{state | buffer: ""})
+            state
+
+          {:error, _} ->
+            state
+        end
+      else
+        state
+      end
 
     process_frames(rest, state)
   end
