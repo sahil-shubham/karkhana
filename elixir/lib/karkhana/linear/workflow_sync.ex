@@ -57,6 +57,14 @@ defmodule Karkhana.Linear.WorkflowSync do
   }
   """
 
+  @update_state_mutation """
+  mutation KarkhanaUpdateWorkflowState($id: String!, $input: WorkflowStateUpdateInput!) {
+    workflowStateUpdate(id: $id, input: $input) {
+      success
+    }
+  }
+  """
+
   # --- GenServer API ---
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -179,8 +187,10 @@ defmodule Karkhana.Linear.WorkflowSync do
       {:ok, %{state_ids: %{}, team_id: nil, created: [], existing: []}}
     else
       with {:ok, team_id} <- resolve_team_id(settings),
-           {:ok, existing_states} <- fetch_team_states(team_id) do
-        sync_states(team_id, lifecycle, existing_states)
+           {:ok, existing_states} <- fetch_team_states(team_id),
+           {:ok, result} <- sync_states(team_id, lifecycle, existing_states) do
+        reorder_states(lifecycle, result.state_ids, existing_states)
+        {:ok, result}
       end
     end
   end
@@ -294,6 +304,102 @@ defmodule Karkhana.Linear.WorkflowSync do
       {:error, reason} ->
         Logger.warning("WorkflowSync: failed to create state '#{name}': #{inspect(reason)}")
         {:error, name, reason}
+    end
+  end
+
+  # Reorder states in Linear to match the lifecycle config order.
+  # The lifecycle states map is unordered, but we define a logical order:
+  # idle states first, then dispatch states in pipeline order (following
+  # on_complete chains), then human gates, then terminals.
+  defp reorder_states(lifecycle, state_ids, existing_states) do
+    existing_positions = Map.new(existing_states, fn s -> {s["name"], s["position"]} end)
+
+    # Build ordered list by following the on_complete chain from each entry point
+    ordered = build_state_order(lifecycle)
+
+    # Check if positions already match
+    needs_update =
+      ordered
+      |> Enum.with_index()
+      |> Enum.any?(fn {name, idx} ->
+        current_pos = existing_positions[name]
+        current_pos != nil and current_pos != idx
+      end)
+
+    if needs_update do
+      ordered
+      |> Enum.with_index()
+      |> Enum.each(fn {name, position} ->
+        case Map.get(state_ids, name) do
+          nil ->
+            :ok
+
+          id ->
+            case Client.graphql(@update_state_mutation, %{id: id, input: %{position: position}}) do
+              {:ok, %{"data" => %{"workflowStateUpdate" => %{"success" => true}}}} ->
+                :ok
+
+              {:ok, resp} ->
+                Logger.debug("WorkflowSync: failed to reorder '#{name}': #{inspect(resp)}")
+
+              {:error, reason} ->
+                Logger.debug("WorkflowSync: failed to reorder '#{name}': #{inspect(reason)}")
+            end
+        end
+      end)
+
+      Logger.info("WorkflowSync: reordered states: #{Enum.join(ordered, " → ")}")
+    end
+  end
+
+  # Build a logical ordering of states by following the on_complete chain.
+  defp build_state_order(lifecycle) do
+    states = lifecycle.states
+
+    # Categorize
+    {idle, dispatch, human_gate, terminal} =
+      Enum.reduce(states, {[], [], [], []}, fn {name, config}, {i, d, h, t} ->
+        case config["type"] do
+          "idle" -> {[name | i], d, h, t}
+          "dispatch" -> {i, [{name, config} | d], h, t}
+          "human_gate" -> {i, d, [name | h], t}
+          "terminal" -> {i, d, h, [name | t]}
+          _ -> {i, d, h, t}
+        end
+      end)
+
+    # Order dispatch states by following on_complete chains.
+    # Find entry points: dispatch states that aren't the on_complete target of another dispatch state.
+    all_targets = for {_, c} <- dispatch, t = c["on_complete"], t != nil, do: t
+    entry_points = for {name, _} <- dispatch, name not in all_targets, do: name
+
+    # Follow chains from each entry point
+    dispatch_ordered =
+      entry_points
+      |> Enum.flat_map(fn entry -> follow_chain(entry, states, []) end)
+      |> Enum.uniq()
+
+    # Any dispatch states not reached by chains (orphans)
+    dispatch_names = for {name, _} <- dispatch, do: name
+    orphans = dispatch_names -- dispatch_ordered
+
+    Enum.sort(idle) ++ dispatch_ordered ++ orphans ++ Enum.sort(human_gate) ++ Enum.sort(terminal)
+  end
+
+  defp follow_chain(state_name, states, visited) do
+    if state_name in visited or not Map.has_key?(states, state_name) do
+      []
+    else
+      config = states[state_name]
+      next = config["on_complete"]
+      next_config = Map.get(states, next)
+
+      # Only follow into dispatch or human_gate states (not terminals)
+      if next && next_config && next_config["type"] in ["dispatch", "human_gate"] do
+        [state_name | follow_chain(next, states, [state_name | visited])]
+      else
+        [state_name]
+      end
     end
   end
 end

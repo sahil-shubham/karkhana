@@ -179,6 +179,11 @@ defmodule Karkhana.Session do
 
     Logger.info("Session #{state.issue.identifier}: mode=#{mode}")
 
+    # Move issue to its active state in Linear so it's visible as "in progress".
+    # e.g. Todo (unstarted) → Planning (started) when planning mode dispatches.
+    lifecycle = Config.settings!().lifecycle
+    dispatch_transition(state.issue, lifecycle)
+
     # Clean up stale documents from previous failed runs for this mode
     cleanup_stale_documents(state.issue, mode, gate_specs)
 
@@ -391,7 +396,7 @@ defmodule Karkhana.Session do
       at: DateTime.utc_now(),
       type: :assistant,
       summary: text,
-      raw: nil
+      raw: event
     }
 
     broadcast_session(state.issue.identifier, {:session_event, display_event})
@@ -501,6 +506,21 @@ defmodule Karkhana.Session do
     broadcast_session(state.issue.identifier, {:session_failed, summary(state)})
 
     {:stop, :normal, state}
+  end
+
+  defp dispatch_transition(issue, lifecycle) do
+    case Karkhana.Config.Schema.Lifecycle.active_state_for(lifecycle, issue.state) do
+      nil ->
+        :ok
+
+      active_state ->
+        Logger.info("Session #{issue.identifier}: transitioning #{issue.state} → #{active_state} (dispatch)")
+
+        case Tracker.update_issue_state(issue.id, active_state) do
+          :ok -> :ok
+          {:error, reason} -> Logger.warning("Session #{issue.identifier}: dispatch transition failed: #{inspect(reason)}")
+        end
+    end
   end
 
   defp lifecycle_transition(state) do

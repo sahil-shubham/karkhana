@@ -454,6 +454,31 @@ defmodule Karkhana.Config.Schema do
       end
     end
 
+    @doc """
+    Find the "active" state for a dispatch state. If the current state is
+    unstarted (e.g. Todo) and another started state has the same mode
+    (e.g. Planning), returns that state name. Returns nil if the current
+    state is already the active one or no match exists.
+    """
+    @spec active_state_for(%__MODULE__{}, String.t()) :: String.t() | nil
+    def active_state_for(%__MODULE__{states: states}, state_name) do
+      current = Map.get(states, state_name)
+
+      with %{"mode" => mode, "linear_type" => current_type} when current_type != "started" <- current do
+        # Find a "started" dispatch state with the same mode
+        states
+        |> Enum.find_value(fn
+          {name, %{"mode" => ^mode, "linear_type" => "started", "type" => "dispatch"}} when name != state_name ->
+            name
+
+          _ ->
+            nil
+        end)
+      else
+        _ -> nil
+      end
+    end
+
     @doc "Get the sandbox action for a given state (stop, destroy, or nil)."
     @spec sandbox_action(%__MODULE__{}, String.t()) :: String.t() | nil
     def sandbox_action(%__MODULE__{states: states}, state_name) do
