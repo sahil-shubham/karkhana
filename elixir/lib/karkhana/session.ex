@@ -478,7 +478,10 @@ defmodule Karkhana.Session do
     Logger.info("Session #{state.issue.identifier}: completed successfully")
 
     # Publish preview if mode config has a publish port
-    publish_preview(state)
+    preview_url = publish_preview(state)
+
+    # Post success comment with preview URL and gate results
+    post_success_comment(state, preview_url)
 
     # Lifecycle transition
     lifecycle_transition(state)
@@ -516,7 +519,7 @@ defmodule Karkhana.Session do
 
     case Karkhana.Config.Schema.Modes.publish_port(settings.modes, state.mode) do
       nil ->
-        :ok
+        nil
 
       port ->
         alias_name = String.downcase(state.issue.identifier)
@@ -525,13 +528,17 @@ defmodule Karkhana.Session do
           {:ok, result} ->
             url = result["url"] || result["preview_url"]
             Logger.info("Session #{state.issue.identifier}: published preview on port #{port}: #{url}")
+            url
 
           {:error, reason} ->
             Logger.warning("Session #{state.issue.identifier}: publish failed: #{inspect(reason)}")
+            nil
         end
     end
   rescue
-    e -> Logger.warning("Session #{state.issue.identifier}: publish error: #{Exception.message(e)}")
+    e ->
+      Logger.warning("Session #{state.issue.identifier}: publish error: #{Exception.message(e)}")
+      nil
   end
 
   defp dispatch_transition(issue, lifecycle) do
@@ -624,6 +631,46 @@ defmodule Karkhana.Session do
   rescue
     _ -> :ok
   end
+
+  defp post_success_comment(state, preview_url) do
+    api_key = System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY")
+
+    if api_key && state.issue.id do
+      # Extract PR URL from gate results if present
+      pr_url = extract_gate_value(state.gate_results, "pr-opened")
+
+      lines = [
+        "✅ **#{state.mode} completed**",
+        "",
+        "**Duration:** #{format_duration(duration_seconds(state))}",
+        "**Cost:** $#{Float.round(state.cost_usd, 2)}",
+        "**Turns:** #{state.turn_count}"
+      ]
+
+      lines = if pr_url && pr_url != "", do: lines ++ ["", "**PR:** #{pr_url}"], else: lines
+      lines = if preview_url, do: lines ++ ["**Preview:** #{preview_url}"], else: lines
+
+      body = Enum.join(lines, "\n")
+
+      case Karkhana.Linear.Client.post_comment(state.issue.id, body, api_key) do
+        {:ok, _} -> :ok
+        {:error, reason} -> Logger.warning("Failed to post success comment: #{inspect(reason)}")
+      end
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp extract_gate_value(nil, _name), do: nil
+
+  defp extract_gate_value(results, name) when is_list(results) do
+    case Enum.find(results, fn {n, _, _} -> n == name end) do
+      {_, :pass, output} -> String.trim(output)
+      _ -> nil
+    end
+  end
+
+  defp extract_gate_value(_, _), do: nil
 
   defp post_error_comment(state, error_message) do
     api_key = System.get_env("LINEAR_BOT_API_KEY") || System.get_env("LINEAR_API_KEY")
