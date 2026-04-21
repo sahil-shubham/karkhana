@@ -171,11 +171,13 @@ defmodule Karkhana.Bhatti.WS do
 
     ws_scheme = if scheme == :https, do: :wss, else: :ws
 
+    # Force HTTP/1.1 — Cloudflare doesn't support HTTP/2 extended CONNECT
+    # for WebSocket upgrade (returns enable_connect_protocol: false).
     connect_opts =
       if scheme == :https do
-        [transport_opts: [verify: :verify_none]]
+        [protocols: [:http1], transport_opts: [verify: :verify_none]]
       else
-        []
+        [protocols: [:http1]]
       end
 
     with {:ok, conn} <- Mint.HTTP.connect(scheme, host, port, connect_opts),
