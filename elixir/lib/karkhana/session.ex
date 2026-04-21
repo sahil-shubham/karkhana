@@ -653,12 +653,12 @@ defmodule Karkhana.Session do
       body = Enum.join(lines, "\n")
 
       case Karkhana.Linear.Client.post_comment(state.issue.id, body, api_key) do
-        {:ok, _} -> :ok
+        {:ok, _} -> Logger.info("Posted success comment for #{state.issue.identifier}")
         {:error, reason} -> Logger.warning("Failed to post success comment: #{inspect(reason)}")
       end
     end
   rescue
-    _ -> :ok
+    e -> Logger.warning("Success comment error for #{state.issue.identifier}: #{Exception.message(e)}")
   end
 
   defp extract_gate_value(nil, _name), do: nil

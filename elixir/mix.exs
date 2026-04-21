@@ -4,7 +4,7 @@ defmodule Karkhana.MixProject do
   def project do
     [
       app: :karkhana,
-      version: "0.7.10",
+      version: "0.7.11",
       elixir: "~> 1.18",
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
