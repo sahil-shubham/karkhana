@@ -375,19 +375,28 @@ defmodule Karkhana.Session do
   end
 
   defp process_rpc_event(state, %{"type" => "message_update"} = event) do
+    # Only extract token usage from streaming deltas — don't create
+    # display events for every text_delta (hundreds per turn). The
+    # message_end handler creates one display event per complete message.
     usage = extract_rpc_usage(event)
     {tokens, cost} = merge_usage(state, usage)
+    %{state | tokens: tokens, cost_usd: cost}
+  end
+
+  defp process_rpc_event(state, %{"type" => "message_end"} = event) do
+    # One display event per complete assistant message (not per streaming delta)
+    text = get_in(event, ["message", "content"]) |> summarize_content_blocks()
 
     display_event = %{
       at: DateTime.utc_now(),
       type: :assistant,
-      summary: summarize_rpc_message(event),
-      raw: event
+      summary: text,
+      raw: nil
     }
 
     broadcast_session(state.issue.identifier, {:session_event, display_event})
 
-    %{state | tokens: tokens, cost_usd: cost, events: :queue.in(display_event, state.events), event_count: state.event_count + 1}
+    %{state | events: :queue.in(display_event, state.events), event_count: state.event_count + 1}
   end
 
   defp process_rpc_event(state, %{"type" => "tool_execution_start"} = event) do
@@ -443,11 +452,19 @@ defmodule Karkhana.Session do
     {tokens, cost}
   end
 
-  defp summarize_rpc_message(%{"assistantMessageEvent" => %{"type" => "text_delta", "delta" => delta}}) do
-    delta |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 150)
+  defp summarize_content_blocks(blocks) when is_list(blocks) do
+    text_block = Enum.find(blocks, fn b -> is_map(b) and b["type"] == "text" end)
+
+    cond do
+      text_block ->
+        (text_block["text"] || "") |> String.replace("\n", " ") |> String.trim() |> String.slice(0, 200)
+
+      true ->
+        ""
+    end
   end
 
-  defp summarize_rpc_message(_), do: ""
+  defp summarize_content_blocks(_), do: ""
 
   # --- Completion ---
 
