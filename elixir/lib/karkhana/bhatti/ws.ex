@@ -9,7 +9,7 @@ defmodule Karkhana.Bhatti.WS do
   use GenServer
   require Logger
 
-  @connect_timeout_ms 10_000
+  @connect_timeout_ms 30_000
 
   defstruct [
     :conn,
@@ -126,6 +126,8 @@ defmodule Karkhana.Bhatti.WS do
 
   @impl true
   def handle_info(message, state) when state.conn != nil do
+    Logger.debug("WS recv: #{inspect(elem(message, 0), limit: 50)}")
+
     case Mint.WebSocket.stream(state.conn, message) do
       {:ok, conn, [{:data, ref, data}]} when ref == state.ref ->
         case Mint.WebSocket.decode(state.websocket, data) do
