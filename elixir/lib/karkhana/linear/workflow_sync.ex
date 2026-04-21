@@ -352,54 +352,90 @@ defmodule Karkhana.Linear.WorkflowSync do
     end
   end
 
-  # Build a logical ordering of states by following the on_complete chain.
+  # Build a logical ordering of states using topological sort on on_complete edges.
+  # A state X that has on_complete: Y means X comes before Y in the pipeline.
   defp build_state_order(lifecycle) do
     states = lifecycle.states
+    names = Map.keys(states)
 
-    # Categorize
-    {idle, dispatch, human_gate, terminal} =
-      Enum.reduce(states, {[], [], [], []}, fn {name, config}, {i, d, h, t} ->
-        case config["type"] do
-          "idle" -> {[name | i], d, h, t}
-          "dispatch" -> {i, [{name, config} | d], h, t}
-          "human_gate" -> {i, d, [name | h], t}
-          "terminal" -> {i, d, h, [name | t]}
-          _ -> {i, d, h, t}
+    # Build a dependency graph: if X.on_complete = Y, then X must come before Y.
+    # We sort so that states earlier in the pipeline get lower positions.
+    edges =
+      for {name, config} <- states,
+          target = config["on_complete"],
+          target != nil,
+          Map.has_key?(states, target),
+          do: {name, target}
+
+    # Topological sort via Kahn's algorithm
+    in_degree = Map.new(names, fn n -> {n, 0} end)
+
+    in_degree =
+      Enum.reduce(edges, in_degree, fn {_from, to}, acc ->
+        Map.update(acc, to, 1, &(&1 + 1))
+      end)
+
+    adjacency =
+      Enum.reduce(edges, Map.new(names, fn n -> {n, []} end), fn {from, to}, acc ->
+        Map.update(acc, from, [to], &[to | &1])
+      end)
+
+    # Start with nodes that have no incoming edges (entry points)
+    queue =
+      in_degree
+      |> Enum.filter(fn {_, d} -> d == 0 end)
+      |> Enum.map(fn {n, _} -> n end)
+      # Stable sort: idle first, then unstarted, then started, then terminals
+      |> Enum.sort_by(fn name ->
+        config = states[name]
+
+        type_order =
+          case config["type"] do
+            "idle" -> 0
+            "dispatch" -> 1
+            "human_gate" -> 2
+            "terminal" -> 3
+            _ -> 4
+          end
+
+        linear_order =
+          case config["linear_type"] do
+            "backlog" -> 0
+            "unstarted" -> 1
+            "started" -> 2
+            "completed" -> 3
+            "canceled" -> 4
+            _ -> 5
+          end
+
+        {type_order, linear_order, name}
+      end)
+
+    # Partition: process non-terminals first, terminals at the end
+    {non_terminal, terminal} =
+      Enum.split_with(queue, fn name ->
+        states[name]["type"] not in ["terminal"]
+      end)
+
+    topo_sort(non_terminal, adjacency, in_degree, []) ++ terminal
+  end
+
+  defp topo_sort([], _adj, _in_deg, result), do: Enum.reverse(result)
+
+  defp topo_sort([node | rest], adjacency, in_degree, result) do
+    neighbors = Map.get(adjacency, node, [])
+
+    {new_queue, new_in_degree} =
+      Enum.reduce(neighbors, {rest, in_degree}, fn neighbor, {q, deg} ->
+        new_deg = Map.update!(deg, neighbor, &(&1 - 1))
+
+        if new_deg[neighbor] == 0 do
+          {q ++ [neighbor], new_deg}
+        else
+          {q, new_deg}
         end
       end)
 
-    # Order dispatch states by following on_complete chains.
-    # Find entry points: dispatch states that aren't the on_complete target of another dispatch state.
-    all_targets = for {_, c} <- dispatch, t = c["on_complete"], t != nil, do: t
-    entry_points = for {name, _} <- dispatch, name not in all_targets, do: name
-
-    # Follow chains from each entry point
-    dispatch_ordered =
-      entry_points
-      |> Enum.flat_map(fn entry -> follow_chain(entry, states, []) end)
-      |> Enum.uniq()
-
-    # Any dispatch states not reached by chains (orphans)
-    dispatch_names = for {name, _} <- dispatch, do: name
-    orphans = dispatch_names -- dispatch_ordered
-
-    Enum.sort(idle) ++ dispatch_ordered ++ orphans ++ Enum.sort(human_gate) ++ Enum.sort(terminal)
-  end
-
-  defp follow_chain(state_name, states, visited) do
-    if state_name in visited or not Map.has_key?(states, state_name) do
-      []
-    else
-      config = states[state_name]
-      next = config["on_complete"]
-      next_config = Map.get(states, next)
-
-      # Only follow into dispatch or human_gate states (not terminals)
-      if next && next_config && next_config["type"] in ["dispatch", "human_gate"] do
-        [state_name | follow_chain(next, states, [state_name | visited])]
-      else
-        [state_name]
-      end
-    end
+    topo_sort(new_queue, adjacency, new_in_degree, [node | result])
   end
 end
