@@ -477,6 +477,9 @@ defmodule Karkhana.Session do
     state = %{state | status: :completed}
     Logger.info("Session #{state.issue.identifier}: completed successfully")
 
+    # Publish preview if mode config has a publish port
+    publish_preview(state)
+
     # Lifecycle transition
     lifecycle_transition(state)
 
@@ -506,6 +509,29 @@ defmodule Karkhana.Session do
     broadcast_session(state.issue.identifier, {:session_failed, summary(state)})
 
     {:stop, :normal, state}
+  end
+
+  defp publish_preview(state) do
+    settings = Config.settings!()
+
+    case Karkhana.Config.Schema.Modes.publish_port(settings.modes, state.mode) do
+      nil ->
+        :ok
+
+      port ->
+        alias_name = String.downcase(state.issue.identifier)
+
+        case Karkhana.Bhatti.Client.publish(state.sandbox_id, port, alias: alias_name) do
+          {:ok, result} ->
+            url = result["url"] || result["preview_url"]
+            Logger.info("Session #{state.issue.identifier}: published preview on port #{port}: #{url}")
+
+          {:error, reason} ->
+            Logger.warning("Session #{state.issue.identifier}: publish failed: #{inspect(reason)}")
+        end
+    end
+  rescue
+    e -> Logger.warning("Session #{state.issue.identifier}: publish error: #{Exception.message(e)}")
   end
 
   defp dispatch_transition(issue, lifecycle) do

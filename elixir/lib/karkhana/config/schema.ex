@@ -549,6 +549,15 @@ defmodule Karkhana.Config.Schema do
         _ -> default
       end
     end
+
+    @doc "Get the publish port for a mode (nil if no preview)."
+    @spec publish_port(%__MODULE__{}, String.t()) :: integer() | nil
+    def publish_port(%__MODULE__{} = modes, mode_name) do
+      case get(modes, mode_name) do
+        %{"publish" => port} when is_integer(port) -> port
+        _ -> nil
+      end
+    end
   end
 
   defmodule Project do
