@@ -367,6 +367,13 @@ defmodule Karkhana.Session do
     %{state | turn_count: state.turn_count + 1}
   end
 
+  defp process_rpc_event(state, %{"type" => "turn_end"}) do
+    # Broadcast updated summary after each turn so the dashboard
+    # shows current token counts and turn progress.
+    broadcast_sessions({:session_status, summary(state)})
+    state
+  end
+
   defp process_rpc_event(state, %{"type" => "message_update"} = event) do
     usage = extract_rpc_usage(event)
     {tokens, cost} = merge_usage(state, usage)

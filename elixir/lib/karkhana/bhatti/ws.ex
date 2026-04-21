@@ -49,9 +49,11 @@ defmodule Karkhana.Bhatti.WS do
 
   @doc """
   Send a text frame over the WebSocket.
+  Appends a newline if not already present — pi RPC reads JSONL.
   """
   @spec send_text(pid(), String.t()) :: :ok | {:error, term()}
   def send_text(ws, text) do
+    text = if String.ends_with?(text, "\n"), do: text, else: text <> "\n"
     GenServer.call(ws, {:send, text})
   end
 
