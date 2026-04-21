@@ -185,37 +185,55 @@ defmodule Karkhana.Bhatti.WS do
            Mint.WebSocket.upgrade(ws_scheme, conn, path, [
              {"authorization", "Bearer #{api_key}"}
            ]) do
-      # Receive the upgrade response
-      receive do
-        message ->
-          case Mint.WebSocket.stream(conn, message) do
-            {:ok, conn, [{:status, ^ref, 101}, {:headers, ^ref, resp_headers}]} ->
-              case Mint.WebSocket.new(conn, ref, 101, resp_headers) do
-                {:ok, conn, websocket} ->
-                  {:ok, conn, websocket, ref}
+      # Accumulate upgrade response frames. HTTP/1.1 sends :status, :headers,
+      # :done as separate responses (possibly across multiple messages).
+      collect_upgrade_response(conn, ref, nil, nil)
+    end
+  end
 
-                {:error, conn, reason} ->
-                  Mint.HTTP.close(conn)
-                  {:error, reason}
+  defp collect_upgrade_response(conn, ref, status, headers) do
+    receive do
+      message ->
+        case Mint.WebSocket.stream(conn, message) do
+          {:ok, conn, responses} ->
+            {conn, status, headers, done} =
+              Enum.reduce(responses, {conn, status, headers, false}, fn
+                {:status, ^ref, s}, {c, _, h, d} -> {c, s, h, d}
+                {:headers, ^ref, h}, {c, s, _, d} -> {c, s, h, d}
+                {:done, ^ref}, {c, s, h, _} -> {c, s, h, true}
+                _, acc -> acc
+              end)
+
+            if done do
+              if status == 101 do
+                case Mint.WebSocket.new(conn, ref, status, headers) do
+                  {:ok, conn, websocket} ->
+                    {:ok, conn, websocket, ref}
+
+                  {:error, conn, reason} ->
+                    Mint.HTTP.close(conn)
+                    {:error, reason}
+                end
+              else
+                Mint.HTTP.close(conn)
+                {:error, {:upgrade_failed, status}}
               end
+            else
+              # Not done yet — keep receiving
+              collect_upgrade_response(conn, ref, status, headers)
+            end
 
-            {:ok, conn, [{:status, ^ref, status} | _]} ->
-              Mint.HTTP.close(conn)
-              {:error, {:upgrade_failed, status}}
+          {:error, conn, reason, _} ->
+            Mint.HTTP.close(conn)
+            {:error, reason}
 
-            {:error, conn, reason, _} ->
-              Mint.HTTP.close(conn)
-              {:error, reason}
-
-            _ ->
-              Mint.HTTP.close(conn)
-              {:error, :unexpected_response}
-          end
-      after
-        @connect_timeout_ms ->
-          Mint.HTTP.close(conn)
-          {:error, :connect_timeout}
-      end
+          :unknown ->
+            collect_upgrade_response(conn, ref, status, headers)
+        end
+    after
+      @connect_timeout_ms ->
+        Mint.HTTP.close(conn)
+        {:error, :connect_timeout}
     end
   end
 
