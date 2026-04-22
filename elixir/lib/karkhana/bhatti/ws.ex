@@ -130,6 +130,20 @@ defmodule Karkhana.Bhatti.WS do
   end
 
   @impl true
+  def handle_info({:mint_extra, {:data, ref, data}}, %{ref: ref} = state) when state.conn != nil do
+    # Extra data frame that arrived in the same TCP packet as the upgrade response.
+    # Decode and process as if it came from a normal Mint message.
+    case Mint.WebSocket.decode(state.websocket, data) do
+      {:ok, websocket, frames} ->
+        state = %{state | websocket: websocket}
+        state = process_frames(frames, state)
+        {:noreply, state}
+
+      {:error, websocket, _reason} ->
+        {:noreply, %{state | websocket: websocket}}
+    end
+  end
+
   def handle_info(message, state) when state.conn != nil do
     case Mint.WebSocket.stream(state.conn, message) do
       {:ok, conn, [{:data, ref, data}]} when ref == state.ref ->
@@ -201,18 +215,25 @@ defmodule Karkhana.Bhatti.WS do
       message ->
         case Mint.WebSocket.stream(conn, message) do
           {:ok, conn, responses} ->
-            {conn, status, headers, done} =
-              Enum.reduce(responses, {conn, status, headers, false}, fn
-                {:status, ^ref, s}, {c, _, h, d} -> {c, s, h, d}
-                {:headers, ^ref, h}, {c, s, _, d} -> {c, s, h, d}
-                {:done, ^ref}, {c, s, h, _} -> {c, s, h, true}
-                _, acc -> acc
+            {conn, status, headers, done, extra} =
+              Enum.reduce(responses, {conn, status, headers, false, []}, fn
+                {:status, ^ref, s}, {c, _, h, d, e} -> {c, s, h, d, e}
+                {:headers, ^ref, h}, {c, s, _, d, e} -> {c, s, h, d, e}
+                {:done, ^ref}, {c, s, h, _, e} -> {c, s, h, true, e}
+                other, {c, s, h, d, e} -> {c, s, h, d, [other | e]}
               end)
 
             if done do
               if status == 101 do
                 case Mint.WebSocket.new(conn, ref, status, headers) do
                   {:ok, conn, websocket} ->
+                    # Re-inject extra responses (e.g. {:data, ...} that arrived
+                    # in the same TCP packet as the upgrade) as self-messages
+                    # so handle_info processes them.
+                    for resp <- Enum.reverse(extra) do
+                      send(self(), {:mint_extra, resp})
+                    end
+
                     {:ok, conn, websocket, ref}
 
                   {:error, conn, reason} ->
