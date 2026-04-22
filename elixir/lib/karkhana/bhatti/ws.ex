@@ -100,14 +100,17 @@ defmodule Karkhana.Bhatti.WS do
   end
 
   def handle_call({:reattach, sandbox_id, session_id}, from, state) do
+    Logger.debug("WS: reattach starting for #{sandbox_id} session=#{session_id}")
     path = "/sandboxes/#{sandbox_id}/exec/ws?session=#{session_id}"
 
     case do_ws_connect(path, state) do
       {:ok, conn, websocket, ref} ->
+        Logger.debug("WS: reattach upgrade succeeded, waiting for session info")
         state = %{state | conn: conn, websocket: websocket, ref: ref, caller: from, status: :connecting}
         {:noreply, state}
 
       {:error, reason} ->
+        Logger.debug("WS: reattach upgrade failed: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
   end
@@ -320,6 +323,7 @@ defmodule Karkhana.Bhatti.WS do
   defp handle_text_line(line, state) do
     case Jason.decode(line) do
       {:ok, %{"type" => "session", "session_id" => sid}} ->
+        Logger.debug("WS: got session info sid=#{sid} caller=#{state.caller != nil}")
         # This is the session info message — reply to the waiting caller
         if state.caller do
           GenServer.reply(state.caller, {:ok, sid})
