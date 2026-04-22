@@ -313,7 +313,8 @@ defmodule Karkhana.Session do
     case Karkhana.Bhatti.Client.list_sessions(sandbox_id) do
       {:ok, sessions} when is_list(sessions) ->
         case Enum.find(sessions, fn s ->
-               s["running"] == true and s["tty"] == false
+               s["running"] == true and s["tty"] == false and
+                 is_binary(s["argv"]) and String.contains?(s["argv"], "pi")
              end) do
           %{"session_id" => sid} -> {:ok, sid}
           _ -> :none
@@ -327,7 +328,7 @@ defmodule Karkhana.Session do
   end
 
   defp reattach_to_agent(state, session_id, on_event, me) do
-    case AgentRPC.reattach(state.sandbox_id, session_id, on_event: on_event) do
+    case safe_reattach(state.sandbox_id, session_id, on_event) do
       {:ok, agent} ->
         state = %{state | agent: agent, status: :running}
         Logger.info("Session #{state.issue.identifier}: reattached to agent via RPC")
@@ -346,6 +347,12 @@ defmodule Karkhana.Session do
         Logger.warning("Session #{state.issue.identifier}: reattach failed (#{inspect(reason)}), starting fresh")
         launch_fresh_agent(state, on_event, me)
     end
+  end
+
+  defp safe_reattach(sandbox_id, session_id, on_event) do
+    AgentRPC.reattach(sandbox_id, session_id, on_event: on_event)
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp launch_fresh_agent(state, on_event, me) do
