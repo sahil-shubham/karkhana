@@ -39,7 +39,16 @@ defmodule Karkhana.AgentRPC do
 
   @spec start(String.t(), keyword()) :: {:ok, pid()} | {:error, term()}
   def start(sandbox_id, opts \\ []) do
-    GenServer.start_link(__MODULE__, {sandbox_id, opts})
+    GenServer.start_link(__MODULE__, {:start, sandbox_id, opts})
+  end
+
+  @doc """
+  Reattach to an existing piped session. Used after karkhana restart
+  when pi is still running inside the sandbox.
+  """
+  @spec reattach(String.t(), String.t(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def reattach(sandbox_id, session_id, opts \\ []) do
+    GenServer.start_link(__MODULE__, {:reattach, sandbox_id, session_id, opts})
   end
 
   @spec prompt(pid(), String.t()) :: :ok | {:error, term()}
@@ -87,7 +96,7 @@ defmodule Karkhana.AgentRPC do
   # --- Callbacks ---
 
   @impl true
-  def init({sandbox_id, opts}) do
+  def init({:start, sandbox_id, opts}) do
     on_event = Keyword.get(opts, :on_event, fn _event -> :ok end)
     provider = Keyword.get(opts, :provider)
     model = Keyword.get(opts, :model)
@@ -120,6 +129,42 @@ defmodule Karkhana.AgentRPC do
           session_id: session_id,
           on_event: on_event
         }
+
+        {:ok, state}
+
+      {:error, reason} ->
+        WS.close(ws)
+        {:stop, reason}
+    end
+  end
+
+  def init({:reattach, sandbox_id, session_id, opts}) do
+    on_event = Keyword.get(opts, :on_event, fn _event -> :ok end)
+    me = self()
+
+    {:ok, ws} =
+      WS.start_link(
+        on_message: fn msg -> send(me, {:ws_message, msg}) end,
+        on_close: fn reason -> send(me, {:ws_closed, reason}) end
+      )
+
+    case WS.reattach(ws, sandbox_id, session_id) do
+      {:ok, ^session_id} ->
+        Logger.info("AgentRPC: reattached to sandbox #{sandbox_id}, session=#{session_id}")
+
+        state = %__MODULE__{
+          sandbox_id: sandbox_id,
+          ws: ws,
+          session_id: session_id,
+          on_event: on_event,
+          # Assume running until we know otherwise — scrollback replay
+          # will deliver agent_end if pi already finished.
+          is_streaming: true,
+          status: :running
+        }
+
+        # Check if pi is still active after scrollback replay settles
+        Process.send_after(self(), :check_idle_after_reconnect, 3_000)
 
         {:ok, state}
 

@@ -192,43 +192,19 @@ defmodule Karkhana.Session do
   end
 
   def handle_info(:launch_agent, state) do
-    documents = fetch_issue_documents(state.issue)
-
-    prompt =
-      PromptBuilder.build_prompt(state.issue,
-        mode: state.mode,
-        mode_prompt: state.mode_prompt,
-        attempt: state.attempt,
-        gate_feedback: nil,
-        documents: documents
-      )
-
-    settings = Config.settings!().claude
     me = self()
+    on_event = fn event -> send(me, {:rpc_event, event}) end
 
-    case AgentRPC.start(state.sandbox_id,
-           on_event: fn event -> send(me, {:rpc_event, event}) end,
-           provider: settings.provider,
-           model: settings.model
-         ) do
-      {:ok, agent} ->
-        :ok = AgentRPC.prompt(agent, prompt)
-        state = %{state | agent: agent, status: :running}
-        Logger.info("Session #{state.issue.identifier}: agent launched via RPC")
-        broadcast_sessions({:session_status, summary(state)})
+    # Try to reattach to an existing piped session (survives karkhana restart).
+    # If pi is still running inside the sandbox, we reconnect instead of
+    # starting a new process — preserving the agent's full context.
+    case find_existing_piped_session(state.sandbox_id) do
+      {:ok, session_id} ->
+        Logger.info("Session #{state.issue.identifier}: found existing piped session #{session_id}, reattaching")
+        reattach_to_agent(state, session_id, on_event, me)
 
-        # Wait for completion asynchronously
-        spawn_link(fn ->
-          case AgentRPC.await_completion(agent) do
-            {:ok, result} -> send(me, {:agent_completed, result})
-            {:error, reason} -> send(me, {:agent_failed, reason})
-          end
-        end)
-
-        {:noreply, state}
-
-      {:error, reason} ->
-        fail(state, "Agent RPC start failed: #{inspect(reason)}")
+      :none ->
+        launch_fresh_agent(state, on_event, me)
     end
   rescue
     e ->
@@ -330,6 +306,86 @@ defmodule Karkhana.Session do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # --- Agent launch helpers ---
+
+  defp find_existing_piped_session(sandbox_id) do
+    case Karkhana.Bhatti.Client.list_sessions(sandbox_id) do
+      {:ok, sessions} when is_list(sessions) ->
+        case Enum.find(sessions, fn s ->
+               s["running"] == true and s["tty"] == false
+             end) do
+          %{"session_id" => sid} -> {:ok, sid}
+          _ -> :none
+        end
+
+      _ ->
+        :none
+    end
+  rescue
+    _ -> :none
+  end
+
+  defp reattach_to_agent(state, session_id, on_event, me) do
+    case AgentRPC.reattach(state.sandbox_id, session_id, on_event: on_event) do
+      {:ok, agent} ->
+        state = %{state | agent: agent, status: :running}
+        Logger.info("Session #{state.issue.identifier}: reattached to agent via RPC")
+        broadcast_sessions({:session_status, summary(state)})
+
+        spawn_link(fn ->
+          case AgentRPC.await_completion(agent) do
+            {:ok, result} -> send(me, {:agent_completed, result})
+            {:error, reason} -> send(me, {:agent_failed, reason})
+          end
+        end)
+
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.warning("Session #{state.issue.identifier}: reattach failed (#{inspect(reason)}), starting fresh")
+        launch_fresh_agent(state, on_event, me)
+    end
+  end
+
+  defp launch_fresh_agent(state, on_event, me) do
+    documents = fetch_issue_documents(state.issue)
+
+    prompt =
+      PromptBuilder.build_prompt(state.issue,
+        mode: state.mode,
+        mode_prompt: state.mode_prompt,
+        attempt: state.attempt,
+        gate_feedback: nil,
+        documents: documents
+      )
+
+    settings = Config.settings!().claude
+
+    case AgentRPC.start(state.sandbox_id,
+           on_event: on_event,
+           provider: settings.provider,
+           model: settings.model
+         ) do
+      {:ok, agent} ->
+        :ok = AgentRPC.prompt(agent, prompt)
+        state = %{state | agent: agent, status: :running}
+        Logger.info("Session #{state.issue.identifier}: agent launched via RPC")
+        broadcast_sessions({:session_status, summary(state)})
+
+        spawn_link(fn ->
+          case AgentRPC.await_completion(agent) do
+            {:ok, result} -> send(me, {:agent_completed, result})
+            {:error, reason} -> send(me, {:agent_failed, reason})
+          end
+        end)
+
+        {:noreply, state}
+
+      {:error, reason} ->
+        fail(state, "Agent RPC start failed: #{inspect(reason)}")
+    end
+  end
 
   @impl true
   def handle_call(:status, _from, state) do

@@ -103,6 +103,15 @@ defmodule Karkhana.Bhatti.Client do
     get("/sandboxes")
   end
 
+  @doc """
+  List active sessions in a sandbox.
+  Returns a list of session info maps with session_id, argv, tty, running, attached.
+  """
+  @spec list_sessions(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def list_sessions(sandbox_id) do
+    get("/sandboxes/#{sandbox_id}/sessions")
+  end
+
   @spec exec(String.t(), [String.t()], keyword()) :: {:ok, map()} | {:error, term()}
   def exec(sandbox_id, cmd, opts \\ []) do
     timeout_sec = Keyword.get(opts, :timeout_sec, 3600)
