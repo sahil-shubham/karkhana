@@ -1,0 +1,15 @@
+{
+  "name": "karkhana-computer-use",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Karkhana computer-use tools for pi-coding-agent (screenshot/click/type/scroll/drag via xdotool + scrot).",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "typebox": "^1.1.24"
+  }
+}

@@ -32,11 +32,25 @@ type Config struct {
 	// (~2s spawn instead of ~30s).
 	WorkerImage string
 
+	// PiExtensions is the list of pi extension paths (in the
+	// SANDBOX filesystem) to load via `--extension <path>` when
+	// spawning the worker. With kk-base, defaults to the
+	// computer-use extension that gives the agent
+	// screenshot/click/type/scroll tools. Empty when WorkerImage
+	// is the raw "computer" image (pi installed at runtime, no
+	// extension dir to load from).
+	PiExtensions []string
+
 	// Pi (worker agent) provider config. If unset, we auto-detect
 	// from whichever API key is present in the env.
 	PiProvider string // e.g. "openrouter" | "anthropic" | "openai"
 	PiModel    string // e.g. "anthropic/claude-sonnet-4"
 }
+
+// DefaultComputerUseExtensionPath is where bake-image.sh installs
+// the computer-use extension inside the worker rootfs. Karkhana
+// loads this automatically for any non-vanilla worker image.
+const DefaultComputerUseExtensionPath = "/usr/local/share/karkhana/extensions/computer-use/index.ts"
 
 // bhattiCLIConfig mirrors the YAML schema of ~/.bhatti/config.yaml.
 type bhattiCLIConfig struct {
@@ -92,6 +106,21 @@ func Load() (*Config, error) {
 	// Worker image. Default to "computer"; user can switch to a
 	// pre-baked image (e.g. kk-base from scripts/bake-image.sh).
 	cfg.WorkerImage = envOr("KARKHANA_WORKER_IMAGE", "computer")
+
+	// Pi extensions. Explicit env var (KARKHANA_PI_EXTENSIONS,
+	// comma-separated) wins. Otherwise: empty for the vanilla
+	// "computer" image (no extension dir baked); for any other
+	// image, default to the computer-use extension path.
+	if raw := os.Getenv("KARKHANA_PI_EXTENSIONS"); raw != "" {
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				cfg.PiExtensions = append(cfg.PiExtensions, p)
+			}
+		}
+	} else if cfg.WorkerImage != "computer" {
+		cfg.PiExtensions = []string{DefaultComputerUseExtensionPath}
+	}
 
 	return cfg, nil
 }

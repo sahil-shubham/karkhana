@@ -75,14 +75,20 @@ func main() {
 	bhattiCli := bhatti.New(cfg.BhattiURL, cfg.BhattiToken)
 
 	state := &serverState{
-		bus:         bus,
-		bhatti:      bhattiCli,
-		missions:    map[string]*mission.Mission{},
-		agents:      map[string]*mission.Agent{},
-		drivers:     map[string]*driver.Driver{},
-		piProvider:  cfg.PiProvider,
-		piModel:     cfg.PiModel,
-		workerImage: cfg.WorkerImage,
+		bus:          bus,
+		bhatti:       bhattiCli,
+		missions:     map[string]*mission.Mission{},
+		agents:       map[string]*mission.Agent{},
+		drivers:      map[string]*driver.Driver{},
+		piProvider:   cfg.PiProvider,
+		piModel:      cfg.PiModel,
+		workerImage:  cfg.WorkerImage,
+		piExtensions: cfg.PiExtensions,
+	}
+	if len(cfg.PiExtensions) > 0 {
+		slog.Info("pi extensions enabled",
+			"count", len(cfg.PiExtensions),
+			"paths", cfg.PiExtensions)
 	}
 	slog.Info("pi provider resolved",
 		"provider", cfg.PiProvider,
@@ -157,6 +163,11 @@ type serverState struct {
 	// Worker bhatti image. "computer" (default) requires runtime
 	// pi install; "kk-base" (after bake-image.sh) has pi pre-baked.
 	workerImage string
+
+	// Pi --extension paths (interpreted in the sandbox FS) to
+	// load on every worker spawn. With kk-base, this is the
+	// computer-use extension; with raw "computer", empty.
+	piExtensions []string
 }
 
 func (s *serverState) nextEventID() int64 {
@@ -435,9 +446,10 @@ func (s *serverState) runMission(m *mission.Mission) {
 		Cmd: []string{
 			"pi", "--mode", "rpc", "--session-dir", piSessionDir,
 		},
-		Provider: s.piProvider,
-		Model:    s.piModel,
-		Env:      piEnv,
+		Provider:   s.piProvider,
+		Model:      s.piModel,
+		Extensions: s.piExtensions,
+		Env:        piEnv,
 		OnEvent: func(ev driver.Event) {
 			s.forwardPiEvent(m.ID, workerID, ev)
 		},
@@ -464,9 +476,10 @@ func (s *serverState) runMission(m *mission.Mission) {
 
 	// 5. Send the operator's goal as the first prompt, wrapped
 	// with the desktop-context preamble so the agent knows it has
-	// a visible KasmVNC display and should prefer launching real
-	// GUI apps (chromium <url> &) over headless workarounds.
-	prompt := wrapGoalWithDesktopContext(m.Goal)
+	// a visible KasmVNC display and (when applicable) the
+	// computer-use toolset for clicking/typing/scrolling.
+	hasComputerUse := len(s.piExtensions) > 0
+	prompt := wrapGoalWithDesktopContext(m.Goal, hasComputerUse)
 	if err := drv.Prompt(context.Background(), prompt); err != nil {
 		s.failWorker(m, worker, "send prompt failed: "+err.Error())
 		return
@@ -544,31 +557,70 @@ func (s *serverState) ensurePi(ctx context.Context, m *mission.Mission, workerID
 
 // wrapGoalWithDesktopContext prepends a short system-style
 // preamble to the operator's goal so pi-coding-agent understands
-// it's running on a XFCE4 + KasmVNC desktop, not a headless
-// server. Without this, pi happily reaches for curl when the
-// goal says "open X.com" — the operator sees a static empty
-// desktop in the iframe.
+// it's running on a XFCE4 + KasmVNC desktop with computer-use
+// tools available. Without this preamble, pi happily reaches
+// for curl when the goal says "open X.com" — the operator sees
+// a static empty desktop in the iframe.
+//
+// Two flavors:
+//   - withComputerUse=true: the worker has the screenshot/click/
+//     type/key/scroll tools loaded (kk-base image). Tell the
+//     agent to drive the desktop visually.
+//   - withComputerUse=false: only bash/read/write/edit. Tell the
+//     agent to launch chromium and narrate from curl.
 //
 // Why an inline preamble (vs. a real --system-prompt CLI flag):
 // pi exposes per-message context cleanly, and we want the
 // preamble to ride alongside *this* goal so re-prompts in the
 // same session don't double up on it.
-func wrapGoalWithDesktopContext(goal string) string {
-	return `<environment>
-You are running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium) streamed live to your operator over KasmVNC. The DISPLAY variable is set to :99 — GUI apps you launch from bash will appear in the operator's iframe in real time.
+func wrapGoalWithDesktopContext(goal string, withComputerUse bool) string {
+	var env string
+	if withComputerUse {
+		env = `<environment>
+You are running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium) streamed live to your operator over KasmVNC. The desktop resolution is 1280x720, DISPLAY=:99.
 
-When the goal says "open <site>", "visit <url>", "browse to X", "go through the docs at…", or anything that implies a website / web UI, treat the target as a URL and open it in the visible browser:
+In addition to bash/read/write/edit, you have a full computer-use toolset that drives the desktop directly. PREFER these over bash for any visible interaction:
+
+  screenshot()                          — capture the current desktop
+  left_click(x, y) / right_click(x, y)  — click at pixel coords
+  double_click(x, y)                    — double-click
+  mouse_move(x, y)                      — hover without clicking
+  left_click_drag(x1,y1, x2,y2)         — drag from A to B
+  type(text)                            — type literal text at focus
+  key(combo)                            — e.g. "Return", "Tab", "ctrl+l"
+  scroll(direction, amount?)            — "up"|"down"|"left"|"right"
+  wait(seconds)                         — sleep, return screenshot
+  cursor_position()                     — read-only, no action
+
+Every action tool returns a fresh screenshot in its result, so you have visual feedback automatically — you do NOT need to call screenshot() after each click. Use coordinates from the latest screenshot you have.
+
+Workflow for "open <url>" / "go to <site>" / "browse to X":
+  1. bash: "chromium --no-sandbox --new-window <url> &" to launch (or click an existing browser icon)
+  2. wait(2)  — let the window appear and the page render
+  3. screenshot() if needed, then click/type/scroll to interact
+
+Do NOT interpret bare hostnames like "bhatti.sh" as local files. They are URLs (prefix https:// when launching).
+
+Narrate what you're doing in short assistant messages between tool calls. The operator watches both your reasoning and the desktop live.
+</environment>`
+	} else {
+		env = `<environment>
+You are running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium) streamed live to your operator over KasmVNC. DISPLAY=:99 — GUI apps you launch from bash will appear in the operator's iframe in real time.
+
+When the goal says "open <site>", "visit <url>", "browse to X", or anything that implies a web UI, launch chromium so the operator can SEE it:
 
   chromium --no-sandbox --new-window <url> &
 
-Not curl, not playwright, not headless mode. The operator wants to watch the browser navigate. Wait ~2 seconds after launching for the window to settle. You can use xdotool / wmctrl for further automation if you need to click or scroll.
+Not curl, not playwright, not headless. Wait ~2 seconds after launching for the window to settle. Use xdotool / wmctrl from bash if you need basic clicks or keypresses.
 
-Do NOT interpret bare hostnames like "bhatti.sh" as local files. They are URLs. Prefix with https:// when calling chromium.
+Do NOT interpret bare hostnames like "bhatti.sh" as local files. They are URLs (prefix https://).
 
-When you genuinely need to read text content programmatically (e.g. extracting structured data), curl is fine — but launch the browser for the human-visible part too.
+For programmatic text extraction (data scraping, etc.), curl is fine — but launch the visible browser for the human-watching part.
 
-Narrate what you're doing as you go: short assistant messages between tool calls explaining the plan and what just happened. The operator is watching both your reasoning and the desktop in real time.
-</environment>
+Narrate what you're doing in short assistant messages between tool calls. The operator watches both your reasoning and the desktop live.
+</environment>`
+	}
+	return env + `
 
 <goal>
 ` + goal + `

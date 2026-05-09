@@ -54,6 +54,13 @@ type Options struct {
 	// Model, if set, is appended as `--model <m>` after Cmd.
 	Model string
 
+	// Extensions, if non-empty, get appended as repeated
+	// `--extension <path>` flags. The path is interpreted in the
+	// SANDBOX's filesystem (not the host's). For Karkhana these
+	// point at extensions baked into the kk-base image, e.g.
+	// /usr/local/share/karkhana/extensions/computer-use/index.ts.
+	Extensions []string
+
 	// Env to inject into the agent process.
 	Env map[string]string
 
@@ -131,6 +138,12 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 	}
 	if opts.Model != "" {
 		opts.Cmd = append(opts.Cmd, "--model", opts.Model)
+	}
+	for _, ext := range opts.Extensions {
+		if ext == "" {
+			continue
+		}
+		opts.Cmd = append(opts.Cmd, "--extension", ext)
 	}
 	if opts.MaxIdleSec == 0 {
 		opts.MaxIdleSec = 3600
