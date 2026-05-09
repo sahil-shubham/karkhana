@@ -61,10 +61,23 @@ type Agent struct {
 	// no sandbox_id; workers always do.
 	BhattiSandboxID        string `json:"bhatti_sandbox_id,omitempty"`
 	SpawnedFromSnapshotID  string `json:"spawned_from_snapshot_id,omitempty"`
-	KasmVNCURL             string `json:"kasmvnc_url,omitempty"`     // raw upstream URL
-	KasmVNCProxyPath       string `json:"kasmvnc_proxy_path,omitempty"` // same-origin path the iframe loads
-	KasmVNCUser            string `json:"-"` // not exposed over the wire
-	KasmVNCPass            string `json:"-"`
+	// KasmVNCURL is the RAW upstream URL (Cloudflare-published
+	// host with Basic auth). Server-side only — never sent to the
+	// browser. The browser must talk to the same-origin proxy
+	// path; if it had the upstream URL it could (a) trigger
+	// Cloudflare's Basic-auth dialog and (b) bypass our auth
+	// injection layer.
+	KasmVNCURL string `json:"-"`
+
+	// KasmVNCProxyPath is the same-origin path the iframe loads
+	// (e.g. "/proxy/agent_abcd1234/"). This is what the frontend
+	// consumes; we marshal it as `kasmvnc_url` so the JSON shape
+	// matches what the iframe will actually use — the upstream
+	// distinction stays a server-side internal.
+	KasmVNCProxyPath string `json:"kasmvnc_url,omitempty"`
+
+	KasmVNCUser string `json:"-"` // not exposed over the wire
+	KasmVNCPass string `json:"-"`
 	AgentEndpointURL       string `json:"agent_endpoint_url,omitempty"`
 
 	// Task / config
