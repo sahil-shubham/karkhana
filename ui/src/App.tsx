@@ -8,7 +8,27 @@ import { ChatPanel } from "./components/ChatPanel";
 import { Canvas } from "./components/Canvas";
 import { connectEvents, type ConnState } from "./lib/ws";
 import { api } from "./lib/api";
+import { apiURL } from "./lib/config";
 import type { Agent, KEvent, Mission } from "./lib/types";
+
+// Each running worker gets exactly one <iframe> on the page,
+// keyed by agent ID and parked in this hidden pool. AgentTile
+// reparents the iframe into its slot on mount and back to the
+// pool on unmount — so switching missions or zooming the canvas
+// never tears down a live KasmVNC connection. See WorkerView in
+// AgentTile.tsx for the slot-side of this dance.
+const IFRAME_POOL_ID = "karkhana-iframe-pool";
+function kasmIframeID(agentID: string): string {
+  return `kasm-iframe-${agentID}`;
+}
+function buildKasmURL(agent: Agent): string | undefined {
+  if (!agent.kasmvnc_url || agent.kasmvnc_url === "about:blank") return undefined;
+  const base = agent.kasmvnc_url.startsWith("/")
+    ? apiURL(agent.kasmvnc_url)
+    : agent.kasmvnc_url;
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}resize=remote&autoconnect=1`;
+}
 
 export default function App() {
   const [missions, setMissions] = useState<Mission[]>([]);
@@ -248,6 +268,55 @@ export default function App() {
     setActiveMissionID(null);
   }, []);
 
+  // ---- iframe pool reconciliation ----
+  // For every running worker with a KasmVNC URL, ensure exactly
+  // one <iframe> exists in the pool; for every iframe whose agent
+  // is gone (terminated, deleted, mission deleted), tear it down.
+  // We do this imperatively (createElement, appendChild, remove)
+  // because React re-renders + xyflow node mounts cannot be
+  // trusted to preserve iframe lifecycle through their
+  // reconciliation cycles.
+  const poolRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const pool = poolRef.current;
+    if (!pool) return;
+
+    const desired = new Map<string, string>(); // agentID -> URL
+    agents.forEach((a) => {
+      if (a.role !== "worker") return;
+      if (a.status !== "running") return;
+      const url = buildKasmURL(a);
+      if (!url) return;
+      desired.set(a.id, url);
+    });
+
+    // Remove iframes whose agent is no longer running. Note:
+    // they may currently be reparented INTO a tile slot, so we
+    // search the whole document, not just the pool.
+    const all = document.querySelectorAll<HTMLIFrameElement>(
+      `iframe[data-kasm-agent]`,
+    );
+    all.forEach((el) => {
+      const id = el.dataset.kasmAgent!;
+      if (!desired.has(id)) {
+        el.remove();
+      }
+    });
+
+    // Add iframes for new running workers.
+    desired.forEach((url, agentID) => {
+      if (document.getElementById(kasmIframeID(agentID))) return; // already alive
+      const iframe = document.createElement("iframe");
+      iframe.id = kasmIframeID(agentID);
+      iframe.dataset.kasmAgent = agentID;
+      iframe.src = url;
+      iframe.allow = "clipboard-read; clipboard-write";
+      iframe.style.cssText =
+        "width:100%;height:100%;border:none;background:#000;display:block;";
+      pool.appendChild(iframe);
+    });
+  }, [agents]);
+
   const visibleAgents = useMemo(() => {
     if (!activeMissionID) return new Map<string, Agent>();
     const out = new Map<string, Agent>();
@@ -274,6 +343,22 @@ export default function App() {
         onDeleteMission={handleDeleteMission}
         onHome={handleHome}
         connState={connState}
+      />
+      {/* Hidden iframe pool. Iframes live here when no tile is
+          showing them; tile slots reparent them in/out by ID. */}
+      <div
+        ref={poolRef}
+        id={IFRAME_POOL_ID}
+        aria-hidden="true"
+        style={{
+          position: "fixed",
+          left: "-99999px",
+          top: 0,
+          width: 1280,
+          height: 720,
+          pointerEvents: "none",
+          visibility: "hidden",
+        }}
       />
       <main style={{ flex: 1, position: "relative" }}>
         <ReactFlowProvider>

@@ -46,11 +46,10 @@ export function AgentTile({ data, selected }: NodeProps) {
   const isDriver = agent.role === "driver";
   const accent = isDriver ? "var(--accent)" : "var(--accent-worker)";
 
-  // KasmVNC URL with the noVNC params we want:
-  //   resize=remote   — server-side X resize to match canvas
-  //                     (no bitmap upscaling; the desktop itself
-  //                     reshapes when the tile resizes)
-  //   autoconnect=1   — connect immediately on iframe load
+  // KasmVNC URL only used for the right-click "Open in new tab"
+  // context-menu item. The actual iframe is owned by App.tsx's
+  // iframe pool (see kasmIframeID + buildKasmURL there) and
+  // reparented into our WorkerView slot on mount.
   const desktopURL = (() => {
     if (!agent.kasmvnc_url || agent.kasmvnc_url === "about:blank")
       return undefined;
@@ -105,7 +104,8 @@ export function AgentTile({ data, selected }: NodeProps) {
           <EventStream events={recentEvents} />
         ) : (
           <WorkerView
-            kasmvncURL={desktopURL}
+            agentID={agent.id}
+            hasURL={!!desktopURL}
             focused={focused}
             onFocus={onFocus}
           />
@@ -522,16 +522,72 @@ function EventRow({ ev }: { ev: KEvent }) {
   );
 }
 
+// Worker desktop view. The actual <iframe> lives in App.tsx's
+// hidden pool, keyed by agent ID. Here we render a slot div and
+// reparent the iframe DOM node into it on mount; on unmount we
+// hand it back to the pool. This way switching missions, zooming
+// the canvas, or any other re-render that unmounts our tile does
+// NOT tear down the KasmVNC WebSocket. The iframe is alive for
+// the lifetime of the agent, not the lifetime of this component.
 function WorkerView({
-  kasmvncURL,
+  agentID,
+  hasURL,
   focused,
   onFocus,
 }: {
-  kasmvncURL?: string;
+  agentID: string;
+  hasURL: boolean;
   focused: boolean;
   onFocus: () => void;
 }) {
-  if (!kasmvncURL) {
+  const slotRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!hasURL) return;
+    const slot = slotRef.current;
+    if (!slot) return;
+
+    let stopped = false;
+    let attached: HTMLIFrameElement | null = null;
+
+    // App.tsx's pool effect runs after children's effects on the
+    // first frame an agent acquires its kasmvnc_url, so the
+    // iframe may not exist yet when we first try to grab it.
+    // Retry on rAF until it shows up (capped to ~2s).
+    let attempts = 0;
+    const tryAttach = () => {
+      if (stopped) return;
+      const iframe = document.getElementById(
+        `kasm-iframe-${agentID}`,
+      ) as HTMLIFrameElement | null;
+      if (!iframe) {
+        if (attempts++ > 120) return; // give up after ~2s @ 60fps
+        requestAnimationFrame(tryAttach);
+        return;
+      }
+      // Take the iframe out of the pool, drop it into our slot.
+      // appendChild moves rather than copies — the existing DOM
+      // node, including its alive WebSocket, comes with us.
+      slot.appendChild(iframe);
+      attached = iframe;
+    };
+    tryAttach();
+
+    return () => {
+      stopped = true;
+      if (!attached) return;
+      const pool = document.getElementById("karkhana-iframe-pool");
+      // If the agent has been terminated while we were mounted,
+      // App.tsx's pool effect will have already removed this
+      // iframe. Guard against that: only re-park if the iframe
+      // is still in the document.
+      if (pool && attached.isConnected) {
+        pool.appendChild(attached);
+      }
+    };
+  }, [agentID, hasURL]);
+
+  if (!hasURL) {
     return (
       <div
         style={{
@@ -553,16 +609,9 @@ function WorkerView({
   }
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
-      <iframe
-        src={kasmvncURL}
-        style={{
-          width: "100%",
-          height: "100%",
-          border: "none",
-          background: "#000",
-          display: "block",
-        }}
-        allow="clipboard-read; clipboard-write"
+      <div
+        ref={slotRef}
+        style={{ width: "100%", height: "100%" }}
       />
       {!focused && (
         <div
