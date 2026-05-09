@@ -1,0 +1,74 @@
+/* Karkhana ContextMenu — shadcn-shaped, dark, dense, monospace.
+ * Matches the rest of the app's operational typography. */
+
+.kk-cm-content {
+  min-width: 180px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text-2);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.5),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+  z-index: 1000;
+
+  /* Radix open animation */
+  animation: kk-cm-fade-in 80ms ease-out;
+}
+
+@keyframes kk-cm-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.kk-cm-item {
+  display: flex;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: 4px;
+  cursor: default;
+  user-select: none;
+  outline: none;
+  position: relative;
+}
+
+.kk-cm-item[data-highlighted] {
+  background: var(--bg-2);
+  color: var(--text);
+}
+
+.kk-cm-item[data-disabled] {
+  color: var(--text-4);
+  pointer-events: none;
+}
+
+.kk-cm-item-danger {
+  color: var(--status-fail);
+}
+
+.kk-cm-item-danger[data-highlighted] {
+  background: rgba(248, 113, 113, 0.12); /* status-fail at 12% */
+  color: var(--status-fail);
+}
+
+.kk-cm-shortcut {
+  margin-left: 16px;
+  color: var(--text-4);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+}
+
+.kk-cm-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}

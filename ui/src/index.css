@@ -1,0 +1,75 @@
+/* Karkhana global styles. Operational typography — dense,
+ * monospace-friendly, dark by default. */
+
+:root {
+  /* Zinc palette, similar to bhatti.sh and Linear */
+  --bg:        #09090b; /* zinc-950 */
+  --bg-1:      #18181b; /* zinc-900 */
+  --bg-2:      #27272a; /* zinc-800 */
+  --border:    #3f3f46; /* zinc-700 */
+  --text:      #fafafa; /* zinc-50 */
+  --text-2:    #d4d4d8; /* zinc-300 */
+  --text-3:    #a1a1aa; /* zinc-400 */
+  --text-4:    #71717a; /* zinc-500 */
+
+  --accent:        #22d3ee; /* cyan-400 — driver tile accent */
+  --accent-worker: #a78bfa; /* violet-400 — worker tile accent */
+
+  --status-running:    #22d3ee;
+  --status-success:    #4ade80;
+  --status-fail:       #f87171;
+  --status-suspended:  #facc15;
+  --status-terminated: #71717a;
+
+  --radius: 6px;
+  --gap: 8px;
+
+  font-family:
+    "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Monaco, Consolas,
+    "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+input,
+textarea {
+  font: inherit;
+  background: var(--bg-1);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+}
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* react-flow tile overrides — get rid of default panel chrome */
+.react-flow__attribution {
+  display: none !important;
+}
+.react-flow__node {
+  font-family: inherit;
+}

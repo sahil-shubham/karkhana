@@ -1,0 +1,25 @@
+# Go
+/karkhana
+/bin/
+*.out
+*.test
+
+# Local
+.env
+.env.local
+*.db
+
+# UI
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Local design docs
+/docs/internal/
