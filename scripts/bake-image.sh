@@ -113,19 +113,35 @@ remote_put_file() {
     "$BHATTI_URL/sandboxes/$sbid/files?path=$encoded" >/dev/null
 }
 
-# --- 1. early-exit if image already exists ---
+# --- 1. handle pre-existing image ---
+#
+# Bhatti's POST /sandboxes/:id/save-image refuses to overwrite an
+# existing image — it returns:
+#   {"error": "image \"X\" already exists — delete first"}
+# So when --force is set we DELETE the existing one first via
+# DELETE /images/:name. Without --force, we exit early so a
+# stale image isn't silently replaced.
 
-if [[ $FORCE -eq 0 ]]; then
-  HAS=$(curl_b "$BHATTI_URL/images" \
-    | python3 -c "
+HAS=$(curl_b "$BHATTI_URL/images" \
+  | python3 -c "
 import sys, json
 try:    imgs = json.load(sys.stdin)
 except: imgs = []
 print('yes' if any(i.get('name') == '$IMAGE_NAME' for i in imgs) else 'no')")
-  if [[ "$HAS" == "yes" ]]; then
+
+if [[ "$HAS" == "yes" ]]; then
+  if [[ $FORCE -eq 0 ]]; then
     echo "image '$IMAGE_NAME' already exists. use --force to rebuild." >&2
     echo "(set KARKHANA_WORKER_IMAGE=$IMAGE_NAME in .env to use it)" >&2
     exit 0
+  fi
+  log "--force set; deleting existing image '$IMAGE_NAME' first"
+  DEL_RES=$(curl_b -X DELETE "$BHATTI_URL/images/$IMAGE_NAME" -w "\n%{http_code}")
+  HTTP_CODE=$(echo "$DEL_RES" | tail -1)
+  if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "204" && "$HTTP_CODE" != "404" ]]; then
+    echo "image delete returned $HTTP_CODE; aborting:" >&2
+    echo "$DEL_RES" | head -1 >&2
+    exit 1
   fi
 fi
 
@@ -234,6 +250,13 @@ log "saving sandbox rootfs as image '$IMAGE_NAME'"
 SAVE_RES=$(curl_b -X POST "$BHATTI_URL/sandboxes/$SBID/save-image" \
   -H 'Content-Type: application/json' \
   -d "{\"name\": \"$IMAGE_NAME\"}")
+# bhatti returns {"error": "..."} on save failure; don't claim
+# success in that case.
+if echo "$SAVE_RES" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if 'error' in d else 1)" 2>/dev/null; then
+  echo "save-image failed:" >&2
+  echo "$SAVE_RES" | python3 -m json.tool >&2 || echo "$SAVE_RES" >&2
+  exit 1
+fi
 echo "$SAVE_RES" | python3 -m json.tool >&2 || true
 
 log "verifying image"
