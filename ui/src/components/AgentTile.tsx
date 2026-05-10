@@ -38,10 +38,14 @@ export interface AgentTileData extends Record<string, unknown> {
   focused: boolean;
   onFocus: () => void;
   onTerminate?: () => void;
+  // Set on the root tile of a mission only (the agent that has
+  // no parent). v0.6 has no sidebar; this is how the operator
+  // ends a whole mission — right-click the root → Delete mission.
+  onDeleteMission?: () => void;
 }
 
 export function AgentTile({ data, selected }: NodeProps) {
-  const { agent, recentEvents, focused, onFocus, onTerminate } =
+  const { agent, recentEvents, focused, onFocus, onTerminate, onDeleteMission } =
     data as AgentTileData;
   const isDriver = agent.role === "driver";
   const accent = isDriver ? "var(--accent)" : "var(--accent-worker)";
@@ -181,13 +185,18 @@ export function AgentTile({ data, selected }: NodeProps) {
             Copy sandbox ID
           </ContextMenuItem>
         )}
+        {(onTerminate && agent.status === "running") || onDeleteMission ? (
+          <ContextMenuSeparator />
+        ) : null}
         {onTerminate && agent.status === "running" && (
-          <>
-            <ContextMenuSeparator />
-            <ContextMenuItem variant="danger" onSelect={onTerminate}>
-              Terminate worker
-            </ContextMenuItem>
-          </>
+          <ContextMenuItem variant="danger" onSelect={onTerminate}>
+            Terminate {agent.role === "driver" ? "driver" : "worker"}
+          </ContextMenuItem>
+        )}
+        {onDeleteMission && (
+          <ContextMenuItem variant="danger" onSelect={onDeleteMission}>
+            Delete mission
+          </ContextMenuItem>
         )}
       </ContextMenuContent>
     </ContextMenu>
