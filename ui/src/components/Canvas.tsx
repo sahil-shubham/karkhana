@@ -137,19 +137,43 @@ export function Canvas({
     ],
   );
 
-  // Merge the desired layout into existing node state, preserving
-  // operator-edited position/size for tiles we've already placed.
+  // Merge the desired layout into existing node state.
+  //
+  // Position policy:
+  //   - DRIVER tiles preserve their previous position. The
+  //     driver lands at the operator's right-click point on
+  //     spawn (canvas_x/y from the server), and any in-session
+  //     drag should stick.
+  //   - WORKER tiles ALWAYS take the freshly-computed grid
+  //     position. The grid (cols, rows) depends on the worker
+  //     count, which grows as the driver spawns more workers.
+  //     If we preserved old positions, workers laid out under a
+  //     smaller grid would stay there while new workers used the
+  //     bigger grid — causing overlap. Re-layout every render.
+  //
+  // Dimensions (NodeResizer edits) always come from prev when
+  // available so resizes persist for both roles.
   useEffect(() => {
     setNodes((prev) => {
       const prevByID = new Map(prev.map((n) => [n.id, n]));
       const merged: Node[] = [];
       for (const want of desired.nodes) {
         const before = prevByID.get(want.id);
-        if (before) {
-          merged.push({ ...before, data: want.data, type: want.type });
-        } else {
+        if (!before) {
           merged.push(want);
+          continue;
         }
+        const data = want.data as AgentTileData;
+        const isDriver = data?.agent?.role === "driver";
+        merged.push({
+          ...before,
+          data: want.data,
+          type: want.type,
+          // Drivers: keep prev position (operator drag preserved
+          // in-session; canvas_x/y persisted across restarts).
+          // Workers: always re-layout from the current grid.
+          position: isDriver ? before.position : want.position,
+        });
       }
       return merged;
     });
