@@ -9,7 +9,7 @@
 // Per v0.6: this is the ONLY way to start a new mission.
 // There's no left-side dispatch panel, no command palette.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 interface Props {
   screenX: number;
@@ -32,6 +32,21 @@ export function NewMissionPopover({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Auto-grow the textarea on every keystroke. We measure
+  // scrollHeight after resetting height to 'auto'; without the
+  // reset, scrollHeight would only ever increase. Capped so a
+  // pasted essay doesn't push the popover off-screen.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const max = Math.min(
+      window.innerHeight - 200, // leave room for header + footer + chrome
+      560,
+    );
+    el.style.height = Math.min(el.scrollHeight, max) + "px";
+  }, [draft]);
 
   // Esc to cancel; click-outside to cancel.
   useEffect(() => {
@@ -65,18 +80,21 @@ export function NewMissionPopover({
     onSubmit(goal);
   };
 
-  // Position the popover. We want it anchored at the click point,
-  // but kept on-screen if the click was near the edges.
-  const POPOVER_W = 480;
-  const POPOVER_H = 140;
+  // Position the popover. Anchored at the click point, kept on-
+  // screen if the click was near the edges. Height is no longer
+  // fixed (textarea auto-grows); we use the popover's actual
+  // measured height for clamping. Width is generous enough that
+  // most goals don't need to wrap.
+  const POPOVER_W = 640;
   const margin = 12;
+  const popoverH = popoverRef.current?.offsetHeight ?? 180;
   const left = Math.min(
     Math.max(margin, screenX),
     window.innerWidth - POPOVER_W - margin,
   );
   const top = Math.min(
     Math.max(margin, screenY),
-    window.innerHeight - POPOVER_H - margin,
+    window.innerHeight - popoverH - margin,
   );
 
   return (
@@ -132,10 +150,16 @@ export function NewMissionPopover({
           borderRadius: 4,
           padding: "8px 10px",
           fontSize: 13,
+          lineHeight: 1.5,
           fontFamily: "inherit",
+          // No vertical scrollbar — we grow the textarea via JS
+          // (see useLayoutEffect above). Height transitions are
+          // size-driven, not scroll-driven.
           resize: "none",
+          overflow: "hidden",
           outline: "none",
           boxSizing: "border-box",
+          minHeight: 72,
         }}
       />
       <footer
