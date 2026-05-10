@@ -50,6 +50,15 @@ type Options struct {
 	// Model, if set, is appended as `--model <m>` after Cmd.
 	Model string
 
+	// Thinking, if set, is sent as set_thinking_level after
+	// connect. Levels: "off", "minimal", "low", "medium",
+	// "high", "xhigh". Empty leaves pi's default in place.
+	// We use "low" for drivers (orchestration is mechanical
+	// once the plan is clear; deep thinking is wasted seconds)
+	// and "low" for workers (clicks don't need much reasoning;
+	// the agent has screenshots to react to).
+	Thinking string
+
 	// Extensions, if non-empty, get appended as repeated
 	// `--extension <path>` flags. The path is interpreted in the
 	// SANDBOX's filesystem (not the host's). For Karkhana these
@@ -229,6 +238,9 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 	// + auto-retry; missions can run long and rate-limits happen.
 	_ = d.sendCommand(ctx, "set_auto_compaction", map[string]any{"enabled": true})
 	_ = d.sendCommand(ctx, "set_auto_retry", map[string]any{"enabled": true})
+	if opts.Thinking != "" {
+		_ = d.sendCommand(ctx, "set_thinking_level", map[string]any{"level": opts.Thinking})
+	}
 
 	return d, nil
 }

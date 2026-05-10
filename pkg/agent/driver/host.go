@@ -23,7 +23,7 @@ type HostOptions struct {
 	//   ["pi", "--mode", "rpc",
 	//    "--session-dir", "/tmp/karkhana-driver/<mission>",
 	//    "--provider", "openrouter",
-	//    "--model", "anthropic/claude-sonnet-4",
+	//    "--model", "anthropic/claude-sonnet-4.6",
 	//    "--extension", "/path/to/driver-tools/index.ts"]
 	Argv []string
 
@@ -44,6 +44,12 @@ type HostOptions struct {
 	// session_info handshake, so we synthesize one for parity
 	// (e.g. "host-<mission_id>").
 	SessionID string
+
+	// Thinking, if set, is sent as set_thinking_level after
+	// connect. Same levels as Options.Thinking. "low" is the
+	// right default for drivers; orchestration doesn't need
+	// deep reasoning once the goal shape is recognized.
+	Thinking string
 }
 
 // ConnectHost spawns the local pi subprocess and returns a
@@ -79,6 +85,9 @@ func ConnectHost(ctx context.Context, opts HostOptions) (*Driver, error) {
 	// sessions can run for hours of operator chat).
 	_ = d.sendCommand(ctx, "set_auto_compaction", map[string]any{"enabled": true})
 	_ = d.sendCommand(ctx, "set_auto_retry", map[string]any{"enabled": true})
+	if opts.Thinking != "" {
+		_ = d.sendCommand(ctx, "set_thinking_level", map[string]any{"level": opts.Thinking})
+	}
 
 	return d, nil
 }

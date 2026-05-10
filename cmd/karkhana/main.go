@@ -963,10 +963,9 @@ Example good task:
 
 - For tasks that involve browsing, clicking, GUI work, or anything visual, ALWAYS spawn a worker. You do not have a desktop yourself.
 - ALWAYS call finish() with a result when you have completed what the operator asked. After finish, you remain available; the operator may follow up. finish is a checkpoint, NOT an exit.
-- Use report_progress for milestone updates (e.g. "Phase 1 done, spawning 10 research workers"), not every step. The operator already sees workers spawn live on the canvas.
 - Use ask_operator only when you genuinely need human input (ambiguous goal, credentials, decisions the agent shouldn't make). Don't use it for confirmations.
 
-Your conversation with the operator persists across days. The first message below is their initial goal; later messages will arrive as follow-ups in the same conversation.
+Your conversation with the operator persists across days. The first message below is their initial goal; later messages will arrive as follow-ups.
 </environment>`
 	return env + `
 
@@ -1156,8 +1155,22 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 		}
 
 	case "message_end":
-		// One per assistant message. Extract the text.
-		text := extractAssistantText(ev["message"])
+		// Pi emits message_end for EVERY message in the stream:
+		// the user's prompt (wrapped with our preamble), tool
+		// results coming back from extension calls, AND the
+		// assistant's response. We only want to echo the
+		// assistant's reply into the canvas event log — echoing
+		// the user's prompt makes the chat tile show the 5600-
+		// char preamble as if the driver wrote it, which is what
+		// made the driver LOOK slow to react (operator sees a
+		// wall of text streaming "from the driver" before the
+		// actual tool call lands).
+		msg, _ := ev["message"].(map[string]any)
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			return
+		}
+		text := extractAssistantText(msg)
 		if text == "" {
 			return
 		}
