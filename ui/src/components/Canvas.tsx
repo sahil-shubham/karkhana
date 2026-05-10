@@ -42,10 +42,6 @@ interface Props {
   agents: Map<string, Agent>;
   missions: Mission[];
   eventsByAgent: Map<string, KEvent[]>;
-  // Per-mission canvas-coordinate origin. When set, the mission's
-  // lane is centered around this point; missing entries fall back
-  // to the auto-layout (next free X-column at Y=0).
-  missionOrigins: Map<string, { x: number; y: number }>;
   onTerminateAgent?: (agentID: string) => void;
   onDeleteMission?: (missionID: string) => void;
   // Called on right-click. The handler receives both screen coords
@@ -85,7 +81,6 @@ export function Canvas({
   agents,
   missions,
   eventsByAgent,
-  missionOrigins,
   onTerminateAgent,
   onDeleteMission,
   onPaneContextMenu,
@@ -102,7 +97,6 @@ export function Canvas({
         agents,
         missions,
         eventsByAgent,
-        missionOrigins,
         focusedID,
         setFocusedID,
         onTerminateAgent,
@@ -113,7 +107,6 @@ export function Canvas({
       agents,
       missions,
       eventsByAgent,
-      missionOrigins,
       focusedID,
       onTerminateAgent,
       onDeleteMission,
@@ -214,7 +207,6 @@ function buildGraph(
   agents: Map<string, Agent>,
   missions: Mission[],
   eventsByAgent: Map<string, KEvent[]>,
-  missionOrigins: Map<string, { x: number; y: number }>,
   focusedID: string | null,
   setFocusedID: (id: string) => void,
   onTerminateAgent?: (agentID: string) => void,
@@ -258,26 +250,33 @@ function buildGraph(
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
-  // Two-pass layout. Missions with an explicit origin (right-
-  // click coords) land where the operator clicked; missions
-  // without one (programmatic dispatches, recovered missions)
-  // get auto-positioned in next-free-column order. We pre-
-  // compute auto-positioned cursor accounting for the rightmost
-  // edge of any origin'd missions to avoid overlap on first
-  // load.
+  // Mission origin source-of-truth: the driver agent's
+  // canvas_x/y. Backend persists these on right-click dispatch;
+  // they survive Karkhana restart. Missions whose driver has
+  // null coords (programmatic dispatches, pre-persistence rows)
+  // get auto-positioned in next-free-column order.
+  const missionOrigin = (missionID: string): { x: number; y: number } | null => {
+    const driver = (agentsByMission.get(missionID) ?? []).find(
+      (a) => a.role === "driver",
+    );
+    if (!driver) return null;
+    if (driver.canvas_x == null || driver.canvas_y == null) return null;
+    return { x: driver.canvas_x, y: driver.canvas_y };
+  };
+
+  // Two-pass layout. Missions with an explicit origin land where
+  // the operator clicked; missions without one auto-position.
   let autoCursorX = 0;
-  // Find the rightmost edge of any origin'd mission so auto
-  // missions don't visually collide with them.
-  missionOrigins.forEach((pt) => {
-    // Conservative estimate: assume each mission is ~1.5 lane
-    // widths to reserve room. Operator can always drag to fix.
-    const rightEdge = pt.x + TILE_W_DEFAULT;
+  for (const mid of orderedMissionIDs) {
+    const o = missionOrigin(mid);
+    if (!o) continue;
+    const rightEdge = o.x + TILE_W_DEFAULT;
     if (rightEdge > autoCursorX) autoCursorX = rightEdge + MISSION_GAP;
-  });
+  }
 
   for (const missionID of orderedMissionIDs) {
     const missionAgents = agentsByMission.get(missionID) ?? [];
-    const origin = missionOrigins.get(missionID);
+    const origin = missionOrigin(missionID);
 
     // Pre-compute lane width to know where to anchor the lane
     // when origin'd. Layout function computes width again

@@ -13,7 +13,16 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/sahil-shubham/karkhana/pkg/eventbus"
+	"github.com/sahil-shubham/karkhana/pkg/mission"
 )
+
+// Replayer is an optional source of historical events streamed
+// to a newly-connected client BEFORE live bus events start. Used
+// for the post-restart hydrate path: SQLite -> AllEventsForMissions.
+// Implementations should return events ordered by id ascending.
+type Replayer interface {
+	ReplayEvents() ([]mission.Event, error)
+}
 
 const (
 	writeWait      = 10 * time.Second
@@ -32,8 +41,11 @@ var upgrader = websocket.Upgrader{
 
 // EventStreamHandler returns an http.HandlerFunc that subscribes
 // each connecting client to the eventbus and streams events as
-// JSON lines.
-func EventStreamHandler(bus *eventbus.Bus) http.HandlerFunc {
+// JSON lines. If `replayer` is non-nil, history is sent BEFORE
+// the live stream starts so post-restart clients see the full
+// timeline. Frontend dedupes by event.id so any overlap with
+// live events is harmless.
+func EventStreamHandler(bus *eventbus.Bus, replayer Replayer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -49,8 +61,33 @@ func EventStreamHandler(bus *eventbus.Bus) http.HandlerFunc {
 			return nil
 		})
 
+		// Subscribe BEFORE replay so live events that arrive
+		// between the replay snapshot and the live loop don't
+		// get dropped. Frontend dedupes by event.id; some
+		// duplicates may be emitted, which is fine.
 		ch, cancel := bus.Subscribe()
 		defer cancel()
+
+		if replayer != nil {
+			history, err := replayer.ReplayEvents()
+			if err != nil {
+				slog.Warn("event replay failed (non-fatal)", "err", err)
+			}
+			for _, ev := range history {
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
+				body, err := json.Marshal(ev)
+				if err != nil {
+					continue
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, body); err != nil {
+					slog.Debug("ws replay write failed", "err", err)
+					return
+				}
+			}
+			if n := len(history); n > 0 {
+				slog.Info("canvas: replayed history", "events", n)
+			}
+		}
 
 		// Two goroutines: one reads from the bus and writes to the
 		// socket; the other reads from the socket (so we can detect

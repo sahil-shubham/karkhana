@@ -119,8 +119,21 @@ func (t *wsTransport) Close() error {
 
 // dialBhattiWS opens the bhatti exec/ws WebSocket and returns a
 // wsTransport ready for the bhatti session-info handshake.
+// Used for spawning a NEW pi session (Connect path).
 func dialBhattiWS(ctx context.Context, baseURL, apiKey, sandboxID string) (*wsTransport, error) {
-	wsURL, err := buildExecWSURL(baseURL, sandboxID, "")
+	return dialBhattiWSURL(ctx, baseURL, apiKey, sandboxID, "")
+}
+
+// dialBhattiSessionWS opens the bhatti exec/ws WebSocket
+// ATTACHED to an existing pi session by session_id. No cmd
+// spec or session_info handshake — used by the recovery path
+// (AttachBhatti) on Karkhana restart.
+func dialBhattiSessionWS(ctx context.Context, baseURL, apiKey, sandboxID, sessionID string) (*wsTransport, error) {
+	return dialBhattiWSURL(ctx, baseURL, apiKey, sandboxID, sessionID)
+}
+
+func dialBhattiWSURL(ctx context.Context, baseURL, apiKey, sandboxID, sessionID string) (*wsTransport, error) {
+	wsURL, err := buildExecWSURL(baseURL, sandboxID, sessionID)
 	if err != nil {
 		return nil, err
 	}

@@ -38,6 +38,15 @@ export interface Agent {
 
   started_at: string;
   terminated_at?: string;
+
+  // Persisted canvas coords. Set on driver agents when the
+  // operator dispatches via right-click; null/absent means
+  // "auto-position me". Survives Karkhana restart.
+  canvas_x?: number;
+  canvas_y?: number;
+
+  bhatti_session_id?: string;
+  pi_session_file?: string;
 }
 
 export interface KEvent {

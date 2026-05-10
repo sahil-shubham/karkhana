@@ -102,6 +102,13 @@ type Agent struct {
 
 	StartedAt    time.Time  `json:"started_at"`
 	TerminatedAt *time.Time `json:"terminated_at,omitempty"`
+
+	// Canvas position. v0.6: durable spatial coords (right-click
+	// drop point or operator-dragged). nil falls back to the
+	// canvas's auto-layout. Stored on agents.canvas_x/y in
+	// SQLite; the API exposes them as `canvas_x` / `canvas_y`.
+	CanvasX *float64 `json:"canvas_x,omitempty"`
+	CanvasY *float64 `json:"canvas_y,omitempty"`
 }
 
 // Event is a typed observation. Source of truth for the canvas

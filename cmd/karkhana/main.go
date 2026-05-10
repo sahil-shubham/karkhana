@@ -35,6 +35,7 @@ import (
 	"github.com/sahil-shubham/karkhana/pkg/eventbus"
 	"github.com/sahil-shubham/karkhana/pkg/kasmproxy"
 	"github.com/sahil-shubham/karkhana/pkg/mission"
+	"github.com/sahil-shubham/karkhana/pkg/store"
 )
 
 const (
@@ -75,9 +76,21 @@ func main() {
 	defer bus.Close()
 	bhattiCli := bhatti.New(cfg.BhattiURL, cfg.BhattiToken)
 
+	// SQLite-backed persistence. Karkhana is amnesic without
+	// this — missions / agents / events all live in this DB and
+	// the in-memory maps are write-through caches.
+	db, err := store.Open(cfg.DBPath)
+	if err != nil {
+		slog.Error("store open failed", "path", cfg.DBPath, "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	slog.Info("store opened", "path", cfg.DBPath)
+
 	state := &serverState{
 		bus:               bus,
 		bhatti:            bhattiCli,
+		store:             db,
 		missions:          map[string]*mission.Mission{},
 		agents:            map[string]*mission.Agent{},
 		drivers:           map[string]driver.AgentDriver{},
@@ -90,6 +103,15 @@ func main() {
 		internalURL:       cfg.InternalURL,
 		driverTokens:      map[string]string{},
 		driverPendingAsk:  map[string]chan string{},
+	}
+
+	// Seed the event ID counter from the persisted max so newly
+	// published events keep monotonically increasing without
+	// colliding with replayed history.
+	if maxID, err := db.MaxEventID(context.Background()); err == nil {
+		state.eventID = maxID
+	} else {
+		slog.Warn("max event id read failed (non-fatal)", "err", err)
 	}
 	if len(cfg.PiExtensions) > 0 {
 		slog.Info("pi extensions enabled",
@@ -113,9 +135,12 @@ func main() {
 	cancelSmoke()
 	slog.Info("bhatti connection ok")
 
-	// Recover any sandboxes we own but lost track of (Karkhana
-	// restart, or the operator hit Cmd+R in the browser).
-	go state.recoverFromBhatti()
+	// Hydrate from store + reattach to running agents.
+	// recoverFromStore replaces v0.5's bhatti-scan-only recovery:
+	// it reads missions/agents/events from SQLite, rebuilds the
+	// caches, and re-spawns drivers / re-attaches workers for
+	// anything still status='running'.
+	go state.recoverFromStore()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +150,7 @@ func main() {
 	mux.HandleFunc("/api/missions/", state.handleMissionByID)
 	mux.HandleFunc("/api/agents", state.handleAgents)
 	mux.HandleFunc("/api/agents/", state.handleAgentByID)
-	mux.HandleFunc("/api/events", canvas.EventStreamHandler(bus))
+	mux.HandleFunc("/api/events", canvas.EventStreamHandler(bus, state))
 	mux.HandleFunc("/proxy/", kasmproxy.Handler("/proxy/", state))
 	// Driver-tool callbacks. Authed via per-driver bearer
 	// tokens minted at driver-spawn time. Bound to localhost
@@ -162,6 +187,7 @@ type serverState struct {
 	mu       sync.Mutex
 	bus      *eventbus.Bus
 	bhatti   *bhatti.Client
+	store    *store.Store
 	missions map[string]*mission.Mission
 	agents   map[string]*mission.Agent
 	drivers  map[string]driver.AgentDriver // keyed by agentID
@@ -210,6 +236,12 @@ func (s *serverState) nextEventID() int64 {
 
 type createMissionReq struct {
 	Goal string `json:"goal"`
+	// Canvas coordinates of the right-click that dispatched this
+	// mission, in canvas-flow space. When set, the mission's
+	// driver tile spawns at this point and the position
+	// persists across Karkhana restarts. Optional.
+	CanvasX *float64 `json:"canvas_x,omitempty"`
+	CanvasY *float64 `json:"canvas_y,omitempty"`
 }
 
 func (s *serverState) handleMissions(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +276,7 @@ func (s *serverState) handleMissions(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.missions[m.ID] = m
 		s.mu.Unlock()
+		s.persistMission(m)
 
 		s.publish(mission.Event{
 			ID:        s.nextEventID(),
@@ -253,7 +286,9 @@ func (s *serverState) handleMissions(w http.ResponseWriter, r *http.Request) {
 			Ts:        time.Now(),
 		})
 
-		go s.runMission(m)
+		// Pass the right-click canvas coords to runMission so the
+		// driver agent's canvas_x/y get set on creation.
+		go s.runMission(m, req.CanvasX, req.CanvasY)
 		writeJSON(w, 201, m)
 
 	default:
@@ -313,6 +348,19 @@ func (s *serverState) deleteMission(m *mission.Mission) {
 		}
 	}
 	s.mu.Unlock()
+
+	// Remove from store. The DB has FK ON DELETE CASCADE so
+	// agents + events for this mission go too. Run after the
+	// in-memory cleanup so we never have a row in s.agents
+	// that's been deleted from the DB.
+	if s.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.store.DeleteMission(ctx, m.ID); err != nil {
+			slog.Warn("mission DB delete failed",
+				"mission", m.ID, "err", err)
+		}
+		cancel()
+	}
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID,
@@ -384,10 +432,14 @@ func (s *serverState) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 // with it for the lifetime of the mission — v0.6: mission ==
 // driver tile == conversation.
 //
+// canvasX/Y come from the right-click coords if the operator
+// dispatched via the canvas; nil for programmatic dispatches.
+// They land on the driver agent's canvas_x/y and persist.
+//
 // Worker spawning is now a SEPARATE flow: spawnWorker(), called
 // from the /internal/driver/:id/spawn_worker HTTP handler when
 // the driver invokes its spawn_worker tool.
-func (s *serverState) runMission(m *mission.Mission) {
+func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) {
 	driverID := "agent_" + randHex(12)
 	token := randHex(32)
 
@@ -399,21 +451,36 @@ func (s *serverState) runMission(m *mission.Mission) {
 		Task:      m.Goal,
 		Status:    mission.StatusRunning,
 		StartedAt: time.Now(),
+		CanvasX:   canvasX,
+		CanvasY:   canvasY,
 	}
 	s.mu.Lock()
 	s.agents[driverID] = driverAgent
 	s.driverTokens[driverID] = token
 	m.DriverAgentID = driverID
 	s.mu.Unlock()
+	s.persistAgent(driverAgent)
+	if s.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = s.store.SetMissionDriver(ctx, m.ID, driverID)
+		cancel()
+	}
 
+	spawningPayload := map[string]any{
+		"role":  "driver",
+		"task":  m.Goal,
+		"stage": "spawning host pi process",
+	}
+	if canvasX != nil {
+		spawningPayload["canvas_x"] = *canvasX
+	}
+	if canvasY != nil {
+		spawningPayload["canvas_y"] = *canvasY
+	}
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
 		Kind: "agent.spawning", Ts: time.Now(),
-		Payload: map[string]any{
-			"role":  "driver",
-			"task":  m.Goal,
-			"stage": "spawning host pi process",
-		},
+		Payload: spawningPayload,
 	})
 
 	// Per-mission session dir for pi's JSONL.
@@ -525,6 +592,7 @@ func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, tas
 	s.mu.Lock()
 	s.agents[workerID] = worker
 	s.mu.Unlock()
+	s.persistAgent(worker)
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: workerID,
@@ -583,6 +651,7 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 	s.mu.Lock()
 	worker.BhattiSandboxID = sb.ID
 	s.mu.Unlock()
+	s.persistAgent(worker)
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: workerID,
@@ -615,6 +684,7 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 	worker.KasmVNCUser = user
 	worker.KasmVNCPass = pass
 	s.mu.Unlock()
+	s.persistAgent(worker)
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: workerID,
@@ -662,6 +732,7 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 	s.drivers[workerID] = drv
 	worker.BhattiSessionID = drv.SessionID()
 	s.mu.Unlock()
+	s.persistAgent(worker)
 
 	slog.Info("agent driver connected",
 		"agent", workerID, "session", drv.SessionID())
@@ -1196,6 +1267,10 @@ func (s *serverState) updateTokens(agentID string, usage map[string]any) {
 	} else if c := getf("cost"); c > a.CostUSD {
 		a.CostUSD = c
 	}
+	// Persist outside the lock so the SQLite call doesn't block
+	// other event handlers.
+	copyA := *a
+	defer func() { go s.persistAgent(&copyA) }()
 }
 
 func getfMap(m map[string]any, k string) float64 {
@@ -1223,6 +1298,7 @@ func (s *serverState) markWorkerCompleted(missionID, workerID string) {
 		delete(s.drivers, workerID)
 	}
 	s.mu.Unlock()
+	s.persistAgent(w)
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: missionID, AgentID: workerID,
@@ -1281,6 +1357,7 @@ func (s *serverState) terminateAgent(a *mission.Agent) {
 	a.Outcome = "terminated_by_operator"
 	a.TerminatedAt = &now
 	s.mu.Unlock()
+	s.persistAgent(a)
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: a.MissionID, AgentID: a.ID,
 		Kind: "agent.terminated", Ts: time.Now(),
@@ -1296,6 +1373,7 @@ func (s *serverState) failWorker(m *mission.Mission, worker *mission.Agent, reas
 	worker.FinalAssistantText = reason
 	worker.TerminatedAt = &now
 	s.mu.Unlock()
+	s.persistAgent(worker)
 	slog.Warn("worker failed",
 		"mission", m.ID, "agent", worker.ID, "reason", reason)
 	s.publish(mission.Event{
@@ -1306,107 +1384,304 @@ func (s *serverState) failWorker(m *mission.Mission, worker *mission.Agent, reas
 }
 
 // --- recovery ---
-
-// recoverFromBhatti scans existing bhatti sandboxes and rebuilds
-// the Karkhana state for any tagged with our metadata. Useful
-// when Karkhana restarts mid-mission. We do NOT re-attach the
-// pi-rpc driver here; that's a future enhancement (the bhatti
-// session reattach pattern from `Karkhana.AgentRPC`).
-func (s *serverState) recoverFromBhatti() {
+//
+// recoverFromStore is the v0.6 startup path. It hydrates the
+// in-memory caches from SQLite, then re-spawns drivers and
+// re-attaches workers for any mission whose status is still
+// 'running'.
+//
+// Order of work:
+//
+//   1. Read all missions + all agents from store → fill caches.
+//   2. For each running mission, kick off async recoverMission
+//      that handles its driver + workers.
+//   3. Driver recovery: re-spawn host pi with --continue and
+//      same --session-dir; pi reads the existing JSONL and
+//      keeps going. Mint a fresh driver token (old one dies
+//      with the old subprocess). Operator chat works again.
+//   4. Worker recovery: dial bhatti exec/ws WITH the stored
+//      session_id (no cmd-spec, no session_info handshake —
+//      we're attaching to an existing session, not creating).
+//      Worker pi process is unchanged; events resume streaming.
+//
+// If a sandbox is gone (operator deleted it manually), we mark
+// the worker failed instead of trying to attach. Same for a
+// driver session file that doesn't exist anymore.
+func (s *serverState) recoverFromStore() {
+	if s.store == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	sbs, err := s.bhatti.ListSandboxes(ctx)
+	missions, err := s.store.ListMissions(ctx)
 	if err != nil {
-		slog.Warn("recovery: list sandboxes failed", "err", err)
+		slog.Warn("recovery: list missions failed", "err", err)
 		return
 	}
-	recovered := 0
-	for _, sb := range sbs {
-		if !strings.HasPrefix(sb.Name, "kk-") {
-			continue
-		}
-		if sb.Status != "running" {
-			continue
-		}
-		// Reconstruct the agent ID from the sandbox name (last 8
-		// chars of agent_id were used as alias; we have to do a
-		// best effort here since metadata isn't returned in list).
-		// Use a synthetic ID; the operator can still see the tile.
-		workerID := "agent_recovered_" + sb.Name[3:]
-		missionID := "msn_recovered_" + sb.Name[3:]
-		now := time.Now()
+	agents, err := s.store.ListAllAgents(ctx)
+	if err != nil {
+		slog.Warn("recovery: list agents failed", "err", err)
+		return
+	}
 
+	s.mu.Lock()
+	for _, m := range missions {
+		s.missions[m.ID] = m
+	}
+	for _, a := range agents {
+		s.agents[a.ID] = a
+	}
+	s.mu.Unlock()
+
+	running := 0
+	for _, m := range missions {
+		if m.Status != mission.StatusRunning {
+			continue
+		}
+		running++
+		go s.recoverMission(m)
+	}
+	slog.Info("recovery: hydrated from store",
+		"missions", len(missions),
+		"agents", len(agents),
+		"running_missions", running)
+}
+
+// recoverMission re-spawns the driver and re-attaches workers
+// for one mission. Called per running mission from
+// recoverFromStore.
+func (s *serverState) recoverMission(m *mission.Mission) {
+	s.mu.Lock()
+	var driverAgent *mission.Agent
+	var workerAgents []*mission.Agent
+	if m.DriverAgentID != "" {
+		driverAgent = s.agents[m.DriverAgentID]
+	}
+	for _, a := range s.agents {
+		if a.MissionID != m.ID || a.Role != mission.RoleWorker {
+			continue
+		}
+		workerAgents = append(workerAgents, a)
+	}
+	s.mu.Unlock()
+
+	if driverAgent != nil && driverAgent.Status == mission.StatusRunning {
+		s.recoverDriver(m, driverAgent)
+	}
+	for _, w := range workerAgents {
+		if w.Status != mission.StatusRunning {
+			continue
+		}
+		go s.recoverWorker(m, w)
+	}
+}
+
+// recoverDriver re-spawns a host pi process for the mission's
+// driver agent, using pi's --continue flag against the same
+// --session-dir so the conversation history is preserved.
+func (s *serverState) recoverDriver(m *mission.Mission, d *mission.Agent) {
+	sessDir := filepath.Join(s.driverSessionRoot, m.ID)
+	if _, err := os.Stat(sessDir); err != nil {
+		slog.Warn("recovery: driver session dir missing; marking driver failed",
+			"mission", m.ID, "agent", d.ID, "sess_dir", sessDir)
+		s.failWorker(m, d, "driver session dir missing on restart")
+		return
+	}
+
+	token := randHex(32)
+	s.mu.Lock()
+	s.driverTokens[d.ID] = token
+	s.mu.Unlock()
+
+	// pi --continue resumes the most recent session in --session-dir.
+	argv := []string{
+		"pi", "--mode", "rpc",
+		"--session-dir", sessDir,
+		"--continue",
+	}
+	if s.piProvider != "" {
+		argv = append(argv, "--provider", s.piProvider)
+	}
+	if s.piModel != "" {
+		argv = append(argv, "--model", s.piModel)
+	}
+	if s.driverToolsPath != "" {
+		argv = append(argv, "--extension", s.driverToolsPath)
+	}
+	env := s.piEnvFromHost()
+	env["KARKHANA_INTERNAL_URL"] = s.internalURL
+	env["KARKHANA_DRIVER_TOKEN"] = token
+	env["KARKHANA_DRIVER_ID"] = d.ID
+
+	ctx := context.Background()
+	drv, err := driver.ConnectHost(ctx, driver.HostOptions{
+		Argv:      argv,
+		Env:       env,
+		SessionID: "host-" + m.ID,
+		OnEvent: func(ev driver.Event) {
+			s.forwardPiEvent(m.ID, d.ID, ev)
+		},
+		OnDisconnect: func(err error) {
+			s.handleDriverDisconnect(m.ID, d.ID, err)
+		},
+	})
+	if err != nil {
+		slog.Warn("recovery: driver respawn failed",
+			"mission", m.ID, "agent", d.ID, "err", err)
+		s.failWorker(m, d, "driver respawn failed: "+err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.drivers[d.ID] = drv
+	s.mu.Unlock()
+
+	slog.Info("recovery: driver re-spawned",
+		"mission", m.ID, "agent", d.ID, "sess_dir", sessDir)
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: d.ID,
+		Kind: "agent.driver_connected", Ts: time.Now(),
+		Payload: map[string]any{
+			"session_id": drv.SessionID(),
+			"recovered":  true,
+		},
+	})
+}
+
+// recoverWorker re-attaches to a running worker's pi-rpc session
+// inside its bhatti sandbox, by passing the stored session_id
+// to bhatti's exec/ws (no cmd spec sent; we're attaching to an
+// existing piped session, not spawning a new one).
+func (s *serverState) recoverWorker(m *mission.Mission, w *mission.Agent) {
+	if w.BhattiSandboxID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Verify the sandbox still exists. Operators can manually
+	// delete sandboxes via the bhatti CLI; if so, the worker is
+	// gone and we mark it failed.
+	sb, err := s.bhatti.GetSandbox(ctx, w.BhattiSandboxID)
+	if err != nil || sb == nil {
+		slog.Info("recovery: worker sandbox gone; marking failed",
+			"agent", w.ID, "sandbox", w.BhattiSandboxID, "err", err)
+		s.failWorker(m, w, "sandbox no longer exists")
+		return
+	}
+	if sb.Status != "running" {
+		slog.Info("recovery: worker sandbox not running; marking failed",
+			"agent", w.ID, "sandbox", w.BhattiSandboxID, "status", sb.Status)
+		s.failWorker(m, w, "sandbox status: "+sb.Status)
+		return
+	}
+
+	sessionID := w.BhattiSessionID
+	if sessionID == "" {
+		// Without a session ID we can't attach. Look up the
+		// sandbox's sessions; if there's a single pi-rpc one,
+		// adopt its ID.
+		sessions, err := s.bhatti.ListSessions(ctx, w.BhattiSandboxID)
+		if err != nil {
+			slog.Warn("recovery: list sessions failed", "agent", w.ID, "err", err)
+			s.failWorker(m, w, "list sessions failed: "+err.Error())
+			return
+		}
+		for _, ses := range sessions {
+			if !ses.Running {
+				continue
+			}
+			joined := strings.Join(ses.Argv, " ")
+			if strings.Contains(joined, "pi") {
+				sessionID = ses.SessionID
+				break
+			}
+		}
+		if sessionID == "" {
+			slog.Info("recovery: no live pi session in worker sandbox",
+				"agent", w.ID, "sandbox", w.BhattiSandboxID)
+			s.failWorker(m, w, "no live pi session")
+			return
+		}
 		s.mu.Lock()
-		if _, exists := s.agents[workerID]; exists {
-			s.mu.Unlock()
-			continue
-		}
-		s.missions[missionID] = &mission.Mission{
-			ID:        missionID,
-			Goal:      "(recovered) " + sb.Name,
-			Status:    mission.StatusRunning,
-			CreatedBy: "recovery",
-			CreatedAt: sb.CreatedAt,
-		}
-		s.agents[workerID] = &mission.Agent{
-			ID:               workerID,
-			MissionID:        missionID,
-			Role:             mission.RoleWorker,
-			SpawnKind:        mission.SpawnSpawn,
-			Task:             "(recovered: original task lost)",
-			Recipe:           "computer-use",
-			BhattiSandboxID:  sb.ID,
-			KasmVNCProxyPath: "/proxy/" + workerID + "/",
-			Status:           mission.StatusRunning,
-			StartedAt:        sb.CreatedAt,
-		}
+		w.BhattiSessionID = sessionID
 		s.mu.Unlock()
-
-		// Fetch creds for the proxy to work
-		go func(workerID, sbID string, sb bhatti.Sandbox) {
-			fctx, fcancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer fcancel()
-			user, pass, err := s.fetchKasmCreds(fctx, sbID)
-			if err != nil {
-				slog.Warn("recovery: vnc-creds failed", "agent", workerID, "err", err)
-				return
-			}
-			kasmURL := ""
-			if len(sb.URLs) > 0 {
-				kasmURL = sb.URLs[0]
-			}
-			s.mu.Lock()
-			if a, ok := s.agents[workerID]; ok {
-				a.KasmVNCURL = kasmURL
-				a.KasmVNCUser = user
-				a.KasmVNCPass = pass
-			}
-			s.mu.Unlock()
-			s.publish(mission.Event{
-				ID: s.nextEventID(), MissionID: "msn_recovered_" + sb.Name[3:], AgentID: workerID,
-				Kind: "agent.spawned", Ts: now,
-				Payload: map[string]any{
-					"role":             "worker",
-					"task":             "(recovered)",
-					"sandbox_id":       sbID,
-					"kasmvnc_url":      "/proxy/" + workerID + "/",
-					"kasmvnc_upstream": kasmURL,
-				},
-			})
-		}(workerID, sb.ID, sb)
-
-		recovered++
+		s.persistAgent(w)
 	}
-	if recovered > 0 {
-		slog.Info("recovery: rebuilt agents from bhatti", "count", recovered)
+
+	drv, err := driver.AttachBhatti(ctx, s.bhatti, w.BhattiSandboxID, sessionID, driver.Options{
+		OnEvent: func(ev driver.Event) {
+			s.forwardPiEvent(m.ID, w.ID, ev)
+		},
+		OnDisconnect: func(err error) {
+			s.handleDriverDisconnect(m.ID, w.ID, err)
+		},
+	})
+	if err != nil {
+		slog.Warn("recovery: worker reattach failed",
+			"agent", w.ID, "session", sessionID, "err", err)
+		s.failWorker(m, w, "worker reattach failed: "+err.Error())
+		return
 	}
+	s.mu.Lock()
+	s.drivers[w.ID] = drv
+	s.mu.Unlock()
+
+	slog.Info("recovery: worker re-attached",
+		"agent", w.ID, "sandbox", w.BhattiSandboxID, "session", sessionID)
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: w.ID,
+		Kind: "agent.driver_connected", Ts: time.Now(),
+		Payload: map[string]any{
+			"session_id": sessionID,
+			"recovered":  true,
+		},
+	})
 }
 
 // --- helpers ---
 
+// publish sends the event to the in-memory bus (which fans to
+// connected canvas WS clients) AND persists it to SQLite. The
+// store write is best-effort; failures are logged but don't
+// block fan-out (the canvas is the user-visible thing).
 func (s *serverState) publish(e mission.Event) {
 	s.bus.Publish(e)
+	if s.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.store.AppendEvent(ctx, e); err != nil {
+			slog.Warn("event persist failed",
+				"kind", e.Kind, "agent", e.AgentID, "err", err)
+		}
+	}
+}
+
+// persistMission writes the mission record to SQLite. Called on
+// create + every status change. Best-effort; logs on failure.
+func (s *serverState) persistMission(m *mission.Mission) {
+	if s.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.store.CreateMission(ctx, m); err != nil {
+		slog.Warn("mission persist failed", "mission", m.ID, "err", err)
+	}
+}
+
+// persistAgent writes one agent's current state to SQLite. Called
+// on every meaningful state change (sandbox created, kasmvnc
+// published, status flipped, terminated, costs updated, etc.).
+func (s *serverState) persistAgent(a *mission.Agent) {
+	if s.store == nil || a == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.store.UpsertAgent(ctx, a); err != nil {
+		slog.Warn("agent persist failed", "agent", a.ID, "err", err)
+	}
 }
 
 // --- internal driver-tool callbacks ---
@@ -1645,6 +1920,7 @@ func (s *serverState) handleToolFinish(w http.ResponseWriter, r *http.Request, d
 	s.mu.Lock()
 	driverAgent.FinalAssistantText = body.Result
 	s.mu.Unlock()
+	s.persistAgent(driverAgent)
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
 		Kind: "driver.finish", Ts: time.Now(),
@@ -1740,6 +2016,41 @@ func (s *serverState) handleAgentPrompt(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ReplayEvents implements canvas.Replayer — returns every event
+// across every running mission so a freshly-connected canvas
+// client sees the full conversation history of every active
+// driver / worker. Closed missions' events aren't replayed; the
+// operator can scroll the missions list later if we add an
+// archive view.
+func (s *serverState) ReplayEvents() ([]mission.Event, error) {
+	if s.store == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.mu.Lock()
+	missionIDs := make([]string, 0, len(s.missions))
+	for id, m := range s.missions {
+		if m.Status != mission.StatusRunning {
+			continue
+		}
+		missionIDs = append(missionIDs, id)
+	}
+	s.mu.Unlock()
+
+	var all []mission.Event
+	for _, mid := range missionIDs {
+		evs, err := s.store.AllEventsForMission(ctx, mid)
+		if err != nil {
+			slog.Warn("replay events for mission failed",
+				"mission", mid, "err", err)
+			continue
+		}
+		all = append(all, evs...)
+	}
+	return all, nil
 }
 
 // Resolve implements kasmproxy.Resolver — returns the upstream URL

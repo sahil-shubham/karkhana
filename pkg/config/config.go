@@ -59,6 +59,12 @@ type Config struct {
 	// listen on. Override for non-default ports.
 	InternalURL string
 
+	// DBPath is the SQLite database file. Holds missions,
+	// agents, events. WAL-mode, single-host. Default:
+	// "./karkhana.db". Set KARKHANA_DB_PATH to override.
+	// `:memory:` opts out of persistence (useful for tests).
+	DBPath string
+
 	// Pi (worker agent) provider config. If unset, we auto-detect
 	// from whichever API key is present in the env.
 	PiProvider string // e.g. "openrouter" | "anthropic" | "openai"
@@ -140,6 +146,7 @@ func Load() (*Config, error) {
 		"/tmp/karkhana-driver-sessions",
 	)
 	cfg.InternalURL = envOr("KARKHANA_INTERNAL_URL", "http://localhost"+cfg.Addr)
+	cfg.DBPath = envOr("KARKHANA_DB_PATH", "karkhana.db")
 
 	// Pi extensions. Explicit env var (KARKHANA_PI_EXTENSIONS,
 	// comma-separated) wins. Otherwise: empty for the vanilla

@@ -16,10 +16,20 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  createMission: (goal: string) =>
+  // Optional canvas_x / canvas_y come from the right-click drop
+  // point. The backend stores them on the driver agent so the
+  // mission tile lands at that point on the next page-load.
+  createMission: (
+    goal: string,
+    origin?: { x: number; y: number },
+  ) =>
     jsonFetch<Mission>("/api/missions", {
       method: "POST",
-      body: JSON.stringify({ goal }),
+      body: JSON.stringify({
+        goal,
+        canvas_x: origin?.x,
+        canvas_y: origin?.y,
+      }),
     }),
 
   listMissions: () => jsonFetch<Mission[]>("/api/missions"),

@@ -56,14 +56,10 @@ export default function App() {
     flowY: number;
   } | null>(null);
 
-  // Per-mission canvas origin. When the operator dispatches via
-  // right-click, we remember WHERE they clicked so the mission's
-  // driver tile lands there. Missions without an entry (e.g.
-  // recovered ones) auto-position. In-memory only for v0.6;
-  // moves to the persistence layer later.
-  const [missionOrigins, setMissionOrigins] = useState<
-    Map<string, { x: number; y: number }>
-  >(new Map());
+  // v0.6 persistence: canvas position lives on the driver agent
+  // (canvas_x / canvas_y). The backend stores it; the WS event
+  // for agent.spawning carries it; Canvas reads it off the agent
+  // record. We don't need a client-side Map anymore.
 
   // ---- WS subscription ----
   useEffect(() => {
@@ -108,6 +104,8 @@ export default function App() {
             const sandboxID = event.payload?.sandbox_id as string | undefined;
 
             if (event.kind === "agent.spawning" && !existing) {
+              const cx = event.payload?.canvas_x;
+              const cy = event.payload?.canvas_y;
               next.set(agentID, {
                 id: agentID,
                 mission_id: event.mission_id,
@@ -122,6 +120,8 @@ export default function App() {
                 tokens_output: 0,
                 cost_usd: 0,
                 started_at: event.ts,
+                canvas_x: typeof cx === "number" ? cx : undefined,
+                canvas_y: typeof cy === "number" ? cy : undefined,
               });
             } else if (event.kind === "agent.spawned") {
               const base = existing ?? {
@@ -174,13 +174,27 @@ export default function App() {
           });
         }
 
-        // append to per-agent event log
+        // append to per-agent event log. Dedup by event.id
+        // because the WS sends a replay batch on connect (post-
+        // restart hydration) and live events may overlap with
+        // the replayed snapshot. See pkg/canvas/ws.go.
         if (event.agent_id) {
           setEventsByAgent((cur) => {
             const next = new Map(cur);
             const arr = next.get(event.agent_id!) ?? [];
-            const trimmed = [...arr, event].slice(-200);
-            next.set(event.agent_id!, trimmed);
+            if (arr.some((e) => e.id === event.id)) return cur;
+            // Insert in id order; events arrive monotonically
+            // most of the time so a simple append is fine, but
+            // be defensive: sort if a tail event arrives out of
+            // order.
+            const merged = [...arr, event];
+            if (
+              merged.length >= 2 &&
+              merged[merged.length - 1].id < merged[merged.length - 2].id
+            ) {
+              merged.sort((a, b) => a.id - b.id);
+            }
+            next.set(event.agent_id!, merged.slice(-200));
             return next;
           });
         }
@@ -226,15 +240,8 @@ export default function App() {
   const handleCreateMission = useCallback(
     async (goal: string, origin?: { x: number; y: number }) => {
       try {
-        const m = await api.createMission(goal);
+        const m = await api.createMission(goal, origin);
         setMissions((ms) => [m, ...ms.filter((x) => x.id !== m.id)]);
-        if (origin) {
-          setMissionOrigins((prev) => {
-            const next = new Map(prev);
-            next.set(m.id, origin);
-            return next;
-          });
-        }
       } catch (e) {
         console.error("createMission failed", e);
       }
@@ -279,12 +286,6 @@ export default function App() {
           next.forEach((a, aid) => {
             if (a.mission_id === id) next.delete(aid);
           });
-          return next;
-        });
-        setMissionOrigins((prev) => {
-          if (!prev.has(id)) return prev;
-          const next = new Map(prev);
-          next.delete(id);
           return next;
         });
       } catch (e) {
@@ -384,7 +385,6 @@ export default function App() {
           agents={agents}
           missions={missions}
           eventsByAgent={eventsByAgent}
-          missionOrigins={missionOrigins}
           onTerminateAgent={handleTerminateAgent}
           onDeleteMission={handleDeleteMission}
           onPaneContextMenu={handlePaneContextMenu}

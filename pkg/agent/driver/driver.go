@@ -233,6 +233,45 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 	return d, nil
 }
 
+// AttachBhatti reattaches to an EXISTING pi-rpc session inside a
+// bhatti sandbox by session_id. Used by the recovery flow on
+// Karkhana startup: the worker pi process is still alive in its
+// sandbox; we just need to wire up our WS again and pick up the
+// event stream from where it is.
+//
+// Differs from Connect in two ways:
+//   1. NO command spec on the first frame (we're not spawning a
+//      new session, attaching to an existing one).
+//   2. NO session_info handshake to wait for (bhatti doesn't
+//      send one when the WS attaches to an existing session).
+//
+// We also don't re-send set_auto_compaction / set_auto_retry
+// since they were set on initial Connect and pi remembers.
+func AttachBhatti(ctx context.Context, b *bhatti.Client, sandboxID, sessionID string, opts Options) (*Driver, error) {
+	if sessionID == "" {
+		return nil, errors.New("AttachBhatti: empty session_id")
+	}
+	wsTx, err := dialBhattiSessionWS(ctx, b.BaseURL, b.APIKey, sandboxID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	d := &Driver{
+		sandboxID:    sandboxID,
+		bhatti:       b,
+		tx:           wsTx,
+		doneCh:       make(chan struct{}),
+		onEvent:      opts.OnEvent,
+		onDisconnect: opts.OnDisconnect,
+	}
+	d.sessionID.Store(sessionID)
+	// Optimistic: if pi was streaming when Karkhana died, it's
+	// likely still streaming now. The next agent_end will flip
+	// this back to false. AwaitCompletion is safe either way.
+	d.isStreaming.Store(true)
+	go d.readLoop()
+	return d, nil
+}
+
 // SessionID returns the bhatti session ID this driver is bound to.
 func (d *Driver) SessionID() string {
 	if v, ok := d.sessionID.Load().(string); ok {
