@@ -76,6 +76,29 @@ const COL_GAP = 64;
 const ROW_GAP = 140;
 // Horizontal gap BETWEEN missions on the canvas (lane separator).
 const MISSION_GAP = 320;
+// Maximum columns when laying out workers as a grid. With 4
+// columns the bounding box stays under ~5500px wide for the
+// common N=8 case, which fits at ~25% zoom on a typical
+// monitor. We could go to 5+ but the operator generally wants
+// to scan workers at readable size, not as thumbnails.
+const WORKER_GRID_MAX_COLS = 4;
+
+// gridLayout decides how to arrange N worker tiles. Up to 3 in
+// a single row (the common cases stay flat); 4+ get squared
+// into a grid using ceil(sqrt(N)) columns capped at
+// WORKER_GRID_MAX_COLS. Returns (cols, rows).
+//
+//   N=1 → 1×1      N=4 → 2×2      N=9 → 3×3
+//   N=2 → 2×1      N=6 → 3×2      N=12 → 4×3
+//   N=3 → 3×1      N=8 → 3×3      N=16 → 4×4
+function gridLayout(n: number): { cols: number; rows: number } {
+  if (n <= 0) return { cols: 0, rows: 0 };
+  if (n <= 3) return { cols: n, rows: 1 };
+  const sq = Math.ceil(Math.sqrt(n));
+  const cols = Math.min(WORKER_GRID_MAX_COLS, sq);
+  const rows = Math.ceil(n / cols);
+  return { cols, rows };
+}
 
 export function Canvas({
   agents,
@@ -439,38 +462,52 @@ function layoutMissionLane(
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
+  // Pre-compute the mission-cumulative cost + worker counts so
+  // the driver tile can surface the rollup in its header.
+  // (Loop-invariant; pull out of the depth loop.)
+  const missionCostUSD = missionAgents.reduce(
+    (sum, a) => sum + (a.cost_usd ?? 0),
+    0,
+  );
+  const missionWorkers = (() => {
+    let running = 0;
+    let total = 0;
+    for (const a of missionAgents) {
+      if (a.role !== "worker") continue;
+      total += 1;
+      if (a.status === "running") running += 1;
+    }
+    return { running, total };
+  })();
+
   for (const d of sortedDepths) {
     const row = rows.get(d)!;
-    const y = yByDepth.get(d)!;
+    const y0 = yByDepth.get(d)!;
     const tileW = rowTileW(row);
-    const rowW = row.length * tileW + (row.length - 1) * COL_GAP;
-    let cursorX = laneCenterX - rowW / 2;
+    const isWorkerRow = row.length > 0 && row[0].role === "worker";
+    // Worker rows fan out as a grid (cols capped at
+    // WORKER_GRID_MAX_COLS); other rows stay flat.
+    const grid = isWorkerRow
+      ? gridLayout(row.length)
+      : { cols: row.length, rows: 1 };
+    const gridRowW = grid.cols * tileW + (grid.cols - 1) * COL_GAP;
+    const startX = laneCenterX - gridRowW / 2;
 
-    // Pre-compute the mission-cumulative cost + worker counts
-    // so the driver tile can surface the rollup in its header.
-    // Operators want "this whole mission cost $X", not "the
-    // driver's own LLM call cost $0.04".
-    const missionCostUSD = missionAgents.reduce(
-      (sum, a) => sum + (a.cost_usd ?? 0),
-      0,
-    );
-    const missionWorkers = (() => {
-      let running = 0;
-      let total = 0;
-      for (const a of missionAgents) {
-        if (a.role !== "worker") continue;
-        total += 1;
-        if (a.status === "running") running += 1;
-      }
-      return { running, total };
-    })();
-
+    let i = 0;
     for (const agent of row) {
       const isMissionRoot =
         !agent.parent_agent_id || !byID.has(agent.parent_agent_id);
       const isDriver = agent.role === "driver";
       const tH = isDriver ? DRIVER_H_DEFAULT : TILE_H_DEFAULT;
       const tW = isDriver ? DRIVER_W_DEFAULT : TILE_W_DEFAULT;
+
+      // Grid cell coords. Driver row is always 1×1; worker
+      // rows wrap every `grid.cols` tiles into the next
+      // grid-row. Cells are top-left-anchored within the row.
+      const col = i % grid.cols;
+      const gridRow = Math.floor(i / grid.cols);
+      const cursorX = startX + col * (tW + COL_GAP);
+      const y = y0 + gridRow * (tH + ROW_GAP);
 
       const data = {
         agent,
@@ -509,7 +546,7 @@ function layoutMissionLane(
         data,
       });
 
-      cursorX += tW + COL_GAP;
+      i++;
     }
   }
 
