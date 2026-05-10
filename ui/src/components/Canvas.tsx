@@ -24,58 +24,77 @@ import {
   type NodeTypes,
   useEdgesState,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { AgentTile, type AgentTileData } from "./AgentTile";
-import { AgentLogTile } from "./AgentLogTile";
 import type { Agent, KEvent, Mission } from "../lib/types";
 
+// v0.6 iteration: workers used to have a separate AgentLogTile
+// connected by a dashed view-edge. Merged into the main tile so
+// each worker is one bounded box (desktop on top, log below).
 const nodeTypes: NodeTypes = {
   agent: AgentTile,
-  agentLog: AgentLogTile,
 };
 
 interface Props {
   agents: Map<string, Agent>;
   missions: Mission[];
   eventsByAgent: Map<string, KEvent[]>;
+  // Per-mission canvas-coordinate origin. When set, the mission's
+  // lane is centered around this point; missing entries fall back
+  // to the auto-layout (next free X-column at Y=0).
+  missionOrigins: Map<string, { x: number; y: number }>;
   onTerminateAgent?: (agentID: string) => void;
   onDeleteMission?: (missionID: string) => void;
-  onPaneContextMenu?: (event: React.MouseEvent | MouseEvent) => void;
+  // Called on right-click. The handler receives both screen coords
+  // (for popover positioning) and the canvas-coordinate point
+  // (for mission origin). screenToFlowPosition is converted here
+  // because Canvas is inside the ReactFlowProvider.
+  onPaneContextMenu?: (
+    event: React.MouseEvent | MouseEvent,
+    flowPos: { x: number; y: number },
+  ) => void;
+  onPrompt?: (agentID: string, text: string) => Promise<void>;
 }
 
-// Tile dimensions. Worker desktops render KasmVNC at native 1:1
-// (KasmVNC's bhatti config is `Xkasmvnc :99 -geometry 1280x720`).
-const DESKTOP_PX_W = 1280;
-const DESKTOP_PX_H = 720;
+// Tile dimensions. Worker tile holds both the desktop iframe
+// (top, KasmVNC native 1280x720) AND the event log (bottom),
+// so default height = header + iframe + log split (~60/40).
 const HEADER_PX = 32;
-const TILE_W_DEFAULT = DESKTOP_PX_W;
-const TILE_H_DEFAULT = DESKTOP_PX_H + HEADER_PX;
-const LOG_W_DEFAULT = TILE_W_DEFAULT;
-const LOG_H_DEFAULT = 480;
-// Vertical gap between a worker and its paired log tile.
-const PAIR_GAP_Y = 28;
+const TILE_W_DEFAULT = 1280;
+// 720 (iframe) + 32 (header) + 480 (log) = 1232. Operator can
+// resize via NodeResizer; iframe and log share the body via
+// flex 3:2 so they scale proportionally.
+const TILE_H_DEFAULT = 720 + HEADER_PX + 480;
+// Driver tile is chat-shaped — narrower than worker, but tall
+// enough that operator + driver messages have room to breathe
+// without scrolling for typical 2-3 turn missions. Operator
+// can resize via NodeResizer.
+const DRIVER_W_DEFAULT = 720;
+const DRIVER_H_DEFAULT = 600;
 // Horizontal gap between sibling tiles within a row of one mission.
 const COL_GAP = 64;
 // Vertical gap between depth rows within one mission.
 const ROW_GAP = 140;
 // Horizontal gap BETWEEN missions on the canvas (lane separator).
-// Big enough that a mission with one worker doesn't visually merge
-// with its neighbour.
 const MISSION_GAP = 320;
 
 export function Canvas({
   agents,
   missions,
   eventsByAgent,
+  missionOrigins,
   onTerminateAgent,
   onDeleteMission,
   onPaneContextMenu,
+  onPrompt,
 }: Props) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [focusedID, setFocusedID] = useState<string | null>(null);
+  const rf = useReactFlow();
 
   const desired = useMemo(
     () =>
@@ -83,18 +102,22 @@ export function Canvas({
         agents,
         missions,
         eventsByAgent,
+        missionOrigins,
         focusedID,
         setFocusedID,
         onTerminateAgent,
         onDeleteMission,
+        onPrompt,
       ),
     [
       agents,
       missions,
       eventsByAgent,
+      missionOrigins,
       focusedID,
       onTerminateAgent,
       onDeleteMission,
+      onPrompt,
     ],
   );
 
@@ -122,6 +145,22 @@ export function Canvas({
     [onNodesChange],
   );
 
+  // Translate the right-click's screen coords to canvas
+  // coordinates so the new mission can land where the operator
+  // clicked. screenToFlowPosition accounts for current viewport
+  // pan + zoom.
+  const handlePaneContextMenu = useCallback(
+    (event: React.MouseEvent | MouseEvent) => {
+      if (!onPaneContextMenu) return;
+      const flowPos = rf.screenToFlowPosition({
+        x: event.clientX,
+        y: event.clientY,
+      });
+      onPaneContextMenu(event, flowPos);
+    },
+    [onPaneContextMenu, rf],
+  );
+
   return (
     <div style={{ width: "100%", height: "100%" }}>
       <ReactFlow
@@ -130,7 +169,7 @@ export function Canvas({
         nodeTypes={nodeTypes}
         onNodesChange={handleNodesChange}
         onEdgesChange={onEdgesChange}
-        onPaneContextMenu={onPaneContextMenu}
+        onPaneContextMenu={handlePaneContextMenu}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         minZoom={0.05}
@@ -175,10 +214,12 @@ function buildGraph(
   agents: Map<string, Agent>,
   missions: Mission[],
   eventsByAgent: Map<string, KEvent[]>,
+  missionOrigins: Map<string, { x: number; y: number }>,
   focusedID: string | null,
   setFocusedID: (id: string) => void,
   onTerminateAgent?: (agentID: string) => void,
   onDeleteMission?: (missionID: string) => void,
+  onPrompt?: (agentID: string, text: string) => Promise<void>,
 ): { nodes: Node[]; edges: Edge[] } {
   if (agents.size === 0) return { nodes: [], edges: [] };
 
@@ -216,14 +257,45 @@ function buildGraph(
 
   const nodes: Node[] = [];
   const edges: Edge[] = [];
-  let cursorX = 0;
+
+  // Two-pass layout. Missions with an explicit origin (right-
+  // click coords) land where the operator clicked; missions
+  // without one (programmatic dispatches, recovered missions)
+  // get auto-positioned in next-free-column order. We pre-
+  // compute auto-positioned cursor accounting for the rightmost
+  // edge of any origin'd missions to avoid overlap on first
+  // load.
+  let autoCursorX = 0;
+  // Find the rightmost edge of any origin'd mission so auto
+  // missions don't visually collide with them.
+  missionOrigins.forEach((pt) => {
+    // Conservative estimate: assume each mission is ~1.5 lane
+    // widths to reserve room. Operator can always drag to fix.
+    const rightEdge = pt.x + TILE_W_DEFAULT;
+    if (rightEdge > autoCursorX) autoCursorX = rightEdge + MISSION_GAP;
+  });
 
   for (const missionID of orderedMissionIDs) {
     const missionAgents = agentsByMission.get(missionID) ?? [];
+    const origin = missionOrigins.get(missionID);
 
-    // Per-mission depth-based row layout. Same algorithm as v0.5,
-    // just operating on this mission's agents only and placed
-    // inside the mission's lane (not centered around X=0).
+    // Pre-compute lane width to know where to anchor the lane
+    // when origin'd. Layout function computes width again
+    // internally; cheap.
+    const laneW = computeLaneWidth(missionAgents);
+
+    let laneOriginX: number;
+    let laneOriginY: number;
+    if (origin) {
+      // Center the lane horizontally around the click point;
+      // anchor Y at click point (driver tile starts there).
+      laneOriginX = origin.x - laneW / 2;
+      laneOriginY = origin.y;
+    } else {
+      laneOriginX = autoCursorX;
+      laneOriginY = 0;
+    }
+
     const result = layoutMissionLane(
       missionID,
       missionAgents,
@@ -232,14 +304,63 @@ function buildGraph(
       setFocusedID,
       onTerminateAgent,
       onDeleteMission,
-      cursorX,
+      onPrompt,
+      laneOriginX,
+      laneOriginY,
     );
     nodes.push(...result.nodes);
     edges.push(...result.edges);
-    cursorX += result.laneWidth + MISSION_GAP;
+
+    if (!origin) {
+      autoCursorX += result.laneWidth + MISSION_GAP;
+    }
   }
 
   return { nodes, edges };
+}
+
+// computeLaneWidth predicts how wide a mission's lane will be
+// before laying it out, so origin'd missions can anchor their
+// driver tile at the click point. Mirrors the rowTileW logic in
+// layoutMissionLane.
+function computeLaneWidth(missionAgents: Agent[]): number {
+  if (missionAgents.length === 0) return TILE_W_DEFAULT;
+
+  const byID = new Map<string, Agent>();
+  missionAgents.forEach((a) => byID.set(a.id, a));
+
+  // Same depth computation as in layoutMissionLane.
+  const depth = new Map<string, number>();
+  const computeDepth = (id: string): number => {
+    if (depth.has(id)) return depth.get(id)!;
+    const a = byID.get(id);
+    if (!a || !a.parent_agent_id || !byID.has(a.parent_agent_id)) {
+      depth.set(id, 0);
+      return 0;
+    }
+    const d = 1 + computeDepth(a.parent_agent_id);
+    depth.set(id, d);
+    return d;
+  };
+  missionAgents.forEach((a) => computeDepth(a.id));
+
+  const rows = new Map<number, Agent[]>();
+  missionAgents.forEach((a) => {
+    const d = depth.get(a.id)!;
+    if (!rows.has(d)) rows.set(d, []);
+    rows.get(d)!.push(a);
+  });
+
+  let laneWidth = TILE_W_DEFAULT;
+  rows.forEach((row) => {
+    const tileW =
+      row.length > 0 && row[0].role === "driver"
+        ? DRIVER_W_DEFAULT
+        : TILE_W_DEFAULT;
+    const w = row.length * tileW + (row.length - 1) * COL_GAP;
+    if (w > laneWidth) laneWidth = w;
+  });
+  return laneWidth;
 }
 
 function layoutMissionLane(
@@ -250,7 +371,9 @@ function layoutMissionLane(
   setFocusedID: (id: string) => void,
   onTerminateAgent: ((agentID: string) => void) | undefined,
   onDeleteMission: ((missionID: string) => void) | undefined,
+  onPrompt: ((agentID: string, text: string) => Promise<void>) | undefined,
   laneOriginX: number,
+  laneOriginY: number,
 ): { nodes: Node[]; edges: Edge[]; laneWidth: number } {
   // Local agent map for parent-lookup convenience.
   const byID = new Map<string, Agent>();
@@ -282,27 +405,34 @@ function layoutMissionLane(
   }
 
   const sortedDepths = [...rows.keys()].sort((a, b) => a - b);
-  const rowHasWorker = (r: Agent[]) =>
-    r.some((a) => a.role === "worker");
 
-  // Compute Y for each depth, accounting for paired-log space.
+  // Compute Y for each depth. Driver rows are shorter
+  // (DRIVER_H_DEFAULT) than worker rows (TILE_H_DEFAULT,
+  // which now bundles desktop + log). Y is relative to
+  // laneOriginY so origin'd missions stack downward from the
+  // click point.
   const yByDepth = new Map<number, number>();
-  let yCursor = 0;
+  let yCursor = laneOriginY;
   for (const d of sortedDepths) {
     yByDepth.set(d, yCursor);
     const r = rows.get(d)!;
-    const rowH = rowHasWorker(r)
-      ? TILE_H_DEFAULT + PAIR_GAP_Y + LOG_H_DEFAULT
-      : TILE_H_DEFAULT;
+    const rowH =
+      r.length > 0 && r[0].role === "driver"
+        ? DRIVER_H_DEFAULT
+        : TILE_H_DEFAULT;
     yCursor += rowH + ROW_GAP;
   }
 
-  // Lane width = the widest row in this mission. We'll center each
-  // row inside this width.
+  // Lane width = the widest row in this mission. Each row's
+  // tile widths depend on whether the row holds the driver
+  // (DRIVER_W_DEFAULT, narrower) or workers (TILE_W_DEFAULT,
+  // 1280 wide for KasmVNC).
+  const rowTileW = (r: Agent[]) =>
+    r.length > 0 && r[0].role === "driver" ? DRIVER_W_DEFAULT : TILE_W_DEFAULT;
   let laneWidth = TILE_W_DEFAULT;
   for (const d of sortedDepths) {
     const row = rows.get(d)!;
-    const w = row.length * TILE_W_DEFAULT + (row.length - 1) * COL_GAP;
+    const w = row.length * rowTileW(row) + (row.length - 1) * COL_GAP;
     if (w > laneWidth) laneWidth = w;
   }
   const laneCenterX = laneOriginX + laneWidth / 2;
@@ -313,12 +443,36 @@ function layoutMissionLane(
   for (const d of sortedDepths) {
     const row = rows.get(d)!;
     const y = yByDepth.get(d)!;
-    const rowW = row.length * TILE_W_DEFAULT + (row.length - 1) * COL_GAP;
+    const tileW = rowTileW(row);
+    const rowW = row.length * tileW + (row.length - 1) * COL_GAP;
     let cursorX = laneCenterX - rowW / 2;
+
+    // Pre-compute the mission-cumulative cost + worker counts
+    // so the driver tile can surface the rollup in its header.
+    // Operators want "this whole mission cost $X", not "the
+    // driver's own LLM call cost $0.04".
+    const missionCostUSD = missionAgents.reduce(
+      (sum, a) => sum + (a.cost_usd ?? 0),
+      0,
+    );
+    const missionWorkers = (() => {
+      let running = 0;
+      let total = 0;
+      for (const a of missionAgents) {
+        if (a.role !== "worker") continue;
+        total += 1;
+        if (a.status === "running") running += 1;
+      }
+      return { running, total };
+    })();
 
     for (const agent of row) {
       const isMissionRoot =
         !agent.parent_agent_id || !byID.has(agent.parent_agent_id);
+      const isDriver = agent.role === "driver";
+      const tH = isDriver ? DRIVER_H_DEFAULT : TILE_H_DEFAULT;
+      const tW = isDriver ? DRIVER_W_DEFAULT : TILE_W_DEFAULT;
+
       const data = {
         agent,
         recentEvents: eventsByAgent.get(agent.id) ?? [],
@@ -334,6 +488,15 @@ function layoutMissionLane(
           isMissionRoot && onDeleteMission
             ? () => onDeleteMission(missionID)
             : undefined,
+        // Drivers get the operator chat plumbing; workers ignore
+        // it (their AgentTile branch doesn't render the input).
+        onPrompt:
+          isDriver && onPrompt
+            ? (text: string) => onPrompt(agent.id, text)
+            : undefined,
+        // Driver-only roll-ups for the header.
+        missionCostUSD: isDriver ? missionCostUSD : undefined,
+        missionWorkers: isDriver ? missionWorkers : undefined,
       } as AgentTileData;
 
       nodes.push({
@@ -341,30 +504,18 @@ function layoutMissionLane(
         type: "agent",
         dragHandle: ".drag-handle",
         position: { x: cursorX, y },
-        width: TILE_W_DEFAULT,
-        height: TILE_H_DEFAULT,
-        style: { width: TILE_W_DEFAULT, height: TILE_H_DEFAULT },
+        width: tW,
+        height: tH,
+        style: { width: tW, height: tH },
         data,
       });
 
-      if (agent.role === "worker") {
-        nodes.push({
-          id: agent.id + ":log",
-          type: "agentLog",
-          dragHandle: ".drag-handle",
-          position: { x: cursorX, y: y + TILE_H_DEFAULT + PAIR_GAP_Y },
-          width: LOG_W_DEFAULT,
-          height: LOG_H_DEFAULT,
-          style: { width: LOG_W_DEFAULT, height: LOG_H_DEFAULT },
-          data,
-        });
-      }
-
-      cursorX += TILE_W_DEFAULT + COL_GAP;
+      cursorX += tW + COL_GAP;
     }
   }
 
-  // Edges within this mission only.
+  // Edges within this mission only. Spawn edges only — the
+  // dashed view-edge to a separate log tile is gone.
   for (const a of missionAgents) {
     if (a.parent_agent_id && byID.has(a.parent_agent_id)) {
       edges.push({
@@ -377,22 +528,6 @@ function layoutMissionLane(
             a.spawn_kind === "fork" ? "var(--accent)" : "var(--border)",
           strokeWidth: 1.5,
           strokeDasharray: a.spawn_kind === "fork" ? "4 4" : undefined,
-        },
-      });
-    }
-    if (a.role === "worker") {
-      edges.push({
-        id: `${a.id}->${a.id}:log`,
-        source: a.id,
-        sourceHandle: "log",
-        target: `${a.id}:log`,
-        targetHandle: "log",
-        animated: false,
-        style: {
-          stroke: "var(--accent-worker)",
-          strokeWidth: 1,
-          strokeDasharray: "2 3",
-          opacity: 0.5,
         },
       });
     }

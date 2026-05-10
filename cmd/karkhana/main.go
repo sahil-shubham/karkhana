@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -75,15 +76,20 @@ func main() {
 	bhattiCli := bhatti.New(cfg.BhattiURL, cfg.BhattiToken)
 
 	state := &serverState{
-		bus:          bus,
-		bhatti:       bhattiCli,
-		missions:     map[string]*mission.Mission{},
-		agents:       map[string]*mission.Agent{},
-		drivers:      map[string]*driver.Driver{},
-		piProvider:   cfg.PiProvider,
-		piModel:      cfg.PiModel,
-		workerImage:  cfg.WorkerImage,
-		piExtensions: cfg.PiExtensions,
+		bus:               bus,
+		bhatti:            bhattiCli,
+		missions:          map[string]*mission.Mission{},
+		agents:            map[string]*mission.Agent{},
+		drivers:           map[string]driver.AgentDriver{},
+		piProvider:        cfg.PiProvider,
+		piModel:           cfg.PiModel,
+		workerImage:       cfg.WorkerImage,
+		piExtensions:      cfg.PiExtensions,
+		driverToolsPath:   cfg.DriverToolsPath,
+		driverSessionRoot: cfg.DriverSessionRoot,
+		internalURL:       cfg.InternalURL,
+		driverTokens:      map[string]string{},
+		driverPendingAsk:  map[string]chan string{},
 	}
 	if len(cfg.PiExtensions) > 0 {
 		slog.Info("pi extensions enabled",
@@ -121,6 +127,11 @@ func main() {
 	mux.HandleFunc("/api/agents/", state.handleAgentByID)
 	mux.HandleFunc("/api/events", canvas.EventStreamHandler(bus))
 	mux.HandleFunc("/proxy/", kasmproxy.Handler("/proxy/", state))
+	// Driver-tool callbacks. Authed via per-driver bearer
+	// tokens minted at driver-spawn time. Bound to localhost
+	// only by virtue of running on the same host as the driver
+	// pi subprocess that calls them.
+	mux.HandleFunc("/internal/driver/", state.handleInternalDriver)
 
 	handler := withCORS(mux)
 	srv := &http.Server{Addr: cfg.Addr, Handler: handler}
@@ -153,7 +164,7 @@ type serverState struct {
 	bhatti   *bhatti.Client
 	missions map[string]*mission.Mission
 	agents   map[string]*mission.Agent
-	drivers  map[string]*driver.Driver // keyed by agentID
+	drivers  map[string]driver.AgentDriver // keyed by agentID
 	eventID  int64
 
 	// pi-coding-agent provider/model, resolved at startup
@@ -168,6 +179,24 @@ type serverState struct {
 	// load on every worker spawn. With kk-base, this is the
 	// computer-use extension; with raw "computer", empty.
 	piExtensions []string
+
+	// Driver-side: paths/URLs for spawning the host driver pi
+	// process and routing its tool callbacks back here.
+	driverToolsPath   string
+	driverSessionRoot string
+	internalURL       string
+
+	// Per-driver auth tokens for the /internal/driver/* HTTP
+	// callbacks. Generated when the driver is spawned, deleted
+	// when the mission ends. Keyed by driver agent ID.
+	driverTokens map[string]string
+
+	// Outstanding ask_operator calls. While set, the next
+	// operator chat message resolves the pending question (the
+	// HTTP handler for /internal/.../ask_operator blocks on this
+	// channel). Keyed by driver agent ID. Only one outstanding
+	// ask per driver at a time.
+	driverPendingAsk map[string]chan string
 }
 
 func (s *serverState) nextEventID() int64 {
@@ -305,9 +334,29 @@ func (s *serverState) handleAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// handleAgentByID supports DELETE /api/agents/:id for terminate.
+// handleAgentByID supports:
+//   GET    /api/agents/:id        — fetch agent
+//   DELETE /api/agents/:id        — terminate agent (cascades to
+//                                   sandbox / driver subprocess)
+//   POST   /api/agents/:id/prompt — operator chat (drivers only,
+//                                   in practice; workers don't
+//                                   currently take live input)
 func (s *serverState) handleAgentByID(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/api/agents/"):]
+	path := r.URL.Path[len("/api/agents/"):]
+	// Sub-routes: /api/agents/:id/<action>
+	if idx := strings.IndexByte(path, '/'); idx >= 0 {
+		agentID := path[:idx]
+		action := path[idx+1:]
+		switch action {
+		case "prompt":
+			s.handleAgentPrompt(w, r, agentID)
+			return
+		default:
+			http.Error(w, "unknown sub-route", 404)
+			return
+		}
+	}
+	id := path
 	s.mu.Lock()
 	a, ok := s.agents[id]
 	s.mu.Unlock()
@@ -328,17 +377,150 @@ func (s *serverState) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 
 // --- mission runner (real bhatti + real pi) ---
 
+// runMission spawns the per-mission DRIVER agent on the
+// Karkhana host and sends the operator's initial goal as its
+// first prompt. The driver decides whether to spawn workers via
+// its tools (spawn_worker), and the operator can keep chatting
+// with it for the lifetime of the mission — v0.6: mission ==
+// driver tile == conversation.
+//
+// Worker spawning is now a SEPARATE flow: spawnWorker(), called
+// from the /internal/driver/:id/spawn_worker HTTP handler when
+// the driver invokes its spawn_worker tool.
 func (s *serverState) runMission(m *mission.Mission) {
-	workerID := "agent_" + randHex(12)
-	worker := &mission.Agent{
-		ID:        workerID,
+	driverID := "agent_" + randHex(12)
+	token := randHex(32)
+
+	driverAgent := &mission.Agent{
+		ID:        driverID,
 		MissionID: m.ID,
-		Role:      mission.RoleWorker,
-		SpawnKind: mission.SpawnSpawn,
+		Role:      mission.RoleDriver,
+		SpawnKind: mission.SpawnRoot,
 		Task:      m.Goal,
-		Recipe:    "computer-use",
 		Status:    mission.StatusRunning,
 		StartedAt: time.Now(),
+	}
+	s.mu.Lock()
+	s.agents[driverID] = driverAgent
+	s.driverTokens[driverID] = token
+	m.DriverAgentID = driverID
+	s.mu.Unlock()
+
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
+		Kind: "agent.spawning", Ts: time.Now(),
+		Payload: map[string]any{
+			"role":  "driver",
+			"task":  m.Goal,
+			"stage": "spawning host pi process",
+		},
+	})
+
+	// Per-mission session dir for pi's JSONL.
+	sessDir := filepath.Join(s.driverSessionRoot, m.ID)
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		s.failAgent(m, driverAgent, "mkdir session dir: "+err.Error())
+		return
+	}
+
+	argv := []string{
+		"pi", "--mode", "rpc",
+		"--session-dir", sessDir,
+	}
+	if s.piProvider != "" {
+		argv = append(argv, "--provider", s.piProvider)
+	}
+	if s.piModel != "" {
+		argv = append(argv, "--model", s.piModel)
+	}
+	if s.driverToolsPath != "" {
+		argv = append(argv, "--extension", s.driverToolsPath)
+	}
+
+	env := s.piEnvFromHost()
+	env["KARKHANA_INTERNAL_URL"] = s.internalURL
+	env["KARKHANA_DRIVER_TOKEN"] = token
+	env["KARKHANA_DRIVER_ID"] = driverID
+
+	ctx := context.Background()
+	drv, err := driver.ConnectHost(ctx, driver.HostOptions{
+		Argv:      argv,
+		Env:       env,
+		SessionID: "host-" + m.ID,
+		OnEvent: func(ev driver.Event) {
+			s.forwardPiEvent(m.ID, driverID, ev)
+		},
+		OnDisconnect: func(err error) {
+			s.handleDriverDisconnect(m.ID, driverID, err)
+		},
+	})
+	if err != nil {
+		s.failAgent(m, driverAgent, "spawn driver pi failed: "+err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.drivers[driverID] = drv
+	s.mu.Unlock()
+
+	slog.Info("driver spawned",
+		"mission", m.ID, "driver", driverID, "argv", argv[0])
+
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
+		Kind: "agent.spawned", Ts: time.Now(),
+		Payload: map[string]any{
+			"role": "driver",
+			"task": m.Goal,
+		},
+	})
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
+		Kind: "agent.driver_connected", Ts: time.Now(),
+		Payload: map[string]any{"session_id": drv.SessionID()},
+	})
+
+	// Echo the operator's first message into the event stream so
+	// the DriverTile chat shows it. The first prompt and any
+	// follow-ups go through the same operator.message kind.
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
+		Kind: "operator.message", Ts: time.Now(),
+		Payload: map[string]any{"text": m.Goal},
+	})
+
+	prompt := wrapGoalWithDriverContext(m.Goal)
+	if err := drv.Prompt(context.Background(), prompt); err != nil {
+		s.failAgent(m, driverAgent, "send prompt failed: "+err.Error())
+		return
+	}
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
+		Kind: "driver.prompt_sent", Ts: time.Now(),
+		Payload: map[string]any{"text": m.Goal},
+	})
+
+	// We do NOT AwaitCompletion. The driver is persistent — it
+	// finishes a turn (agent_end) but stays running, awaiting
+	// the operator's next chat message via /api/agents/:id/prompt.
+	// Cleanup happens via mission deletion or driver crash.
+}
+
+// spawnWorker creates a new worker sandbox + pi-rpc agent under
+// the given driver. Called by the /internal/driver/:id/spawn_worker
+// HTTP handler when the driver invokes its spawn_worker tool.
+// Returns the worker agent record (already in s.agents).
+func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, task string) (*mission.Agent, error) {
+	workerID := "agent_" + randHex(12)
+	worker := &mission.Agent{
+		ID:            workerID,
+		MissionID:     m.ID,
+		ParentAgentID: parentDriverID,
+		Role:          mission.RoleWorker,
+		SpawnKind:     mission.SpawnSpawn,
+		Task:          task,
+		Recipe:        "computer-use",
+		Status:        mission.StatusRunning,
+		StartedAt:     time.Now(),
 	}
 	s.mu.Lock()
 	s.agents[workerID] = worker
@@ -348,12 +530,27 @@ func (s *serverState) runMission(m *mission.Mission) {
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: workerID,
 		Kind: "agent.spawning", Ts: time.Now(),
 		Payload: map[string]any{
-			"role":  "worker",
-			"task":  m.Goal,
-			"stage": "creating sandbox",
+			"role":   "worker",
+			"task":   task,
+			"parent": parentDriverID,
+			"stage":  "creating sandbox",
 		},
 	})
 
+	// Spawn the rest asynchronously so the driver tool returns
+	// quickly with a worker_id; sandbox boot + pi connect take
+	// a couple seconds even on kk-base.
+	go s.runWorker(parentDriverID, m, worker)
+	return worker, nil
+}
+
+// runWorker is the per-worker async lifecycle: create sandbox,
+// publish KasmVNC, ensure pi, connect driver, send task as
+// prompt. This is the meat of v0.5's runMission, just renamed
+// and parameterized by parentDriverID + task. Failures call
+// failAgent (which used to be failWorker).
+func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worker *mission.Agent) {
+	workerID := worker.ID
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -474,25 +671,22 @@ func (s *serverState) runMission(m *mission.Mission) {
 		Payload: map[string]any{"session_id": drv.SessionID()},
 	})
 
-	// 5. Send the operator's goal as the first prompt, wrapped
-	// with the desktop-context preamble so the agent knows it has
-	// a visible KasmVNC display and (when applicable) the
-	// computer-use toolset for clicking/typing/scrolling.
+	// 5. Send the WORKER's task as the first prompt, with the
+	// desktop-context preamble so the worker pi knows it has a
+	// visible KasmVNC display and the computer-use toolset.
 	hasComputerUse := len(s.piExtensions) > 0
-	prompt := wrapGoalWithDesktopContext(m.Goal, hasComputerUse)
+	prompt := wrapGoalWithDesktopContext(worker.Task, hasComputerUse)
 	if err := drv.Prompt(context.Background(), prompt); err != nil {
-		s.failWorker(m, worker, "send prompt failed: "+err.Error())
+		s.failAgent(m, worker, "send prompt failed: "+err.Error())
 		return
 	}
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: workerID,
 		Kind: "driver.prompt_sent", Ts: time.Now(),
-		Payload: map[string]any{"text": m.Goal},
+		Payload: map[string]any{"text": worker.Task},
 	})
 
 	// 6. Wait for agent_end in a goroutine; mark worker complete.
-	// Doesn't block — runMission returns and the driver's readLoop
-	// keeps streaming events to the canvas.
 	go func() {
 		awaitCtx, awaitCancel := context.WithTimeout(
 			context.Background(),
@@ -505,6 +699,14 @@ func (s *serverState) runMission(m *mission.Mission) {
 		}
 		s.markWorkerCompleted(m.ID, workerID)
 	}()
+}
+
+// failAgent is the rename of failWorker, used for both worker
+// and driver failure paths. failWorker remains as a thin alias
+// for the existing call sites elsewhere in this file (recovery,
+// etc.) until those are touched.
+func (s *serverState) failAgent(m *mission.Mission, a *mission.Agent, reason string) {
+	s.failWorker(m, a, reason)
 }
 
 // ensurePi makes sure `pi` is on the worker's PATH. Fast path:
@@ -555,6 +757,90 @@ func (s *serverState) ensurePi(ctx context.Context, m *mission.Mission, workerID
 	return nil
 }
 
+// wrapGoalWithDriverContext is the preamble for the per-mission
+// DRIVER agent (running on the Karkhana host, no desktop). The
+// driver orchestrates worker microVMs via its tool surface;
+// this preamble teaches it the tools and the chat-shaped
+// lifecycle (finish is a checkpoint, not an exit).
+func wrapGoalWithDriverContext(goal string) string {
+	env := `<environment>
+You are the DRIVER agent for a Karkhana mission. You orchestrate worker agents to accomplish what the operator asks. You run on the Karkhana host (no desktop, just bash/read/write/edit + your orchestration tools); your workers run inside isolated bhatti microVMs with full Linux desktops, Chromium, and computer-use tools (screenshot, click, type, scroll). The operator watches all of you live on a single canvas.
+
+Your orchestration tools:
+
+  spawn_worker(task)                   create a worker; returns immediately with worker_id
+  wait_for_workers(worker_ids, timeout) block until those workers terminate; returns their outputs
+  ask_operator(question)               pause and ask the human; blocks until they reply
+  report_progress(message)             send a status update without blocking
+  finish(result)                       checkpoint the current task with a final answer
+
+## Always parallelize when possible
+
+If the operator's goal has TWO OR MORE independent parts, spawn that many workers IN PARALLEL (multiple spawn_worker calls before any wait_for_workers). Then wait_for_workers([w1, w2, ...]) on all of them at once.
+
+  Good:    "compare A, B, C"          → spawn 3 workers, wait once, synthesize
+           "summarize 5 articles"     → spawn 5 workers, wait once, combine
+  Bad:     spawn w1, wait, spawn w2, wait, ...   (wastes the parallelism)
+
+## Phased pattern: discovery + fan-out
+
+Many tasks have TWO PHASES — first find a list, then research each item in parallel. Recognize this and chain accordingly:
+
+  Phase 1 (1 worker, serial):
+    spawn_worker("find items, return URLs as plain text, max N")
+    wait_for_workers([w1])
+    parse URLs from w1's result
+
+  Phase 2 (N workers, parallel):
+    spawn_worker("research <url_i>")  for each url_i  (do all the spawn calls before waiting)
+    wait_for_workers([w2..wN+1])
+    synthesize
+
+Goals that fit this shape:
+  "search HN for X submissions, then research each in detail"
+  "find the top 5 PRs in this repo, summarize each"
+  "list the components on this page, audit each for accessibility"
+
+Key rules for the discovery worker (Phase 1):
+  - Cap the count (N=5..20 usually). Don't spawn 100 sandboxes.
+  - Tell it EXPLICITLY: "return ONLY a list of items, plain text, one per line, no other commentary". Makes parsing reliable on your end.
+  - Worker task MUST end with "do not call any more tools after that" so it terminates and unblocks your wait.
+
+## When wait_for_workers returns timed_out=true
+
+If wait_for_workers returns with timed_out=true, look at the partial results before deciding what to do:
+
+  - If a worker has final_assistant_text that already contains the answer you need, USE IT. The worker may have produced a clean answer but failed to reach pi's agent_end terminal state. Retrying would be wasteful and would hit the same edge case.
+  - Only re-spawn a worker if its result is genuinely empty / useless / off-task.
+  - Always prefer summarizing partial results over retrying. The operator would rather see "here's what 8 of 10 workers found" than wait another 30 minutes for a clean run.
+
+## Worker tasks must have explicit completion criteria
+
+Workers don't see your conversation with the operator — only what you put in their task. Each task MUST end with a sentence like:
+
+  "When done, respond with <X> as plain text. Do not call any more tools after that."
+
+Without this, the worker may keep clicking/exploring forever and never signal completion. The literal phrase "do not call any more tools" is what triggers pi's agent_end and unblocks your wait_for_workers.
+
+Example good task:
+  "Open https://news.ycombinator.com in the browser. Extract the top 3 story titles from the front page. When done, respond with the three titles as a numbered list, plain text only. Do not call any more tools after that."
+
+## Other behaviours
+
+- For tasks that involve browsing, clicking, GUI work, or anything visual, ALWAYS spawn a worker. You do not have a desktop yourself.
+- ALWAYS call finish() with a result when you have completed what the operator asked. After finish, you remain available; the operator may follow up. finish is a checkpoint, NOT an exit.
+- Use report_progress for milestone updates (e.g. "Phase 1 done, spawning 10 research workers"), not every step. The operator already sees workers spawn live on the canvas.
+- Use ask_operator only when you genuinely need human input (ambiguous goal, credentials, decisions the agent shouldn't make). Don't use it for confirmations.
+
+Your conversation with the operator persists across days. The first message below is their initial goal; later messages will arrive as follow-ups in the same conversation.
+</environment>`
+	return env + `
+
+<goal>
+` + goal + `
+</goal>`
+}
+
 // wrapGoalWithDesktopContext prepends a short system-style
 // preamble to the operator's goal so pi-coding-agent understands
 // it's running on a XFCE4 + KasmVNC desktop with computer-use
@@ -577,7 +863,17 @@ func wrapGoalWithDesktopContext(goal string, withComputerUse bool) string {
 	var env string
 	if withComputerUse {
 		env = `<environment>
-You are running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium) streamed live to your operator over KasmVNC. The desktop resolution is 1280x720, DISPLAY=:99.
+You are a WORKER agent running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium). The DRIVER agent for this mission delegated this task to you and is waiting for your answer.
+
+The desktop resolution is 1280x720, DISPLAY=:99. The operator watches you live over KasmVNC.
+
+## Completion criteria are mandatory
+
+When you have produced your final answer, respond with TEXT ONLY — do NOT call any more tools after that. The text-only response is what signals you're done; without it the driver thinks you're still working and the mission hangs.
+
+The driver's task description below usually includes the explicit phrase "do not call any more tools after that" — honour it literally. Once you have what was asked, write it out and stop.
+
+## Tools
 
 In addition to bash/read/write/edit, you have a full computer-use toolset that drives the desktop directly. PREFER these over bash for any visible interaction:
 
@@ -595,7 +891,11 @@ In addition to bash/read/write/edit, you have a full computer-use toolset that d
 Every action tool returns a fresh screenshot in its result, so you have visual feedback automatically — you do NOT need to call screenshot() after each click. Use coordinates from the latest screenshot you have.
 
 Workflow for "open <url>" / "go to <site>" / "browse to X":
-  1. bash: "chromium --no-sandbox --new-window <url> &" to launch (or click an existing browser icon)
+  1. bash: 'chromium --no-sandbox --test-type --new-window <url> &' to launch.
+     IMPORTANT: include --test-type along with --no-sandbox. It suppresses the
+     yellow infobars ("You are using an unsupported command-line flag", "Google API
+     keys are missing") that otherwise eat the top ~80px of the viewport and
+     confuse screenshot-driven coordinate work.
   2. wait(2)  — let the window appear and the page render
   3. screenshot() if needed, then click/type/scroll to interact
 
@@ -605,11 +905,23 @@ Narrate what you're doing in short assistant messages between tool calls. The op
 </environment>`
 	} else {
 		env = `<environment>
-You are running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium) streamed live to your operator over KasmVNC. DISPLAY=:99 — GUI apps you launch from bash will appear in the operator's iframe in real time.
+You are a WORKER agent running inside a sandboxed Linux microVM (Debian + XFCE4 + Chromium). The DRIVER agent for this mission delegated this task to you and is waiting for your answer.
+
+DISPLAY=:99 — GUI apps you launch from bash will appear in the operator's iframe in real time.
+
+## Completion criteria are mandatory
+
+When you have produced your final answer, respond with TEXT ONLY — do NOT call any more tools after that. The text-only response is what signals you're done; without it the driver thinks you're still working and the mission hangs.
+
+The driver's task description below usually includes the explicit phrase "do not call any more tools after that" — honour it literally. Once you have what was asked, write it out and stop.
+
+## Browsing
 
 When the goal says "open <site>", "visit <url>", "browse to X", or anything that implies a web UI, launch chromium so the operator can SEE it:
 
-  chromium --no-sandbox --new-window <url> &
+  chromium --no-sandbox --test-type --new-window <url> &
+
+(Include --test-type to suppress chromium's yellow infobars that would otherwise occupy ~80px at the top of the page.)
 
 Not curl, not playwright, not headless. Wait ~2 seconds after launching for the window to settle. Use xdotool / wmctrl from bash if you need basic clicks or keypresses.
 
@@ -762,7 +1074,24 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 		})
 
 	case "agent_end":
-		// Handled by AwaitCompletion -> markWorkerCompleted; nothing to do here.
+		// Primary path is AwaitCompletion -> markWorkerCompleted in
+		// runWorker. We ALSO call markWorkerCompleted here as a
+		// belt-and-braces safety net: if the AwaitCompletion
+		// completion-waiter race ever drops a signal (it shouldn't
+		// post-race-fix, but defensive), this path catches it.
+		// markWorkerCompleted is a no-op if status is already
+		// terminated, so calling it twice is safe.
+		//
+		// Drivers (host pi processes) ALSO emit agent_end after
+		// each turn, but they're persistent in v0.6 — we don't
+		// auto-terminate them on agent_end. Skip the call if the
+		// agent is a driver.
+		s.mu.Lock()
+		a := s.agents[agentID]
+		s.mu.Unlock()
+		if a != nil && a.Role == mission.RoleWorker && a.Status == mission.StatusRunning {
+			s.markWorkerCompleted(missionID, agentID)
+		}
 
 	case "extension_error":
 		extPath, _ := ev["extensionPath"].(string)
@@ -924,6 +1253,17 @@ func (s *serverState) terminateAgent(a *mission.Agent) {
 	s.mu.Lock()
 	d := s.drivers[a.ID]
 	delete(s.drivers, a.ID)
+	delete(s.driverTokens, a.ID)
+	// Resolve any pending ask_operator with empty string so the
+	// blocked /ask_operator handler returns and the driver pi
+	// process can exit cleanly.
+	if ch, ok := s.driverPendingAsk[a.ID]; ok {
+		select {
+		case ch <- "":
+		default:
+		}
+		delete(s.driverPendingAsk, a.ID)
+	}
 	s.mu.Unlock()
 	if d != nil {
 		_ = d.Close()
@@ -1067,6 +1407,339 @@ func (s *serverState) recoverFromBhatti() {
 
 func (s *serverState) publish(e mission.Event) {
 	s.bus.Publish(e)
+}
+
+// --- internal driver-tool callbacks ---
+// These endpoints are called by the host driver pi process via
+// HTTP, in response to the LLM invoking one of the 5 driver
+// tools (see extensions/driver-tools/index.ts). They are NOT
+// exposed to the operator UI and authed via per-driver bearer
+// tokens minted at driver-spawn time.
+
+// authDriver looks up the driver agent by ID, validates the
+// bearer token, and returns (driver_id, mission, ok). Writes
+// the appropriate HTTP error and returns ok=false on miss.
+func (s *serverState) authDriver(w http.ResponseWriter, r *http.Request, driverID string) (*mission.Agent, *mission.Mission, bool) {
+	authz := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(authz, "Bearer ")
+	if token == "" || token == authz {
+		http.Error(w, "missing bearer", http.StatusUnauthorized)
+		return nil, nil, false
+	}
+	s.mu.Lock()
+	want, hasToken := s.driverTokens[driverID]
+	agent, hasAgent := s.agents[driverID]
+	var m *mission.Mission
+	if hasAgent {
+		m = s.missions[agent.MissionID]
+	}
+	s.mu.Unlock()
+	if !hasToken || !hasAgent || m == nil {
+		http.Error(w, "unknown driver", http.StatusNotFound)
+		return nil, nil, false
+	}
+	if token != want {
+		http.Error(w, "bad token", http.StatusForbidden)
+		return nil, nil, false
+	}
+	return agent, m, true
+}
+
+// handleInternalDriver routes /internal/driver/{driver_id}/<action>
+// to the right tool handler.
+func (s *serverState) handleInternalDriver(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/internal/driver/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		http.Error(w, "path must be /internal/driver/<id>/<action>",
+			http.StatusNotFound)
+		return
+	}
+	driverID, action := parts[0], parts[1]
+
+	driverAgent, m, ok := s.authDriver(w, r, driverID)
+	if !ok {
+		return
+	}
+
+	switch action {
+	case "spawn_worker":
+		s.handleToolSpawnWorker(w, r, driverAgent, m)
+	case "wait_for_workers":
+		s.handleToolWaitForWorkers(w, r, m)
+	case "ask_operator":
+		s.handleToolAskOperator(w, r, driverAgent, m)
+	case "report_progress":
+		s.handleToolReportProgress(w, r, driverAgent, m)
+	case "finish":
+		s.handleToolFinish(w, r, driverAgent, m)
+	default:
+		http.Error(w, "unknown action: "+action, http.StatusNotFound)
+	}
+}
+
+func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Task string `json:"task"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Task) == "" {
+		http.Error(w, "task required", http.StatusBadRequest)
+		return
+	}
+	worker, err := s.spawnWorker(driverAgent.ID, m, body.Task)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"worker_id":  worker.ID,
+		"sandbox_id": worker.BhattiSandboxID, // may be empty if still booting
+		"status":     worker.Status,
+	})
+}
+
+func (s *serverState) handleToolWaitForWorkers(w http.ResponseWriter, r *http.Request, _ *mission.Mission) {
+	var body struct {
+		WorkerIDs      []string `json:"worker_ids"`
+		TimeoutSeconds int      `json:"timeout_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.TimeoutSeconds <= 0 {
+		body.TimeoutSeconds = 1800 // 30 min, matches worker awaitCtx
+	}
+	deadline := time.Now().Add(time.Duration(body.TimeoutSeconds) * time.Second)
+
+	// Poll every 500ms until all listed workers are in a terminal
+	// state OR the deadline passes. Worker termination is signalled
+	// by status != "running" (markWorkerCompleted, terminateAgent,
+	// failWorker all flip status). Short of building a proper
+	// completion-channel registry, polling is fine for v0 — typical
+	// timeouts are O(minutes) and the agents map is in-memory.
+	for {
+		s.mu.Lock()
+		done := true
+		result := []map[string]any{}
+		for _, wid := range body.WorkerIDs {
+			a, ok := s.agents[wid]
+			if !ok {
+				result = append(result, map[string]any{
+					"worker_id": wid,
+					"status":    "unknown",
+				})
+				continue
+			}
+			if a.Status == mission.StatusRunning {
+				done = false
+			}
+			result = append(result, map[string]any{
+				"worker_id":            a.ID,
+				"status":               a.Status,
+				"outcome":              a.Outcome,
+				"final_assistant_text": a.FinalAssistantText,
+				"cost_usd":             a.CostUSD,
+			})
+		}
+		s.mu.Unlock()
+
+		if done {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"workers":   result,
+				"timed_out": false,
+			})
+			return
+		}
+		if time.Now().After(deadline) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"workers":   result,
+				"timed_out": true,
+			})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (s *serverState) handleToolAskOperator(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Question string `json:"question"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Publish the question for the UI to render with chat-blocked
+	// styling.
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
+		Kind: "driver.ask_operator", Ts: time.Now(),
+		Payload: map[string]any{"question": body.Question},
+	})
+
+	ch := make(chan string, 1)
+	s.mu.Lock()
+	if _, exists := s.driverPendingAsk[driverAgent.ID]; exists {
+		s.mu.Unlock()
+		http.Error(w, "another ask_operator is already pending",
+			http.StatusConflict)
+		return
+	}
+	s.driverPendingAsk[driverAgent.ID] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.driverPendingAsk, driverAgent.ID)
+		s.mu.Unlock()
+	}()
+
+	select {
+	case answer := <-ch:
+		writeJSON(w, http.StatusOK, map[string]any{"answer": answer})
+	case <-time.After(30 * time.Minute):
+		http.Error(w, "operator did not answer within 30m",
+			http.StatusRequestTimeout)
+	case <-r.Context().Done():
+		return
+	}
+}
+
+func (s *serverState) handleToolReportProgress(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
+		Kind: "driver.report_progress", Ts: time.Now(),
+		Payload: map[string]any{"message": body.Message},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *serverState) handleToolFinish(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Result string `json:"result"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	driverAgent.FinalAssistantText = body.Result
+	s.mu.Unlock()
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
+		Kind: "driver.finish", Ts: time.Now(),
+		Payload: map[string]any{"result": body.Result},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- operator chat ---
+// POST /api/agents/:id/prompt with { text: "..." } sends a
+// follow-up message from the operator to a driver. If the driver
+// is mid-turn (streaming), the message is steered; otherwise
+// it's a fresh prompt. If there's a pending ask_operator, the
+// message resolves that and isn't forwarded as a prompt.
+
+func (s *serverState) handleAgentPrompt(w http.ResponseWriter, r *http.Request, agentID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		http.Error(w, "text required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	agent, hasAgent := s.agents[agentID]
+	drv, hasDrv := s.drivers[agentID]
+	pendingAsk, hasAsk := s.driverPendingAsk[agentID]
+	s.mu.Unlock()
+	if !hasAgent {
+		http.Error(w, "no such agent", http.StatusNotFound)
+		return
+	}
+
+	// Echo into the event stream so the chat UI shows it.
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: agent.MissionID, AgentID: agentID,
+		Kind: "operator.message", Ts: time.Now(),
+		Payload: map[string]any{"text": body.Text},
+	})
+
+	if hasAsk {
+		select {
+		case pendingAsk <- body.Text:
+		default:
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "resolved_ask": true,
+		})
+		return
+	}
+
+	if !hasDrv {
+		http.Error(w, "agent has no live driver", http.StatusConflict)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Policy: chat-app semantics. If the driver is mid-flight, the
+	// operator's new message takes precedence over whatever the
+	// driver was doing — abort the current operation, then send
+	// the message as a fresh prompt.
+	//
+	// We considered pi-rpc's `steer` (queue for after current
+	// turn completes) but it failed in practice: when the driver
+	// blocks on wait_for_workers, the current turn never
+	// completes, so steer messages pile up invisibly and the
+	// operator sees nothing happen. Abort+prompt is the right
+	// default for a chat surface.
+	var err error
+	if drv.IsStreaming() {
+		if aerr := drv.Abort(ctx); aerr != nil {
+			slog.Warn("abort before re-prompt failed",
+				"agent", agentID, "err", aerr)
+		}
+		// Brief pause so pi processes the abort before the new
+		// prompt arrives — otherwise pi may reject the prompt
+		// with "streaming, must use steer".
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err = drv.Prompt(ctx, body.Text); err != nil {
+		http.Error(w, "forward to driver: "+err.Error(),
+			http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // Resolve implements kasmproxy.Resolver — returns the upstream URL

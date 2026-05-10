@@ -42,4 +42,17 @@ export const api = {
     fetch(apiURL(`/api/agents/${encodeURIComponent(agentID)}`), {
       method: "DELETE",
     }),
+
+  // Send an operator message to a driver. The backend decides
+  // between pi-rpc `prompt` (idle) and `steer` (streaming) based
+  // on the driver's IsStreaming() state. If the driver has an
+  // outstanding ask_operator, this resolves it instead.
+  promptAgent: (agentID: string, text: string) =>
+    jsonFetch<{ ok: boolean; resolved_ask?: boolean }>(
+      `/api/agents/${encodeURIComponent(agentID)}/prompt`,
+      {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      },
+    ),
 };

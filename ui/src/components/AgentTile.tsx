@@ -1,13 +1,16 @@
 // AgentTile — the primary tile per agent.
 //
-//   Driver  → body is the scrolling event stream (no sandbox).
-//   Worker  → body is the KasmVNC desktop iframe.
+//   Driver  → body is a chat-shaped conversation surface
+//             (scrolling event stream + always-visible input).
+//   Worker  → body is two stacked regions in the SAME tile:
+//             (a) KasmVNC desktop iframe on top  (~60% height)
+//             (b) auto-scrolling event log below (~40% height)
 //
-// Workers also get a sibling AgentLogTile (right of this one)
-// that renders the same event-stream view, so the operator can
-// watch the desktop AND read the agent's reasoning without
-// flipping back and forth. Both tiles are independently
-// resizable via NodeResizer.
+// v0.6 iteration: workers used to have a separate log tile
+// connected by a dashed view-edge. Operator feedback: "why is
+// it two tiles connected by an edge when they're conceptually
+// one thing?" — right. Merged into a single tile with an
+// internal divider; the edge clutter goes away.
 //
 // Pointer-event handling: KasmVNC's iframe captures every click;
 // we use the .drag-handle header strip as react-flow's drag
@@ -42,11 +45,33 @@ export interface AgentTileData extends Record<string, unknown> {
   // no parent). v0.6 has no sidebar; this is how the operator
   // ends a whole mission — right-click the root → Delete mission.
   onDeleteMission?: () => void;
+  // Driver tiles only — send an operator chat message to the
+  // driver agent. Backend decides prompt vs steer based on
+  // streaming state. See lib/api.ts:promptAgent.
+  onPrompt?: (text: string) => Promise<void>;
+  // Driver tiles only — cumulative LLM cost across the driver
+  // and all its descendants in this mission. Worker tiles get
+  // undefined here and fall back to agent.cost_usd, which IS
+  // their own cost. Set in Canvas.layoutMissionLane.
+  missionCostUSD?: number;
+  // Driver tiles only — worker counts for the mission. Helps
+  // the operator see "3 of 5 workers running" at a glance in
+  // the header. Set in Canvas.layoutMissionLane.
+  missionWorkers?: { running: number; total: number };
 }
 
 export function AgentTile({ data, selected }: NodeProps) {
-  const { agent, recentEvents, focused, onFocus, onTerminate, onDeleteMission } =
-    data as AgentTileData;
+  const {
+    agent,
+    recentEvents,
+    focused,
+    onFocus,
+    onTerminate,
+    onDeleteMission,
+    onPrompt,
+    missionCostUSD,
+    missionWorkers,
+  } = data as AgentTileData;
   const isDriver = agent.role === "driver";
   const accent = isDriver ? "var(--accent)" : "var(--accent-worker)";
 
@@ -101,28 +126,68 @@ export function AgentTile({ data, selected }: NodeProps) {
         roleLabel={isDriver ? "DRIVER" : "WORKER"}
         agent={agent}
         onTerminate={onTerminate}
+        missionCostUSD={isDriver ? missionCostUSD : undefined}
+        missionWorkers={isDriver ? missionWorkers : undefined}
       />
 
-      <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-        {isDriver ? (
-          <EventStream events={recentEvents} />
-        ) : (
-          <WorkerView
-            agentID={agent.id}
-            hasURL={!!desktopURL}
-            focused={focused}
-            onFocus={onFocus}
-          />
-        )}
-      </div>
+      {/* Body region. For drivers: scrolling chat. For workers:
+          two stacked regions — desktop iframe on top, log
+          below. Both share one bounding tile. */}
+      {isDriver ? (
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+          <ConversationStream events={recentEvents} />
+        </div>
+      ) : (
+        <>
+          <div
+            style={{
+              // 60% of remaining tile height. KasmVNC is native
+              // 1280x720 — with `resize=remote` the X server
+              // xrandrs to whatever the iframe ends up being,
+              // so this region is flexible.
+              flex: "3 0 0",
+              minHeight: 200,
+              position: "relative",
+              overflow: "hidden",
+            }}
+          >
+            <WorkerView
+              agentID={agent.id}
+              hasURL={!!desktopURL}
+              focused={focused}
+              onFocus={onFocus}
+            />
+          </div>
+          <div
+            style={{
+              // 40% — worker's reasoning / tool calls / final text.
+              // Min height keeps the log readable when the
+              // operator drags the tile small.
+              flex: "2 0 0",
+              minHeight: 120,
+              borderTop: "1px solid var(--border)",
+              background: "var(--bg-1)",
+              overflow: "hidden",
+            }}
+          >
+            <EventStream events={recentEvents} />
+          </div>
+        </>
+      )}
 
-      {/* Footer (last assistant message) only on the driver tile.
-          Worker tiles have a paired log sibling that already shows
-          the full stream; a one-line redundant footer below the
-          desktop iframe just steals vertical space. */}
-      {isDriver && <TileFooter agent={agent} recentEvents={recentEvents} />}
+      {/* Drivers get a chat input footer; worker desktops have
+          their paired log tile so no footer needed there. */}
+      {isDriver && onPrompt && (
+        <DriverChatInput
+          agent={agent}
+          recentEvents={recentEvents}
+          onPrompt={onPrompt}
+        />
+      )}
 
-      {/* spawn edges (driver → worker, worker → sub-worker) */}
+      {/* spawn edges (driver → worker, worker → sub-worker).
+          The view-edge to a separate log tile was removed when
+          workers merged log + desktop into one tile. */}
       <Handle
         type="target"
         position={Position.Top}
@@ -133,23 +198,6 @@ export function AgentTile({ data, selected }: NodeProps) {
         position={Position.Bottom}
         style={{ background: "var(--border)", width: 6, height: 6 }}
       />
-      {/* view edge to the paired log tile (workers only).
-          Bottom-center, immediately below the spawn handle so it
-          looks like one logical attachment point. */}
-      {!isDriver && (
-        <Handle
-          id="log"
-          type="source"
-          position={Position.Bottom}
-          style={{
-            background: "var(--accent-worker)",
-            width: 6,
-            height: 6,
-            // Center horizontally; sit right at the edge so the
-            // edge to the log tile drops straight down.
-          }}
-        />
-      )}
     </div>
   );
 
@@ -210,12 +258,23 @@ export function TileHeader({
   roleLabel,
   agent,
   onTerminate,
+  missionCostUSD,
+  missionWorkers,
 }: {
   accent: string;
   roleLabel: string;
   agent: Agent;
   onTerminate?: () => void;
+  // When set, the cost shown in the header is the cumulative
+  // cost across the entire mission (driver + all its workers),
+  // not just this agent's own cost. Driver tiles get this.
+  missionCostUSD?: number;
+  missionWorkers?: { running: number; total: number };
 }) {
+  // Driver tiles show mission-cumulative cost; worker tiles
+  // show their own per-agent cost. Operator's mental model is
+  // "the driver IS the mission" so the rollup belongs there.
+  const displayCost = missionCostUSD ?? agent.cost_usd ?? 0;
   return (
     <header
       className="drag-handle"
@@ -249,8 +308,23 @@ export function TileHeader({
       >
         {agent.task ?? agent.id}
       </span>
-      <span style={{ color: "var(--text-4)", fontSize: 10 }}>
-        ${(agent.cost_usd ?? 0).toFixed(2)}
+      {missionWorkers && missionWorkers.total > 0 && (
+        <span
+          style={{ color: "var(--text-4)", fontSize: 10 }}
+          title={`${missionWorkers.running} of ${missionWorkers.total} workers running`}
+        >
+          {missionWorkers.running}/{missionWorkers.total} ●
+        </span>
+      )}
+      <span
+        style={{ color: "var(--text-4)", fontSize: 10 }}
+        title={
+          missionCostUSD !== undefined
+            ? "mission total LLM cost (driver + workers)"
+            : "this agent's LLM cost"
+        }
+      >
+        ${displayCost.toFixed(2)}
       </span>
       {onTerminate && agent.status === "running" && (
         <button
@@ -634,6 +708,412 @@ function WorkerView({
         />
       )}
     </div>
+  );
+}
+
+// ConversationStream is the driver tile's body — the same
+// auto-scrolling event log as the worker log tile, but with
+// special-case rendering for operator messages, ask_operator
+// blocks, report_progress, and finish so the driver chat reads
+// like a chat instead of a log.
+function ConversationStream({ events }: { events: KEvent[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [stick, setStick] = useState(true);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setStick(el.scrollHeight - el.scrollTop - el.clientHeight < 40);
+  };
+
+  useEffect(() => {
+    if (!stick) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [events.length, stick]);
+
+  return (
+    <div
+      ref={scrollRef}
+      onScroll={handleScroll}
+      style={{
+        height: "100%",
+        overflowY: "auto",
+        padding: "10px 12px",
+        fontSize: 12,
+        color: "var(--text-2)",
+        lineHeight: 1.55,
+        position: "relative",
+      }}
+    >
+      {events.length === 0 ? (
+        <div
+          style={{
+            color: "var(--text-4)",
+            fontStyle: "italic",
+            fontSize: 11,
+          }}
+        >
+          waiting for driver…
+        </div>
+      ) : (
+        events.map((ev) => <ConversationRow key={ev.id} ev={ev} />)
+      )}
+      {!stick && events.length > 5 && (
+        <button
+          onClick={() => {
+            const el = scrollRef.current;
+            if (!el) return;
+            el.scrollTop = el.scrollHeight;
+            setStick(true);
+          }}
+          style={{
+            position: "sticky",
+            bottom: 4,
+            left: "50%",
+            transform: "translateX(-50%)",
+            display: "block",
+            margin: "4px auto 0",
+            padding: "3px 10px",
+            background: "var(--bg-2)",
+            color: "var(--text-2)",
+            border: "1px solid var(--border)",
+            borderRadius: 12,
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          ↓ jump to latest
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ConversationRow({ ev }: { ev: KEvent }) {
+  const kind = ev.kind;
+  const p = (ev.payload ?? {}) as Record<string, unknown>;
+  const time = formatTime(ev.ts);
+
+  // operator typed something
+  if (kind === "operator.message" || kind === "driver.prompt_sent") {
+    return (
+      <ChatBubble role="operator" time={time} text={(p.text as string) ?? ""} />
+    );
+  }
+
+  // driver replied with assistant text
+  if (kind === "worker.message") {
+    return (
+      <ChatBubble role="assistant" time={time} text={(p.text as string) ?? ""} />
+    );
+  }
+
+  // driver thinking
+  if (kind === "worker.thinking") {
+    return (
+      <div style={{ marginBottom: 4 }}>
+        <span style={{ color: "var(--text-4)", fontSize: 10 }}>{time}</span>
+        <span
+          style={{
+            color: "var(--text-3)",
+            marginLeft: 6,
+            fontStyle: "italic",
+            fontSize: 11,
+          }}
+        >
+          {(p.text as string) ?? "(thinking)"}
+        </span>
+      </div>
+    );
+  }
+
+  // driver tool call (spawn_worker, wait_for_workers, etc.)
+  if (kind === "worker.tool_call") {
+    return (
+      <div style={{ marginBottom: 6 }}>
+        <span style={{ color: "var(--text-4)", fontSize: 10 }}>{time}</span>
+        <span
+          style={{
+            color: "var(--accent)",
+            marginLeft: 6,
+            fontWeight: 500,
+            fontSize: 11,
+          }}
+        >
+          → {(p.text as string) ?? ""}
+        </span>
+      </div>
+    );
+  }
+
+  // driver report_progress — status pill
+  if (kind === "driver.report_progress") {
+    return (
+      <div
+        style={{
+          margin: "6px 0",
+          padding: "4px 10px",
+          background: "var(--bg-2)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          fontSize: 11,
+          color: "var(--text-2)",
+        }}
+      >
+        <span style={{ color: "var(--accent)", fontWeight: 500 }}>
+          progress
+        </span>
+        <span style={{ marginLeft: 8 }}>{(p.message as string) ?? ""}</span>
+      </div>
+    );
+  }
+
+  // driver ask_operator — yellow blocked-on-you box
+  if (kind === "driver.ask_operator") {
+    return (
+      <div
+        style={{
+          margin: "6px 0",
+          padding: "6px 10px",
+          background: "var(--status-suspended)22",
+          border: "1px solid var(--status-suspended)",
+          borderRadius: 4,
+          fontSize: 12,
+          color: "var(--text)",
+        }}
+      >
+        <div
+          style={{
+            color: "var(--status-suspended)",
+            fontWeight: 600,
+            fontSize: 10,
+            textTransform: "uppercase",
+            letterSpacing: 0.5,
+            marginBottom: 2,
+          }}
+        >
+          ❓ driver asks
+        </div>
+        {(p.question as string) ?? ""}
+      </div>
+    );
+  }
+
+  // driver finish — result rendered as the last assistant turn
+  if (kind === "driver.finish") {
+    return (
+      <ChatBubble
+        role="assistant"
+        time={time}
+        text={(p.result as string) ?? ""}
+        terminal
+      />
+    );
+  }
+
+  // lifecycle events — small dim line
+  if (
+    kind === "agent.spawning" ||
+    kind === "agent.spawned" ||
+    kind === "agent.driver_connected" ||
+    kind === "agent.completed" ||
+    kind === "agent.terminated"
+  ) {
+    return (
+      <div style={{ marginBottom: 4, color: "var(--text-4)", fontSize: 10 }}>
+        {time} · {kind} {(p.text as string) ?? ""}
+      </div>
+    );
+  }
+
+  // default: dim, just for visibility
+  return (
+    <div style={{ marginBottom: 4, color: "var(--text-4)", fontSize: 10 }}>
+      {time} {kind}
+    </div>
+  );
+}
+
+function ChatBubble({
+  role,
+  time,
+  text,
+  terminal,
+}: {
+  role: "operator" | "assistant";
+  time: string;
+  text: string;
+  terminal?: boolean;
+}) {
+  const isOp = role === "operator";
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 6,
+          marginBottom: 2,
+        }}
+      >
+        <span
+          style={{
+            color: isOp ? "var(--text-2)" : "var(--accent)",
+            fontWeight: 600,
+            fontSize: 10,
+            textTransform: "uppercase",
+            letterSpacing: 0.5,
+          }}
+        >
+          {isOp ? "you" : terminal ? "driver ✓" : "driver"}
+        </span>
+        <span style={{ color: "var(--text-4)", fontSize: 10 }}>{time}</span>
+      </div>
+      <div
+        style={{
+          color: "var(--text)",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          paddingLeft: 0,
+        }}
+      >
+        {text}
+      </div>
+    </div>
+  );
+}
+
+// DriverChatInput is the always-visible footer on driver tiles.
+// Pressing Enter (without shift) sends the operator's message
+// via api.promptAgent; the backend decides prompt vs. steer.
+function DriverChatInput({
+  agent,
+  recentEvents,
+  onPrompt,
+}: {
+  agent: Agent;
+  recentEvents: KEvent[];
+  onPrompt: (text: string) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Are we waiting for the operator to answer an ask_operator?
+  const lastAskIdx = (() => {
+    for (let i = recentEvents.length - 1; i >= 0; i--) {
+      const k = recentEvents[i].kind;
+      if (k === "driver.ask_operator") return i;
+      if (k === "operator.message") return -1; // already answered
+    }
+    return -1;
+  })();
+  const awaitingOperator = lastAskIdx >= 0;
+  const status = agent.status;
+
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setSending(true);
+    try {
+      await onPrompt(text);
+      setDraft("");
+    } catch (e) {
+      console.error("prompt failed", e);
+    } finally {
+      setSending(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  const placeholder =
+    status === "terminated" || status === "failed"
+      ? "driver has ended — start a new mission"
+      : awaitingOperator
+        ? "answer the driver's question…"
+        : "send a follow-up to the driver…";
+
+  const disabled = status === "terminated" || status === "failed";
+
+  return (
+    <footer
+      style={{
+        display: "flex",
+        gap: 6,
+        alignItems: "flex-end",
+        padding: 8,
+        background: "var(--bg-2)",
+        borderTop: `1px solid ${
+          awaitingOperator ? "var(--status-suspended)" : "var(--border)"
+        }`,
+        flexShrink: 0,
+      }}
+      // Stop drag/click bubbling so typing in the textarea
+      // doesn't try to drag the tile.
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <textarea
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            send();
+          }
+        }}
+        disabled={disabled}
+        placeholder={placeholder}
+        rows={2}
+        style={{
+          flex: 1,
+          background: "var(--bg)",
+          color: "var(--text)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          padding: "6px 8px",
+          fontSize: 12,
+          fontFamily: "inherit",
+          resize: "none",
+          outline: "none",
+          opacity: disabled ? 0.5 : 1,
+        }}
+      />
+      <button
+        onClick={send}
+        disabled={disabled || !draft.trim() || sending}
+        style={{
+          background:
+            !disabled && draft.trim() && !sending
+              ? "var(--accent)"
+              : "var(--bg-2)",
+          color:
+            !disabled && draft.trim() && !sending
+              ? "var(--bg)"
+              : "var(--text-4)",
+          border: "1px solid var(--border)",
+          borderRadius: 3,
+          padding: "6px 10px",
+          fontSize: 11,
+          fontWeight: 600,
+          cursor:
+            !disabled && draft.trim() && !sending
+              ? "pointer"
+              : "not-allowed",
+          textTransform: "uppercase",
+          letterSpacing: 0.5,
+          flexShrink: 0,
+        }}
+      >
+        {sending ? "…" : "send"}
+      </button>
+    </footer>
   );
 }
 

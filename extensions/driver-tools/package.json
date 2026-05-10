@@ -1,0 +1,15 @@
+{
+  "name": "karkhana-driver-tools",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Karkhana driver-agent tools (spawn_worker, wait_for_workers, ask_operator, report_progress, finish) — pi extension loaded by the host driver process.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "typebox": "^1.1.24"
+  }
+}

@@ -16,6 +16,13 @@ ui/.vite/
 ui/tsconfig.tsbuildinfo
 *.tsbuildinfo
 
+# Pi extension dependencies. Each extension has its own
+# package.json + node_modules; the host driver process loads them
+# at runtime via jiti. Only check in package.json + lockfile;
+# `make install-deps` (and bake-image.sh for in-sandbox
+# extensions) recreate node_modules.
+extensions/*/node_modules/
+
 # Editors
 .vscode/
 .idea/

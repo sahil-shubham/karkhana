@@ -21,15 +21,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gorilla/websocket"
 
 	"github.com/sahil-shubham/karkhana/pkg/bhatti"
 )
@@ -75,22 +71,30 @@ type Options struct {
 	OnDisconnect func(error)
 }
 
-// Driver is one open agent-protocol connection.
+// Driver is one open agent-protocol connection. It runs over
+// either a bhatti exec/ws WebSocket (workers) or a local stdio
+// pipe (drivers running on the Karkhana host) — the transport
+// is selected at construction time. See transport.go.
+//
+// AgentDriver below is the small interface that main.go holds;
+// every method on Driver satisfies it.
 type Driver struct {
+	// transport-agnostic context. sandboxID is empty for host
+	// drivers; bhatti is nil for host drivers.
 	sandboxID string
 	bhatti    *bhatti.Client
 
-	wsMu sync.Mutex
-	ws   *websocket.Conn
+	txMu sync.Mutex
+	tx   transport
 
 	sessionID atomic.Value // string
 
 	requestCounter atomic.Int64
 	pending        sync.Map // requestID(string) -> chan response
 
-	completionMu       sync.Mutex
-	completionWaiters  []chan completionResult
-	isStreaming        atomic.Bool
+	completionMu      sync.Mutex
+	completionWaiters []chan completionResult
+	isStreaming       atomic.Bool
 
 	closed   atomic.Bool
 	closeErr atomic.Value // error
@@ -99,6 +103,22 @@ type Driver struct {
 	onEvent      func(Event)
 	onDisconnect func(error)
 }
+
+// AgentDriver is the surface main.go uses. Both bhatti-backed
+// (workers) and host-stdio-backed (drivers) Drivers implement
+// it; main.go holds them in a single map[string]AgentDriver.
+type AgentDriver interface {
+	SessionID() string
+	IsStreaming() bool
+	Prompt(ctx context.Context, text string) error
+	FollowUp(ctx context.Context, text string) error
+	Steer(ctx context.Context, text string) error
+	Abort(ctx context.Context) error
+	AwaitCompletion(ctx context.Context) error
+	Close() error
+}
+
+var _ AgentDriver = (*Driver)(nil)
 
 type completionResult struct {
 	ok  bool
@@ -149,34 +169,22 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 		opts.MaxIdleSec = 3600
 	}
 
-	wsURL, err := buildExecWSURL(b.BaseURL, sandboxID, "")
+	wsTx, err := dialBhattiWS(ctx, b.BaseURL, b.APIKey, sandboxID)
 	if err != nil {
 		return nil, err
-	}
-
-	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = 30 * time.Second
-	header := http.Header{}
-	header.Set("Authorization", "Bearer "+b.APIKey)
-
-	conn, resp, err := dialer.DialContext(ctx, wsURL, header)
-	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("ws upgrade %d: %w", resp.StatusCode, err)
-		}
-		return nil, fmt.Errorf("ws dial: %w", err)
 	}
 
 	d := &Driver{
 		sandboxID:    sandboxID,
 		bhatti:       b,
-		ws:           conn,
+		tx:           wsTx,
 		doneCh:       make(chan struct{}),
 		onEvent:      opts.OnEvent,
 		onDisconnect: opts.OnDisconnect,
 	}
 
-	// Send the command spec — bhatti expects this as the first frame.
+	// Send the command spec — bhatti expects this as the first
+	// frame on /exec/ws.
 	cmdSpec := struct {
 		Cmd        []string          `json:"cmd"`
 		Env        map[string]string `json:"env,omitempty"`
@@ -186,32 +194,34 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 		Env:        opts.Env,
 		MaxIdleSec: opts.MaxIdleSec,
 	}
-	if err := conn.WriteJSON(cmdSpec); err != nil {
-		conn.Close()
+	if err := wsTx.WriteJSON(cmdSpec); err != nil {
+		wsTx.Close()
 		return nil, fmt.Errorf("write cmd spec: %w", err)
 	}
 
-	// First frame back is the bhatti session info.
-	if err := conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		conn.Close()
+	// First frame back is bhatti's session info. Read it directly
+	// off the underlying conn so the deadline applies and we can
+	// surface bhatti errors before the readLoop starts.
+	if err := wsTx.conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		wsTx.Close()
 		return nil, err
 	}
-	_, raw, err := conn.ReadMessage()
+	_, raw, err := wsTx.conn.ReadMessage()
 	if err != nil {
-		conn.Close()
+		wsTx.Close()
 		return nil, fmt.Errorf("read session info: %w", err)
 	}
 	var sess bhattiSessionInfo
 	if err := json.Unmarshal(raw, &sess); err != nil {
-		conn.Close()
+		wsTx.Close()
 		return nil, fmt.Errorf("decode session info: %w (got %q)", err, string(raw))
 	}
 	if sess.Type != "session" || sess.SessionID == "" {
-		conn.Close()
+		wsTx.Close()
 		return nil, fmt.Errorf("expected session info, got %q", string(raw))
 	}
 	d.sessionID.Store(sess.SessionID)
-	conn.SetReadDeadline(time.Time{}) // clear
+	wsTx.conn.SetReadDeadline(time.Time{}) // clear
 
 	go d.readLoop()
 
@@ -229,6 +239,13 @@ func (d *Driver) SessionID() string {
 		return v
 	}
 	return ""
+}
+
+// IsStreaming reports whether pi is currently mid-turn (i.e. the
+// agent is working). Callers use this to decide between Prompt
+// (idle — fresh turn) and Steer (mid-turn — inject guidance).
+func (d *Driver) IsStreaming() bool {
+	return d.isStreaming.Load()
 }
 
 // Prompt sends an initial user prompt to the agent. Pi will
@@ -258,12 +275,26 @@ func (d *Driver) Abort(ctx context.Context) error {
 // AwaitCompletion blocks until pi emits `agent_end` (or the
 // connection drops). Returns nil on clean completion, error on
 // disconnect.
+//
+// Race-safety: we re-check isStreaming AFTER acquiring the
+// completion lock, otherwise an agent_end that fires between
+// our initial Load() and our channel-registration would signal
+// an empty waiter list and our channel would block forever.
+// dispatchEvent's order is: Store(false) → lock → snapshot →
+// clear → unlock → signal. So under the lock, if Load() is
+// already false, the agent_end has happened (or is about to
+// happen with no signal because we'd have to be in the snapshot
+// to receive one). Either way, no need to wait.
 func (d *Driver) AwaitCompletion(ctx context.Context) error {
 	if !d.isStreaming.Load() {
 		return nil
 	}
 	ch := make(chan completionResult, 1)
 	d.completionMu.Lock()
+	if !d.isStreaming.Load() {
+		d.completionMu.Unlock()
+		return nil
+	}
 	d.completionWaiters = append(d.completionWaiters, ch)
 	d.completionMu.Unlock()
 	select {
@@ -277,21 +308,16 @@ func (d *Driver) AwaitCompletion(ctx context.Context) error {
 	}
 }
 
-// Close terminates the WS and the underlying piped session.
+// Close terminates the transport and the underlying pi session.
 // Idempotent.
 func (d *Driver) Close() error {
 	if !d.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	d.wsMu.Lock()
-	defer d.wsMu.Unlock()
-	if d.ws != nil {
-		_ = d.ws.WriteControl(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-			time.Now().Add(time.Second),
-		)
-		_ = d.ws.Close()
+	d.txMu.Lock()
+	defer d.txMu.Unlock()
+	if d.tx != nil {
+		_ = d.tx.Close()
 	}
 	close(d.doneCh)
 	return nil
@@ -300,12 +326,12 @@ func (d *Driver) Close() error {
 // --- private ---
 
 func (d *Driver) send(payload map[string]any) error {
-	d.wsMu.Lock()
-	defer d.wsMu.Unlock()
-	if d.ws == nil || d.closed.Load() {
+	d.txMu.Lock()
+	defer d.txMu.Unlock()
+	if d.tx == nil || d.closed.Load() {
 		return errors.New("driver closed")
 	}
-	return d.ws.WriteJSON(payload)
+	return d.tx.WriteJSON(payload)
 }
 
 // sendCommand fire-and-forgets a request/response RPC command with
@@ -337,27 +363,12 @@ func (d *Driver) readLoop() {
 	}()
 
 	for {
-		_, raw, err := d.ws.ReadMessage()
-		if err != nil {
+		var ev Event
+		if err := d.tx.ReadJSON(&ev); err != nil {
 			d.closeErr.Store(err)
 			return
 		}
-		// Pi emits one JSON object per message most of the time, but
-		// sometimes a single WS frame carries multiple newline-
-		// delimited objects. Be tolerant of both.
-		for _, line := range splitLines(raw) {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var ev Event
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				slog.Debug("driver: skipping non-JSON line",
-					"agent", d.sandboxID, "line", truncate(line, 80))
-				continue
-			}
-			d.dispatchEvent(ev)
-		}
+		d.dispatchEvent(ev)
 	}
 }
 

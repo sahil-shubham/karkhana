@@ -46,11 +46,24 @@ export default function App() {
   );
   const [connState, setConnState] = useState<ConnState>("connecting");
 
-  // Right-click dispatch state. Non-null while the popover is open.
+  // Right-click dispatch state. Non-null while the popover is
+  // open. Holds BOTH screen coords (for popover positioning) and
+  // canvas-flow coords (for the mission's spawn origin).
   const [newMissionAt, setNewMissionAt] = useState<{
     screenX: number;
     screenY: number;
+    flowX: number;
+    flowY: number;
   } | null>(null);
+
+  // Per-mission canvas origin. When the operator dispatches via
+  // right-click, we remember WHERE they clicked so the mission's
+  // driver tile lands there. Missions without an entry (e.g.
+  // recovered ones) auto-position. In-memory only for v0.6;
+  // moves to the persistence layer later.
+  const [missionOrigins, setMissionOrigins] = useState<
+    Map<string, { x: number; y: number }>
+  >(new Map());
 
   // ---- WS subscription ----
   useEffect(() => {
@@ -210,14 +223,24 @@ export default function App() {
 
   // ---- callbacks ----
 
-  const handleCreateMission = useCallback(async (goal: string) => {
-    try {
-      const m = await api.createMission(goal);
-      setMissions((ms) => [m, ...ms.filter((x) => x.id !== m.id)]);
-    } catch (e) {
-      console.error("createMission failed", e);
-    }
-  }, []);
+  const handleCreateMission = useCallback(
+    async (goal: string, origin?: { x: number; y: number }) => {
+      try {
+        const m = await api.createMission(goal);
+        setMissions((ms) => [m, ...ms.filter((x) => x.id !== m.id)]);
+        if (origin) {
+          setMissionOrigins((prev) => {
+            const next = new Map(prev);
+            next.set(m.id, origin);
+            return next;
+          });
+        }
+      } catch (e) {
+        console.error("createMission failed", e);
+      }
+    },
+    [],
+  );
 
   const handleTerminateAgent = useCallback(async (agentID: string) => {
     if (!confirm("Terminate this agent? The sandbox will be destroyed.")) return;
@@ -227,6 +250,15 @@ export default function App() {
       console.error("terminate failed", e);
     }
   }, []);
+
+  // Operator chat — send a follow-up to a driver. Backend
+  // decides between prompt (idle) and steer (streaming).
+  const handlePromptAgent = useCallback(
+    async (agentID: string, text: string) => {
+      await api.promptAgent(agentID, text);
+    },
+    [],
+  );
 
   const handleDeleteMission = useCallback(
     async (id: string) => {
@@ -249,6 +281,12 @@ export default function App() {
           });
           return next;
         });
+        setMissionOrigins((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Map(prev);
+          next.delete(id);
+          return next;
+        });
       } catch (e) {
         console.error("deleteMission failed", e);
       }
@@ -256,12 +294,22 @@ export default function App() {
     [missions],
   );
 
-  // Right-click on empty canvas pane.
+  // Right-click on empty canvas pane. Canvas converts the
+  // event's screen coords to canvas-flow coords (using
+  // useReactFlow().screenToFlowPosition under the hood) and
+  // passes both up here.
   const handlePaneContextMenu = useCallback(
-    (event: React.MouseEvent | MouseEvent) => {
-      // React-flow already calls preventDefault for us, but be safe.
+    (
+      event: React.MouseEvent | MouseEvent,
+      flowPos: { x: number; y: number },
+    ) => {
       if ("preventDefault" in event) event.preventDefault();
-      setNewMissionAt({ screenX: event.clientX, screenY: event.clientY });
+      setNewMissionAt({
+        screenX: event.clientX,
+        screenY: event.clientY,
+        flowX: flowPos.x,
+        flowY: flowPos.y,
+      });
     },
     [],
   );
@@ -336,9 +384,11 @@ export default function App() {
           agents={agents}
           missions={missions}
           eventsByAgent={eventsByAgent}
+          missionOrigins={missionOrigins}
           onTerminateAgent={handleTerminateAgent}
           onDeleteMission={handleDeleteMission}
           onPaneContextMenu={handlePaneContextMenu}
+          onPrompt={handlePromptAgent}
         />
       </ReactFlowProvider>
 
@@ -367,7 +417,10 @@ export default function App() {
           screenX={newMissionAt.screenX}
           screenY={newMissionAt.screenY}
           onSubmit={(goal) => {
-            handleCreateMission(goal);
+            handleCreateMission(goal, {
+              x: newMissionAt.flowX,
+              y: newMissionAt.flowY,
+            });
             setNewMissionAt(null);
           }}
           onCancel={() => setNewMissionAt(null)}
