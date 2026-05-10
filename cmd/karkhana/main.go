@@ -103,6 +103,7 @@ func main() {
 		internalURL:       cfg.InternalURL,
 		driverTokens:      map[string]string{},
 		driverPendingAsk:  map[string]chan string{},
+		timingLogged:      map[string]map[string]bool{},
 	}
 
 	// Seed the event ID counter from the persisted max so newly
@@ -223,6 +224,13 @@ type serverState struct {
 	// channel). Keyed by driver agent ID. Only one outstanding
 	// ask per driver at a time.
 	driverPendingAsk map[string]chan string
+
+	// Per-mission "have we logged this milestone yet" tracker.
+	// Keys are missionID; value is a bitmask of which milestones
+	// have already been logged (one slog line apiece, otherwise
+	// the log fills up). See timing.go in pkg/mission for the
+	// canonical milestone definitions.
+	timingLogged map[string]map[string]bool
 }
 
 func (s *serverState) nextEventID() int64 {
@@ -297,7 +305,21 @@ func (s *serverState) handleMissions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *serverState) handleMissionByID(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/api/missions/"):]
+	path := r.URL.Path[len("/api/missions/"):]
+	// Sub-routes: /api/missions/:id/<action>
+	if idx := strings.IndexByte(path, '/'); idx >= 0 {
+		missionID := path[:idx]
+		action := path[idx+1:]
+		switch action {
+		case "timing":
+			s.handleMissionTiming(w, r, missionID)
+			return
+		default:
+			http.Error(w, "unknown sub-route: "+action, 404)
+			return
+		}
+	}
+	id := path
 	s.mu.Lock()
 	m, ok := s.missions[id]
 	s.mu.Unlock()
@@ -314,6 +336,35 @@ func (s *serverState) handleMissionByID(w http.ResponseWriter, r *http.Request) 
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// handleMissionTiming returns mission.MissionTiming — milestone
+// timestamps + computed durations — derived from the events
+// table. Useful for answering "how long did the driver take to
+// react" without scrolling logs.
+//
+// GET /api/missions/:id/timing
+func (s *serverState) handleMissionTiming(w http.ResponseWriter, r *http.Request, missionID string) {
+	if s.store == nil {
+		http.Error(w, "persistence disabled", http.StatusServiceUnavailable)
+		return
+	}
+	s.mu.Lock()
+	m, ok := s.missions[missionID]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, "not found", 404)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	evs, err := s.store.AllEventsForMission(ctx, missionID)
+	if err != nil {
+		http.Error(w, "events read failed: "+err.Error(), 500)
+		return
+	}
+	timing := mission.ComputeMissionTiming(missionID, m.CreatedAt, evs)
+	writeJSON(w, 200, timing)
 }
 
 // deleteMission tears down everything attached to a mission:
@@ -342,6 +393,7 @@ func (s *serverState) deleteMission(m *mission.Mission) {
 	// Remove from state
 	s.mu.Lock()
 	delete(s.missions, m.ID)
+	delete(s.timingLogged, m.ID)
 	for id, a := range s.agents {
 		if a.MissionID == m.ID {
 			delete(s.agents, id)
@@ -529,8 +581,11 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 	s.drivers[driverID] = drv
 	s.mu.Unlock()
 
-	slog.Info("driver spawned",
-		"mission", m.ID, "driver", driverID, "argv", argv[0])
+	driverSpawnedAt := time.Now()
+	slog.Info("timing: driver spawned",
+		"mission", m.ID,
+		"driver", driverID,
+		"warmup_ms", driverSpawnedAt.Sub(m.CreatedAt).Milliseconds())
 
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
@@ -560,11 +615,16 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 		s.failAgent(m, driverAgent, "send prompt failed: "+err.Error())
 		return
 	}
+	promptSentAt := time.Now()
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverID,
-		Kind: "driver.prompt_sent", Ts: time.Now(),
+		Kind: "driver.prompt_sent", Ts: promptSentAt,
 		Payload: map[string]any{"text": m.Goal},
 	})
+	slog.Info("timing: first prompt sent",
+		"mission", m.ID,
+		"goal_len", len(m.Goal),
+		"warmup_ms", promptSentAt.Sub(m.CreatedAt).Milliseconds())
 
 	// We do NOT AwaitCompletion. The driver is persistent — it
 	// finishes a turn (agent_end) but stays running, awaiting
@@ -839,19 +899,22 @@ You are the DRIVER agent for a Karkhana mission. You orchestrate worker agents t
 
 Your orchestration tools:
 
-  spawn_worker(task)                   create a worker; returns immediately with worker_id
-  wait_for_workers(worker_ids, timeout) block until those workers terminate; returns their outputs
-  ask_operator(question)               pause and ask the human; blocks until they reply
-  report_progress(message)             send a status update without blocking
-  finish(result)                       checkpoint the current task with a final answer
+  spawn_worker(task)                    one worker; returns its worker_id immediately
+  spawn_workers(tasks)                  N workers in ONE tool call, fanned out in parallel.
+                                         PREFER this for fan-out (N≥2).
+  wait_for_workers(worker_ids, timeout) block until those workers finish; returns outputs
+  ask_operator(question)                pause and ask the human; blocks until they reply
+  report_progress(message)              send a status update without blocking
+  finish(result)                        checkpoint the current task with a final answer
 
 ## Always parallelize when possible
 
-If the operator's goal has TWO OR MORE independent parts, spawn that many workers IN PARALLEL (multiple spawn_worker calls before any wait_for_workers). Then wait_for_workers([w1, w2, ...]) on all of them at once.
+If the operator's goal has TWO OR MORE independent parts, spawn them ALL via a single spawn_workers([t1, t2, ..., tN]) call — bhatti boots them concurrently. Then wait_for_workers([w1, w2, ...]) on all of them at once.
 
-  Good:    "compare A, B, C"          → spawn 3 workers, wait once, synthesize
-           "summarize 5 articles"     → spawn 5 workers, wait once, combine
-  Bad:     spawn w1, wait, spawn w2, wait, ...   (wastes the parallelism)
+  Good:    "compare A, B, C"          → spawn_workers([tA, tB, tC]), wait once, synthesize
+           "summarize 5 articles"     → spawn_workers([t1..t5]), wait once, combine
+  OK:      spawn_worker for a single one-off (no fan-out)
+  Bad:     spawn_worker, wait, spawn_worker, wait, ...   (defeats the parallelism)
 
 ## Phased pattern: discovery + fan-out
 
@@ -862,8 +925,8 @@ Many tasks have TWO PHASES — first find a list, then research each item in par
     wait_for_workers([w1])
     parse URLs from w1's result
 
-  Phase 2 (N workers, parallel):
-    spawn_worker("research <url_i>")  for each url_i  (do all the spawn calls before waiting)
+  Phase 2 (N workers, parallel — ONE call):
+    spawn_workers(["research <url_1>", "research <url_2>", ..., "research <url_N>"])
     wait_for_workers([w2..wN+1])
     synthesize
 
@@ -1074,6 +1137,7 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 
 	switch t {
 	case "agent_start":
+		s.maybeLogFirstReaction(missionID, agentID, "agent_start")
 		s.publish(mission.Event{
 			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
 			Kind: "worker.thinking", Ts: time.Now(),
@@ -1112,6 +1176,7 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 		toolName, _ := ev["toolName"].(string)
 		args, _ := ev["args"].(map[string]any)
 		summary := summarizeToolCall(toolName, args)
+		s.maybeLogFirstAction(missionID, agentID, toolName)
 		s.publish(mission.Event{
 			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
 			Kind: "worker.tool_call", Ts: time.Now(),
@@ -1641,6 +1706,72 @@ func (s *serverState) recoverWorker(m *mission.Mission, w *mission.Agent) {
 
 // --- helpers ---
 
+// maybeLogFirstReaction logs the time-to-first-token for a
+// driver or worker agent if we haven't logged it yet for this
+// mission. Idempotent on (missionID, agentID).
+func (s *serverState) maybeLogFirstReaction(missionID, agentID, source string) {
+	s.mu.Lock()
+	m := s.missions[missionID]
+	a := s.agents[agentID]
+	if m == nil || a == nil {
+		s.mu.Unlock()
+		return
+	}
+	logged := s.timingLogged[missionID]
+	if logged == nil {
+		logged = map[string]bool{}
+		s.timingLogged[missionID] = logged
+	}
+	key := "first_reaction:" + agentID
+	if logged[key] {
+		s.mu.Unlock()
+		return
+	}
+	logged[key] = true
+	s.mu.Unlock()
+
+	slog.Info("timing: first reaction",
+		"mission", missionID,
+		"agent", agentID,
+		"role", a.Role,
+		"source", source,
+		"since_mission_created_ms", time.Since(m.CreatedAt).Milliseconds(),
+		"since_agent_started_ms", time.Since(a.StartedAt).Milliseconds())
+}
+
+// maybeLogFirstAction logs the time-to-first-tool-call for an
+// agent (driver: spawn_worker; worker: any computer-use tool).
+// Idempotent on (missionID, agentID).
+func (s *serverState) maybeLogFirstAction(missionID, agentID, toolName string) {
+	s.mu.Lock()
+	m := s.missions[missionID]
+	a := s.agents[agentID]
+	if m == nil || a == nil {
+		s.mu.Unlock()
+		return
+	}
+	logged := s.timingLogged[missionID]
+	if logged == nil {
+		logged = map[string]bool{}
+		s.timingLogged[missionID] = logged
+	}
+	key := "first_action:" + agentID
+	if logged[key] {
+		s.mu.Unlock()
+		return
+	}
+	logged[key] = true
+	s.mu.Unlock()
+
+	slog.Info("timing: first action",
+		"mission", missionID,
+		"agent", agentID,
+		"role", a.Role,
+		"tool", toolName,
+		"since_mission_created_ms", time.Since(m.CreatedAt).Milliseconds(),
+		"since_agent_started_ms", time.Since(a.StartedAt).Milliseconds())
+}
+
 // publish sends the event to the in-memory bus (which fans to
 // connected canvas WS clients) AND persists it to SQLite. The
 // store write is best-effort; failures are logged but don't
@@ -1744,6 +1875,8 @@ func (s *serverState) handleInternalDriver(w http.ResponseWriter, r *http.Reques
 	switch action {
 	case "spawn_worker":
 		s.handleToolSpawnWorker(w, r, driverAgent, m)
+	case "spawn_workers":
+		s.handleToolSpawnWorkers(w, r, driverAgent, m)
 	case "wait_for_workers":
 		s.handleToolWaitForWorkers(w, r, m)
 	case "ask_operator":
@@ -1779,6 +1912,60 @@ func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Reque
 		"sandbox_id": worker.BhattiSandboxID, // may be empty if still booting
 		"status":     worker.Status,
 	})
+}
+
+// handleToolSpawnWorkers is the bulk version: one HTTP call,
+// N workers spawned concurrently. The driver LLM calls this
+// instead of spawn_worker repeatedly when fanning out.
+//
+// Concurrency: spawnWorker is itself non-blocking (creates the
+// agent record + kicks off a runWorker goroutine, returns the
+// new worker_id). So we just call it N times in a loop — the
+// goroutines do the parallel sandbox boot, KasmVNC publish,
+// pi-rpc connect dance. No semaphore needed; bhatti's API
+// handles the concurrent CreateSandbox calls fine.
+func (s *serverState) handleToolSpawnWorkers(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Tasks []string `json:"tasks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.Tasks) == 0 {
+		http.Error(w, "tasks required", http.StatusBadRequest)
+		return
+	}
+	// Soft-cap matches the schema's maxItems on the TS side.
+	// Without this guard a confused agent could spawn 1000
+	// sandboxes — expensive and likely to trip bhatti rate limits.
+	if len(body.Tasks) > 20 {
+		http.Error(w, "too many tasks (max 20)", http.StatusBadRequest)
+		return
+	}
+
+	workers := make([]map[string]any, 0, len(body.Tasks))
+	for _, task := range body.Tasks {
+		if strings.TrimSpace(task) == "" {
+			continue
+		}
+		worker, err := s.spawnWorker(driverAgent.ID, m, task)
+		if err != nil {
+			// Continue with the rest; partial success is
+			// preferable to refusing the whole batch. The driver
+			// will see fewer worker IDs than tasks and can
+			// decide what to do.
+			slog.Warn("bulk spawn: one worker failed",
+				"err", err, "task", truncate(task, 80))
+			continue
+		}
+		workers = append(workers, map[string]any{
+			"worker_id":  worker.ID,
+			"sandbox_id": worker.BhattiSandboxID,
+			"status":     worker.Status,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workers": workers})
 }
 
 func (s *serverState) handleToolWaitForWorkers(w http.ResponseWriter, r *http.Request, _ *mission.Mission) {

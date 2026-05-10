@@ -75,7 +75,7 @@ async function karkhanaCall<T>(path: string, body: unknown): Promise<T> {
   return JSON.parse(txt) as T;
 }
 
-// --- spawn_worker ---
+// --- spawn_worker / spawn_workers ---
 
 interface SpawnWorkerResult {
   worker_id: string;
@@ -83,16 +83,19 @@ interface SpawnWorkerResult {
   status: string;
 }
 
+interface SpawnWorkersResult {
+  workers: SpawnWorkerResult[];
+}
+
 const spawnWorkerTool = defineTool({
   name: "spawn_worker",
   label: "Spawn Worker",
   description:
-    "Spawn a new worker agent in its own bhatti microVM, with the " +
+    "Spawn ONE worker agent in its own bhatti microVM, with the " +
     "computer-use toolset (browser, screenshot, click, type, " +
-    "scroll). The worker runs in parallel with other workers and " +
-    "this driver. Returns the worker's ID, which can be passed " +
-    "to wait_for_workers later. Returns immediately — does NOT " +
-    "block waiting for the worker to finish.",
+    "scroll). Returns immediately with the worker's ID. " +
+    "For fanouts of 2 or more workers, prefer `spawn_workers` " +
+    "(plural) — it spawns them all in one tool call.",
   parameters: Type.Object({
     task: Type.String({
       description:
@@ -113,6 +116,47 @@ const spawnWorkerTool = defineTool({
             `worker spawned: ${r.worker_id}\n` +
             `sandbox: ${r.sandbox_id}\n` +
             `status: ${r.status}`,
+        },
+      ],
+      details: r,
+    };
+  },
+});
+
+const spawnWorkersTool = defineTool({
+  name: "spawn_workers",
+  label: "Spawn Workers (bulk)",
+  description:
+    "Spawn N worker agents in parallel — ONE tool call, N " +
+    "sandboxes booted concurrently on bhatti. Each worker gets " +
+    "its own task description and runs independently. Returns " +
+    "the list of worker IDs in the same order as the tasks. " +
+    "Use this for fan-out (compare A/B/C, summarize 5 articles, " +
+    "phase-2 of discovery+research). For a single worker, use " +
+    "`spawn_worker`. Returns immediately — does NOT block.",
+  parameters: Type.Object({
+    tasks: Type.Array(
+      Type.String({
+        description:
+          "One task description per worker. Each is self-contained " +
+          "and must end with 'do not call any more tools after that' " +
+          "so the worker terminates cleanly when done.",
+      }),
+      { minItems: 1, maxItems: 20 },
+    ),
+  }),
+  async execute(_id, { tasks }) {
+    const r = await karkhanaCall<SpawnWorkersResult>("/spawn_workers", {
+      tasks,
+    });
+    const lines = r.workers.map(
+      (w, i) => `  ${i + 1}. ${w.worker_id}  (sandbox=${w.sandbox_id})`,
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${r.workers.length} workers spawned:\n${lines.join("\n")}`,
         },
       ],
       details: r,
@@ -279,6 +323,7 @@ const finishTool = defineTool({
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool(spawnWorkerTool);
+  pi.registerTool(spawnWorkersTool);
   pi.registerTool(waitForWorkersTool);
   pi.registerTool(askOperatorTool);
   pi.registerTool(reportProgressTool);
