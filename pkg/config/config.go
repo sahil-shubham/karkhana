@@ -41,10 +41,28 @@ type Config struct {
 	// extension dir to load from).
 	PiExtensions []string
 
+	// DriverToolsPath is the absolute path on the KARKHANA HOST
+	// to the driver-tools pi extension's index.ts. The host pi
+	// process loads this to register spawn_worker /
+	// wait_for_workers / ask_operator / report_progress / finish.
+	// Default: "<cwd>/extensions/driver-tools/index.ts".
+	DriverToolsPath string
+
+	// DriverSessionRoot is the host directory under which each
+	// mission's driver pi-rpc session JSONL lives. One subdir
+	// per mission ID. Default: "/tmp/karkhana-driver-sessions".
+	DriverSessionRoot string
+
+	// InternalURL is what the driver subprocess uses to call back
+	// into Karkhana for tool callbacks (spawn_worker, etc.).
+	// Default: "http://localhost:4000" — i.e. the same Addr we
+	// listen on. Override for non-default ports.
+	InternalURL string
+
 	// Pi (worker agent) provider config. If unset, we auto-detect
 	// from whichever API key is present in the env.
 	PiProvider string // e.g. "openrouter" | "anthropic" | "openai"
-	PiModel    string // e.g. "anthropic/claude-sonnet-4"
+	PiModel    string // e.g. "anthropic/claude-sonnet-4.6"
 }
 
 // DefaultComputerUseExtensionPath is where bake-image.sh installs
@@ -107,6 +125,22 @@ func Load() (*Config, error) {
 	// pre-baked image (e.g. kk-base from scripts/bake-image.sh).
 	cfg.WorkerImage = envOr("KARKHANA_WORKER_IMAGE", "computer")
 
+	// Driver tools extension path on the host. Resolved to an
+	// absolute path so the host pi subprocess (which may have a
+	// different cwd than karkhana) finds it.
+	cfg.DriverToolsPath = envOr("KARKHANA_DRIVER_TOOLS_PATH", "")
+	if cfg.DriverToolsPath == "" {
+		wd, _ := os.Getwd()
+		cfg.DriverToolsPath = filepath.Join(
+			wd, "extensions", "driver-tools", "index.ts",
+		)
+	}
+	cfg.DriverSessionRoot = envOr(
+		"KARKHANA_DRIVER_SESSION_ROOT",
+		"/tmp/karkhana-driver-sessions",
+	)
+	cfg.InternalURL = envOr("KARKHANA_INTERNAL_URL", "http://localhost"+cfg.Addr)
+
 	// Pi extensions. Explicit env var (KARKHANA_PI_EXTENSIONS,
 	// comma-separated) wins. Otherwise: empty for the vanilla
 	// "computer" image (no extension dir baked); for any other
@@ -133,7 +167,7 @@ func autoDetectPiProvider(forcedModel string) (string, string) {
 	case os.Getenv("OPENROUTER_API_KEY") != "":
 		model := forcedModel
 		if model == "" {
-			model = "anthropic/claude-sonnet-4"
+			model = "anthropic/claude-sonnet-4.6"
 		}
 		return "openrouter", model
 	case os.Getenv("ANTHROPIC_API_KEY") != "":
