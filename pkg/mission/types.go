@@ -32,15 +32,15 @@ const (
 // the first driver of a mission; "spawn" is a worker dispatched
 // by a driver; "fork" is a Pattern-A snapshot fork (v0.5+).
 const (
-	SpawnRoot       = "root"
-	SpawnSpawn      = "spawn"
-	SpawnFork       = "fork"
-	SpawnSubDriver  = "sub_driver"
+	SpawnRoot      = "root"
+	SpawnSpawn     = "spawn"
+	SpawnFork      = "fork"
+	SpawnSubDriver = "sub_driver"
 )
 
 // Mission is the operator's intent. One per top-level user request.
 type Mission struct {
-	ID            string     `json:"id"`              // msn_<12-hex>
+	ID            string     `json:"id"` // msn_<12-hex>
 	Goal          string     `json:"goal"`
 	Status        string     `json:"status"`
 	DriverAgentID string     `json:"driver_agent_id,omitempty"`
@@ -51,16 +51,16 @@ type Mission struct {
 
 // Agent is an execution instance. Drivers and workers both live here.
 type Agent struct {
-	ID             string  `json:"id"`              // agent_<12-hex>
-	MissionID      string  `json:"mission_id"`
-	ParentAgentID  string  `json:"parent_agent_id,omitempty"`
-	Role           string  `json:"role"`            // driver | worker
-	SpawnKind      string  `json:"spawn_kind"`      // root | spawn | fork | sub_driver
+	ID            string `json:"id"` // agent_<12-hex>
+	MissionID     string `json:"mission_id"`
+	ParentAgentID string `json:"parent_agent_id,omitempty"`
+	Role          string `json:"role"`       // driver | worker
+	SpawnKind     string `json:"spawn_kind"` // root | spawn | fork | sub_driver
 
 	// Substrate handles. Drivers running on the Karkhana host have
 	// no sandbox_id; workers always do.
-	BhattiSandboxID        string `json:"bhatti_sandbox_id,omitempty"`
-	SpawnedFromSnapshotID  string `json:"spawned_from_snapshot_id,omitempty"`
+	BhattiSandboxID       string `json:"bhatti_sandbox_id,omitempty"`
+	SpawnedFromSnapshotID string `json:"spawned_from_snapshot_id,omitempty"`
 	// KasmVNCURL is the RAW upstream URL (Cloudflare-published
 	// host with Basic auth). Server-side only — never sent to the
 	// browser. The browser must talk to the same-origin proxy
@@ -76,9 +76,9 @@ type Agent struct {
 	// distinction stays a server-side internal.
 	KasmVNCProxyPath string `json:"kasmvnc_url,omitempty"`
 
-	KasmVNCUser string `json:"-"` // not exposed over the wire
-	KasmVNCPass string `json:"-"`
-	AgentEndpointURL       string `json:"agent_endpoint_url,omitempty"`
+	KasmVNCUser      string `json:"-"` // not exposed over the wire
+	KasmVNCPass      string `json:"-"`
+	AgentEndpointURL string `json:"agent_endpoint_url,omitempty"`
 
 	// Task / config
 	Task   string `json:"task,omitempty"`
@@ -89,10 +89,10 @@ type Agent struct {
 	PiSessionFile   string `json:"pi_session_file,omitempty"`
 
 	// Lifecycle
-	Status               string   `json:"status"`
-	Outcome              string   `json:"outcome,omitempty"`
-	FinalArtifactIDs     []string `json:"final_artifact_ids,omitempty"`
-	FinalAssistantText   string   `json:"final_assistant_text,omitempty"`
+	Status             string   `json:"status"`
+	Outcome            string   `json:"outcome,omitempty"`
+	FinalArtifactIDs   []string `json:"final_artifact_ids,omitempty"`
+	FinalAssistantText string   `json:"final_assistant_text,omitempty"`
 
 	// Accounting
 	TokensInput     int64   `json:"tokens_input"`
@@ -114,18 +114,18 @@ type Agent struct {
 // Event is a typed observation. Source of truth for the canvas
 // timeline, audit log, and replay. Kinds are namespaced:
 //
-//   mission.created, mission.completed
-//   agent.spawned, agent.forked, agent.terminated, agent.outcome
-//   driver.prompt_sent, driver.followup_sent
-//   worker.event_received     (forwarded pi-rpc events)
-//   worker.thinking, worker.tool_call, worker.message
+//	mission.created, mission.completed
+//	agent.spawned, agent.forked, agent.terminated, agent.outcome
+//	driver.prompt_sent, driver.followup_sent
+//	worker.event_received     (forwarded pi-rpc events)
+//	worker.thinking, worker.tool_call, worker.message
 //
 // The canvas subscribes to these to update tile state.
 type Event struct {
-	ID        int64           `json:"id"`
-	MissionID string          `json:"mission_id"`
-	AgentID   string          `json:"agent_id,omitempty"`
-	Kind      string          `json:"kind"`
-	Payload   any             `json:"payload"`
-	Ts        time.Time       `json:"ts"`
+	ID        int64     `json:"id"`
+	MissionID string    `json:"mission_id"`
+	AgentID   string    `json:"agent_id,omitempty"`
+	Kind      string    `json:"kind"`
+	Payload   any       `json:"payload"`
+	Ts        time.Time `json:"ts"`
 }

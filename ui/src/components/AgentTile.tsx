@@ -18,12 +18,7 @@
 // the tile isn't focused (click anywhere → focus → shield clears
 // → KasmVNC takes over). Standard pattern.
 
-import {
-  Handle,
-  NodeResizer,
-  Position,
-  type NodeProps,
-} from "@xyflow/react";
+import { Handle, NodeResizer, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useRef, useState } from "react";
 import type { Agent, KEvent } from "../lib/types";
 import { apiURL } from "../lib/config";
@@ -109,17 +104,11 @@ export function AgentTile({ data, selected }: NodeProps) {
 
   const tile = (
     <div
-      className={
-        "tile" + (driverStreaming ? " tile-streaming" : "")
-      }
+      className={"tile" + (driverStreaming ? " tile-streaming" : "")}
       style={{
         background: "var(--bg-1)",
         border: `1px solid ${
-          driverStreaming
-            ? accent
-            : focused
-              ? accent
-              : "var(--border)"
+          driverStreaming ? accent : focused ? accent : "var(--border)"
         }`,
         borderRadius: "var(--radius)",
         width: "100%",
@@ -744,10 +733,7 @@ function WorkerView({
   }
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
-      <div
-        ref={slotRef}
-        style={{ width: "100%", height: "100%" }}
-      />
+      <div ref={slotRef} style={{ width: "100%", height: "100%" }} />
       {!focused && (
         <div
           onClick={onFocus}
@@ -838,9 +824,7 @@ function ConversationStream({
           (the LLM may take 5+ seconds before the first delta
           arrives, which is OK — the typing-cursor below covers
           that gap). */}
-      {streaming && (
-        <LiveThinkingBubble text={liveThinking} />
-      )}
+      {streaming && <LiveThinkingBubble text={liveThinking} />}
       {!stick && events.length > 5 && (
         <button
           onClick={() => {
@@ -947,7 +931,11 @@ function ConversationRow({ ev }: { ev: KEvent }) {
   // driver replied with assistant text
   if (kind === "worker.message") {
     return (
-      <ChatBubble role="assistant" time={time} text={(p.text as string) ?? ""} />
+      <ChatBubble
+        role="assistant"
+        time={time}
+        text={(p.text as string) ?? ""}
+      />
     );
   }
 
@@ -1232,9 +1220,7 @@ function DriverChatInput({
           fontSize: 11,
           fontWeight: 600,
           cursor:
-            !disabled && draft.trim() && !sending
-              ? "pointer"
-              : "not-allowed",
+            !disabled && draft.trim() && !sending ? "pointer" : "not-allowed",
           textTransform: "uppercase",
           letterSpacing: 0.5,
           flexShrink: 0,

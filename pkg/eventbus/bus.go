@@ -19,9 +19,9 @@ import (
 
 // Bus is the in-process broadcast hub. Safe for concurrent use.
 type Bus struct {
-	mu      sync.Mutex
-	subs    map[chan mission.Event]struct{}
-	closed  bool
+	mu     sync.Mutex
+	subs   map[chan mission.Event]struct{}
+	closed bool
 }
 
 // New creates an empty bus.

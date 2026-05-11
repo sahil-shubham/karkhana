@@ -29,7 +29,7 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 1 << 16 // 64 KB ought to be enough; we don't take large
-	                          // messages from the browser today.
+	// messages from the browser today.
 )
 
 // upgrader allows any origin during development. Tighten for prod.

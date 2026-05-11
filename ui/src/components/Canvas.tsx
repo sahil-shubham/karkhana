@@ -290,9 +290,7 @@ export function Canvas({
           maskColor="rgba(0,0,0,0.5)"
           nodeColor={(n) => {
             const role = (n.data as AgentTileData)?.agent?.role;
-            return role === "driver"
-              ? "var(--accent)"
-              : "var(--accent-worker)";
+            return role === "driver" ? "var(--accent)" : "var(--accent-worker)";
           }}
           pannable
           zoomable
@@ -362,7 +360,9 @@ function buildGraph(
   // they survive Karkhana restart. Missions whose driver has
   // null coords (programmatic dispatches, pre-persistence rows)
   // get auto-positioned in next-free-column order.
-  const missionOrigin = (missionID: string): { x: number; y: number } | null => {
+  const missionOrigin = (
+    missionID: string,
+  ): { x: number; y: number } | null => {
     const driver = (agentsByMission.get(missionID) ?? []).find(
       (a) => a.role === "driver",
     );
@@ -663,8 +663,7 @@ function layoutMissionLane(
     if (a.parent_agent_id && byID.has(a.parent_agent_id)) {
       const lastAction = lastDriverActionByAgent.get(a.id);
       const driverActed =
-        !!lastAction &&
-        now - Date.parse(lastAction.ts) < pulseHorizonMs;
+        !!lastAction && now - Date.parse(lastAction.ts) < pulseHorizonMs;
       // Also pulse briefly when the driver spawns this worker.
       const recentlySpawned = now - Date.parse(a.started_at) < 4000;
       const pulsing =
@@ -727,10 +726,8 @@ function layoutMissionLane(
       const wDepth = depth.get(workerRow[0].id) ?? driverDepth + 1;
       const wY = yByDepth.get(wDepth) ?? driverY + DRIVER_H_DEFAULT + ROW_GAP;
       const grid = gridLayout(workerRow.length);
-      const gridW =
-        grid.cols * TILE_W_DEFAULT + (grid.cols - 1) * COL_GAP;
-      const gridH =
-        grid.rows * TILE_H_DEFAULT + (grid.rows - 1) * ROW_GAP;
+      const gridW = grid.cols * TILE_W_DEFAULT + (grid.cols - 1) * COL_GAP;
+      const gridH = grid.rows * TILE_H_DEFAULT + (grid.rows - 1) * ROW_GAP;
       // Right edge of the worker grid (worker tiles are
       // centered on laneCenterX in the depth loop above).
       const workerGridRightX = laneCenterX + gridW / 2;
@@ -740,8 +737,7 @@ function layoutMissionLane(
       // missions don't get a stubby blackboard.
       bbH = Math.max(BLACKBOARD_H_DEFAULT, gridH);
     } else {
-      bbX =
-        laneCenterX - DRIVER_W_DEFAULT / 2 + DRIVER_W_DEFAULT + COL_GAP;
+      bbX = laneCenterX - DRIVER_W_DEFAULT / 2 + DRIVER_W_DEFAULT + COL_GAP;
       bbY = driverY;
     }
 

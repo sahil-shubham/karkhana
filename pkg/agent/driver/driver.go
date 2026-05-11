@@ -10,10 +10,10 @@
 //
 // Public surface:
 //
-//   d, err := driver.Connect(ctx, bhattiCli, sandboxID, opts...)
-//   d.Prompt(ctx, "research site X")
-//   for ev := range d.Events()  { ... }   // pi-rpc events
-//   d.Close()
+//	d, err := driver.Connect(ctx, bhattiCli, sandboxID, opts...)
+//	d.Prompt(ctx, "research site X")
+//	for ev := range d.Events()  { ... }   // pi-rpc events
+//	d.Close()
 package driver
 
 import (
@@ -252,10 +252,10 @@ func Connect(ctx context.Context, b *bhatti.Client, sandboxID string, opts Optio
 // event stream from where it is.
 //
 // Differs from Connect in two ways:
-//   1. NO command spec on the first frame (we're not spawning a
-//      new session, attaching to an existing one).
-//   2. NO session_info handshake to wait for (bhatti doesn't
-//      send one when the WS attaches to an existing session).
+//  1. NO command spec on the first frame (we're not spawning a
+//     new session, attaching to an existing one).
+//  2. NO session_info handshake to wait for (bhatti doesn't
+//     send one when the WS attaches to an existing session).
 //
 // We also don't re-send set_auto_compaction / set_auto_retry
 // since they were set on initial Connect and pi remembers.
@@ -478,7 +478,8 @@ func (d *Driver) dispatchEvent(ev Event) {
 
 // buildExecWSURL constructs the bhatti exec/ws URL from the API
 // base. e.g. "https://api.bhatti.sh" + sandboxID
-//        →  "wss://api.bhatti.sh/sandboxes/X/exec/ws"
+//
+//	→  "wss://api.bhatti.sh/sandboxes/X/exec/ws"
 func buildExecWSURL(baseURL, sandboxID, sessionID string) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {

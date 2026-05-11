@@ -48,12 +48,12 @@ type MissionTiming struct {
 	//                          Worker LLM time-to-action.
 	//   end_to_end_ms          mission created → driver finish.
 	//                          The thing the operator timed.
-	DriverWarmupMs       *int64 `json:"driver_warmup_ms,omitempty"`
-	DriverFirstTokenMs   *int64 `json:"driver_first_token_ms,omitempty"`
-	DriverFirstActionMs  *int64 `json:"driver_first_action_ms,omitempty"`
-	FirstWorkerBootMs    *int64 `json:"first_worker_boot_ms,omitempty"`
-	FirstWorkerReactMs   *int64 `json:"first_worker_react_ms,omitempty"`
-	EndToEndMs           *int64 `json:"end_to_end_ms,omitempty"`
+	DriverWarmupMs      *int64 `json:"driver_warmup_ms,omitempty"`
+	DriverFirstTokenMs  *int64 `json:"driver_first_token_ms,omitempty"`
+	DriverFirstActionMs *int64 `json:"driver_first_action_ms,omitempty"`
+	FirstWorkerBootMs   *int64 `json:"first_worker_boot_ms,omitempty"`
+	FirstWorkerReactMs  *int64 `json:"first_worker_react_ms,omitempty"`
+	EndToEndMs          *int64 `json:"end_to_end_ms,omitempty"`
 
 	// Per-worker breakdown for parallel-fanout missions. Sorted
 	// by spawn order. Each entry's BootMs measures how long that

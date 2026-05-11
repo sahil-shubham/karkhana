@@ -31,11 +31,7 @@ interface ContentProps extends ComponentPropsWithoutRef<typeof RCM.Content> {
 export function ContextMenuContent({ children, ...rest }: ContentProps) {
   return (
     <RCM.Portal>
-      <RCM.Content
-        className="kk-cm-content"
-        collisionPadding={8}
-        {...rest}
-      >
+      <RCM.Content className="kk-cm-content" collisionPadding={8} {...rest}>
         {children}
       </RCM.Content>
     </RCM.Portal>

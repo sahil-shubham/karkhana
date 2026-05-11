@@ -8,12 +8,7 @@
 // Operator can right-click → "Open fullscreen" for a richer view
 // later; for now the tile content reads like a textarea.
 
-import {
-  Handle,
-  NodeResizer,
-  Position,
-  type NodeProps,
-} from "@xyflow/react";
+import { Handle, NodeResizer, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useState } from "react";
 import type { Artifact } from "../lib/types";
 import { api } from "../lib/api";
@@ -237,10 +232,7 @@ function MarkdownPreview({ content }: { content: string }) {
         }
         if (line.match(/^\s*[-*]\s/)) {
           return (
-            <div
-              key={i}
-              style={{ paddingLeft: 16, position: "relative" }}
-            >
+            <div key={i} style={{ paddingLeft: 16, position: "relative" }}>
               <span
                 style={{
                   position: "absolute",

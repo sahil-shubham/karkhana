@@ -19,10 +19,7 @@ export const api = {
   // Optional canvas_x / canvas_y come from the right-click drop
   // point. The backend stores them on the driver agent so the
   // mission tile lands at that point on the next page-load.
-  createMission: (
-    goal: string,
-    origin?: { x: number; y: number },
-  ) =>
+  createMission: (goal: string, origin?: { x: number; y: number }) =>
     jsonFetch<Mission>("/api/missions", {
       method: "POST",
       body: JSON.stringify({

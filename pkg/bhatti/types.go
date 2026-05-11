@@ -13,21 +13,21 @@ import "time"
 // Metadata) even before bhatti supports them — the client sends
 // them and bhatti can ignore unknown fields until it doesn't.
 type SandboxSpec struct {
-	Name              string            `json:"name,omitempty"`
-	Image             string            `json:"image"`
-	CPUs              float32           `json:"cpus,omitempty"`
-	MemoryMB          int               `json:"memory_mb,omitempty"`
-	DiskSizeMB        int               `json:"disk_size_mb,omitempty"`
-	TimeoutSecs       int               `json:"timeout_secs,omitempty"`
-	Env               map[string]string `json:"env,omitempty"`
-	SecretNames       []string          `json:"secret_names,omitempty"`
-	Entrypoint        []string          `json:"entrypoint,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Image       string            `json:"image"`
+	CPUs        float32           `json:"cpus,omitempty"`
+	MemoryMB    int               `json:"memory_mb,omitempty"`
+	DiskSizeMB  int               `json:"disk_size_mb,omitempty"`
+	TimeoutSecs int               `json:"timeout_secs,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	SecretNames []string          `json:"secret_names,omitempty"`
+	Entrypoint  []string          `json:"entrypoint,omitempty"`
 
 	// v0.5 additions; bhatti currently ignores until shipped
-	Agent     *AgentSpec        `json:"agent,omitempty"`
-	Job       *JobSpec          `json:"job,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	IdempotencyKey string       `json:"idempotency_key,omitempty"`
+	Agent          *AgentSpec        `json:"agent,omitempty"`
+	Job            *JobSpec          `json:"job,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 
 	// Legacy: keep_hot is being replaced by `name` presence at v0.5,
 	// but bhatti today still honours it. Drop when bhatti renames.
@@ -86,8 +86,8 @@ type Sandbox struct {
 	CPUs       float32   `json:"cpus,omitempty"`
 	MemoryMB   int       `json:"memory_mb,omitempty"`
 	DiskSizeMB int       `json:"disk_size_mb,omitempty"`
-	Thermal    string    `json:"thermal,omitempty"`  // hot|warm|cold (internal but exposed)
-	URLs       []string  `json:"urls,omitempty"`     // published preview URLs
+	Thermal    string    `json:"thermal,omitempty"` // hot|warm|cold (internal but exposed)
+	URLs       []string  `json:"urls,omitempty"`    // published preview URLs
 	CreatedAt  time.Time `json:"created_at"`
 }
 
@@ -138,8 +138,8 @@ type ExecRequest struct {
 	// v0.5 piped-session mode for agent transports. When Session=true
 	// and TTY=false, lohar tracks this as a piped session with
 	// scrollback — the path Karkhana.AgentRPC uses today.
-	Session    bool `json:"session,omitempty"`
-	TTY        *bool `json:"tty,omitempty"`
+	Session bool  `json:"session,omitempty"`
+	TTY     *bool `json:"tty,omitempty"`
 }
 
 // ExecResult is what `POST /sandboxes/:id/exec` returns.

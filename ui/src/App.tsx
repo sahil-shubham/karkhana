@@ -30,7 +30,8 @@ function kasmIframeID(agentID: string): string {
   return `kasm-iframe-${agentID}`;
 }
 function buildKasmURL(agent: Agent): string | undefined {
-  if (!agent.kasmvnc_url || agent.kasmvnc_url === "about:blank") return undefined;
+  if (!agent.kasmvnc_url || agent.kasmvnc_url === "about:blank")
+    return undefined;
   const base = agent.kasmvnc_url.startsWith("/")
     ? apiURL(agent.kasmvnc_url)
     : agent.kasmvnc_url;
@@ -51,9 +52,9 @@ export default function App() {
   // events arrive on the WS; artifacts arrive via
   // artifact.created events. Hydrated from REST on initial
   // mount.
-  const [notesByMission, setNotesByMission] = useState<
-    Map<string, Note[]>
-  >(new Map());
+  const [notesByMission, setNotesByMission] = useState<Map<string, Note[]>>(
+    new Map(),
+  );
   const [artifactsByMission, setArtifactsByMission] = useState<
     Map<string, Artifact[]>
   >(new Map());
@@ -227,8 +228,8 @@ export default function App() {
           });
         }
         if (event.kind === "agent.thinking_delta" && event.agent_id) {
-          const delta =
-            (event.payload as Record<string, unknown> | undefined)?.delta;
+          const delta = (event.payload as Record<string, unknown> | undefined)
+            ?.delta;
           if (typeof delta === "string" && delta.length > 0) {
             setLiveThinkingByAgent((cur) => {
               const next = new Map(cur);
@@ -513,7 +514,8 @@ export default function App() {
   );
 
   const handleTerminateAgent = useCallback(async (agentID: string) => {
-    if (!confirm("Terminate this agent? The sandbox will be destroyed.")) return;
+    if (!confirm("Terminate this agent? The sandbox will be destroyed."))
+      return;
     try {
       await api.terminateAgent(agentID);
     } catch (e) {

@@ -1,15 +1,15 @@
 // karkhana is the single-binary HTTP + WebSocket server.
 //
 // Iteration 2 (this revision): real agent integration.
-// - POST /api/missions creates a real computer-tier sandbox via
-//   bhatti, publishes its KasmVNC port (6080), installs pi, opens
-//   an agent driver, sends the goal as the first prompt, forwards
-//   pi events to the canvas event bus.
-// - The canvas tile shows the live desktop + the agent's
-//   reasoning/tool-call overlay.
-// - Tile state survives Karkhana restarts: at startup we list
-//   bhatti sandboxes tagged with our metadata and rebuild minimal
-//   in-memory state (no event replay yet — those are gone).
+//   - POST /api/missions creates a real computer-tier sandbox via
+//     bhatti, publishes its KasmVNC port (6080), installs pi, opens
+//     an agent driver, sends the goal as the first prompt, forwards
+//     pi events to the canvas event bus.
+//   - The canvas tile shows the live desktop + the agent's
+//     reasoning/tool-call overlay.
+//   - Tile state survives Karkhana restarts: at startup we list
+//     bhatti sandboxes tagged with our metadata and rebuild minimal
+//     in-memory state (no event replay yet — those are gone).
 package main
 
 import (
@@ -363,8 +363,8 @@ func (s *serverState) handleMissionByID(w http.ResponseWriter, r *http.Request) 
 // Used by the frontend on initial hydrate / when the operator
 // expands a note row.
 //
-//   GET /api/missions/:id/notes        — all notes
-//   GET /api/missions/:id/notes?key=X  — only notes with key=X
+//	GET /api/missions/:id/notes        — all notes
+//	GET /api/missions/:id/notes?key=X  — only notes with key=X
 //
 // Always returns oldest-first within a key (creation order).
 func (s *serverState) handleMissionNotes(w http.ResponseWriter, r *http.Request, missionID string) {
@@ -386,7 +386,7 @@ func (s *serverState) handleMissionNotes(w http.ResponseWriter, r *http.Request,
 // v0.7: usually 0 or 1 artifact per mission (created when the
 // driver calls finish). Newer-first ordering.
 //
-//   GET /api/missions/:id/artifacts
+//	GET /api/missions/:id/artifacts
 func (s *serverState) handleMissionArtifacts(w http.ResponseWriter, r *http.Request, missionID string) {
 	if s.store == nil {
 		http.Error(w, "persistence disabled", http.StatusServiceUnavailable)
@@ -404,7 +404,7 @@ func (s *serverState) handleMissionArtifacts(w http.ResponseWriter, r *http.Requ
 
 // handleArtifactByID returns a single artifact's full content.
 //
-//   GET /api/artifacts/:id
+//	GET /api/artifacts/:id
 func (s *serverState) handleArtifactByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/artifacts/")
 	if id == "" {
@@ -530,12 +530,13 @@ func (s *serverState) handleAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentByID supports:
-//   GET    /api/agents/:id        — fetch agent
-//   DELETE /api/agents/:id        — terminate agent (cascades to
-//                                   sandbox / driver subprocess)
-//   POST   /api/agents/:id/prompt — operator chat (drivers only,
-//                                   in practice; workers don't
-//                                   currently take live input)
+//
+//	GET    /api/agents/:id        — fetch agent
+//	DELETE /api/agents/:id        — terminate agent (cascades to
+//	                                sandbox / driver subprocess)
+//	POST   /api/agents/:id/prompt — operator chat (drivers only,
+//	                                in practice; workers don't
+//	                                currently take live input)
 func (s *serverState) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path[len("/api/agents/"):]
 	// Sub-routes: /api/agents/:id/<action>
@@ -1003,21 +1004,22 @@ func (s *serverState) ensurePi(ctx context.Context, m *mission.Mission, workerID
 // session.jsonl).
 //
 // Hermeticity flags:
-//   --no-extensions        Pi auto-discovers extensions from
-//                          ~/.pi/agent/extensions/. We don't want
-//                          the driver to inherit globally-installed
-//                          extensions like pi-bhatti-browser (which
-//                          adds playwright-driven browser_open /
-//                          browser_screenshot tools that operate on
-//                          the OPERATOR'S HOST machine, invisible to
-//                          the canvas, and architecturally wrong —
-//                          drivers coordinate workers, they don't
-//                          browse. The --extension flag we pass
-//                          explicitly still works.)
-//   --no-skills            same reasoning — don't inherit local skills
-//   --no-prompt-templates  same
-//   --no-context-files     skip AGENTS.md / CLAUDE.md from operator's cwd
-//   --no-themes            irrelevant in rpc mode, but cleaner
+//
+//	--no-extensions        Pi auto-discovers extensions from
+//	                       ~/.pi/agent/extensions/. We don't want
+//	                       the driver to inherit globally-installed
+//	                       extensions like pi-bhatti-browser (which
+//	                       adds playwright-driven browser_open /
+//	                       browser_screenshot tools that operate on
+//	                       the OPERATOR'S HOST machine, invisible to
+//	                       the canvas, and architecturally wrong —
+//	                       drivers coordinate workers, they don't
+//	                       browse. The --extension flag we pass
+//	                       explicitly still works.)
+//	--no-skills            same reasoning — don't inherit local skills
+//	--no-prompt-templates  same
+//	--no-context-files     skip AGENTS.md / CLAUDE.md from operator's cwd
+//	--no-themes            irrelevant in rpc mode, but cleaner
 //
 // Net effect: the driver pi process sees ONLY the tools we
 // explicitly --extension in, plus pi's built-in bash/read/write/
@@ -1272,9 +1274,9 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
 			Kind: "worker.tool_call", Ts: time.Now(),
 			Payload: map[string]any{
-				"text":  summary,
-				"tool":  toolName,
-				"args":  args,
+				"text": summary,
+				"tool": toolName,
+				"args": args,
 			},
 		})
 
@@ -1585,17 +1587,17 @@ func (s *serverState) failWorker(m *mission.Mission, worker *mission.Agent, reas
 //
 // Order of work:
 //
-//   1. Read all missions + all agents from store → fill caches.
-//   2. For each running mission, kick off async recoverMission
-//      that handles its driver + workers.
-//   3. Driver recovery: re-spawn host pi with --continue and
-//      same --session-dir; pi reads the existing JSONL and
-//      keeps going. Mint a fresh driver token (old one dies
-//      with the old subprocess). Operator chat works again.
-//   4. Worker recovery: dial bhatti exec/ws WITH the stored
-//      session_id (no cmd-spec, no session_info handshake —
-//      we're attaching to an existing session, not creating).
-//      Worker pi process is unchanged; events resume streaming.
+//  1. Read all missions + all agents from store → fill caches.
+//  2. For each running mission, kick off async recoverMission
+//     that handles its driver + workers.
+//  3. Driver recovery: re-spawn host pi with --continue and
+//     same --session-dir; pi reads the existing JSONL and
+//     keeps going. Mint a fresh driver token (old one dies
+//     with the old subprocess). Operator chat works again.
+//  4. Worker recovery: dial bhatti exec/ws WITH the stored
+//     session_id (no cmd-spec, no session_info handshake —
+//     we're attaching to an existing session, not creating).
+//     Worker pi process is unchanged; events resume streaming.
 //
 // If a sandbox is gone (operator deleted it manually), we mark
 // the worker failed instead of trying to attach. Same for a

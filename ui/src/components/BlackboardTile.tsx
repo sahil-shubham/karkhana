@@ -12,12 +12,7 @@
 // one note: agent badge · key · summary · relative time. Click
 // a row to expand inline and reveal the full content.
 
-import {
-  Handle,
-  NodeResizer,
-  Position,
-  type NodeProps,
-} from "@xyflow/react";
+import { Handle, NodeResizer, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Note } from "../lib/types";
 import { formatTime } from "./AgentTile";
