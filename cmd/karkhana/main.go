@@ -636,19 +636,7 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 		return
 	}
 
-	argv := []string{
-		"pi", "--mode", "rpc",
-		"--session-dir", sessDir,
-	}
-	if s.piProvider != "" {
-		argv = append(argv, "--provider", s.piProvider)
-	}
-	if s.piModel != "" {
-		argv = append(argv, "--model", s.piModel)
-	}
-	if s.driverToolsPath != "" {
-		argv = append(argv, "--extension", s.driverToolsPath)
-	}
+	argv := buildDriverArgv(sessDir, s.piProvider, s.piModel, s.driverToolsPath, false)
 
 	env := s.piEnvFromHost()
 	env["KARKHANA_INTERNAL_URL"] = s.internalURL
@@ -1276,6 +1264,60 @@ Narrate what you're doing in short assistant messages between tool calls. The op
 // piEnvFromHost extracts LLM-provider API keys from Karkhana's
 // environment so pi-coding-agent has something to authenticate
 // with. Mirrors the env keys the Elixir prototype passes through.
+// buildDriverArgv composes the argv for a host-side `pi --mode rpc`
+// subprocess that runs as the mission driver. Used by both the
+// initial spawn (continueSession=false) and the recovery path
+// (continueSession=true, adds --continue to resume the existing
+// session.jsonl).
+//
+// Hermeticity flags:
+//   --no-extensions        Pi auto-discovers extensions from
+//                          ~/.pi/agent/extensions/. We don't want
+//                          the driver to inherit globally-installed
+//                          extensions like pi-bhatti-browser (which
+//                          adds playwright-driven browser_open /
+//                          browser_screenshot tools that operate on
+//                          the OPERATOR'S HOST machine, invisible to
+//                          the canvas, and architecturally wrong —
+//                          drivers coordinate workers, they don't
+//                          browse. The --extension flag we pass
+//                          explicitly still works.)
+//   --no-skills            same reasoning — don't inherit local skills
+//   --no-prompt-templates  same
+//   --no-context-files     skip AGENTS.md / CLAUDE.md from operator's cwd
+//   --no-themes            irrelevant in rpc mode, but cleaner
+//
+// Net effect: the driver pi process sees ONLY the tools we
+// explicitly --extension in, plus pi's built-in bash/read/write/
+// edit/grep/find/ls. No surprise tools.
+func buildDriverArgv(sessDir, provider, model, driverToolsPath string, continueSession bool) []string {
+	argv := []string{
+		"pi", "--mode", "rpc",
+		"--session-dir", sessDir,
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--no-themes",
+	}
+	if continueSession {
+		argv = append(argv, "--continue")
+	}
+	if provider != "" {
+		argv = append(argv, "--provider", provider)
+	}
+	if model != "" {
+		argv = append(argv, "--model", model)
+	}
+	if driverToolsPath != "" {
+		// --no-extensions disables DISCOVERY but explicit
+		// --extension paths still load. This is the only tool
+		// surface the driver should see.
+		argv = append(argv, "--extension", driverToolsPath)
+	}
+	return argv
+}
+
 func (s *serverState) piEnvFromHost() map[string]string {
 	keys := []string{
 		"ANTHROPIC_API_KEY",
@@ -1914,20 +1956,7 @@ func (s *serverState) recoverDriver(m *mission.Mission, d *mission.Agent) {
 	s.mu.Unlock()
 
 	// pi --continue resumes the most recent session in --session-dir.
-	argv := []string{
-		"pi", "--mode", "rpc",
-		"--session-dir", sessDir,
-		"--continue",
-	}
-	if s.piProvider != "" {
-		argv = append(argv, "--provider", s.piProvider)
-	}
-	if s.piModel != "" {
-		argv = append(argv, "--model", s.piModel)
-	}
-	if s.driverToolsPath != "" {
-		argv = append(argv, "--extension", s.driverToolsPath)
-	}
+	argv := buildDriverArgv(sessDir, s.piProvider, s.piModel, s.driverToolsPath, true)
 	env := s.piEnvFromHost()
 	env["KARKHANA_INTERNAL_URL"] = s.internalURL
 	env["KARKHANA_DRIVER_TOKEN"] = token
