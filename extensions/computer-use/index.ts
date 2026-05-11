@@ -29,8 +29,10 @@ import { spawn } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import { Type } from "typebox";
 import { defineTool, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import WebSocket from "ws";
 
 // --- shell helpers ---
 
@@ -567,6 +569,454 @@ const cursorPositionTool = defineTool({
   },
 });
 
+// write_note is a SIGNALLING tool. The worker calls it to
+// contribute a finding to the mission blackboard. The tool's
+// local execute() is a no-op — the actual persistence happens
+// in Karkhana's host-side handler when it receives the
+// tool_execution_start event from this worker's pi-rpc stream.
+//
+// Why this routing: workers run inside bhatti microVMs whose
+// network reach to the Karkhana host is environment-dependent.
+// The pi-rpc WebSocket is already open and bidirectional, so we
+// piggy-back on its event stream rather than building a parallel
+// HTTP path that would need per-deployment URL configuration.
+//
+// Workers can only WRITE notes (not read) at v0.7. Coordination
+// across workers is mediated by the driver, which reads the
+// full blackboard during synthesis. Mid-flight reads come
+// later when long-running workers need them.
+const writeNoteTool = defineTool({
+  name: "write_note",
+  label: "Write Note (blackboard)",
+  description:
+    "Contribute a finding to the mission's shared blackboard. " +
+    "Other agents (the driver and possibly other workers in v1) " +
+    "see your contribution. Use this for facts, sources, partial " +
+    "results — anything that would help downstream synthesis.\n\n" +
+    "Keys are free-form topic labels (e.g. 'hn_top_stories', " +
+    "'bhatti_pricing'). Multiple notes under the same key are " +
+    "normal — they accumulate as separate contributions, no " +
+    "overwrites.",
+  parameters: Type.Object({
+    key: Type.String({
+      description:
+        "Short topic label. Use snake_case. Multiple workers " +
+        "contributing to the same key is fine — reads return them " +
+        "all, in order. Keep keys focused; one finding per call.",
+    }),
+    content: Type.String({
+      description:
+        "The finding itself. Plain text or markdown. Include " +
+        "sources/URLs if relevant. Other agents will see this " +
+        "verbatim.",
+    }),
+    summary: Type.Optional(
+      Type.String({
+        description:
+          "One-line summary (≤ 80 chars) shown in the blackboard " +
+          "manifest. If omitted, the manifest uses a truncation of " +
+          "content. Provide one if your content is multi-paragraph.",
+      }),
+    ),
+  }),
+  async execute(_id, { key, content, summary }) {
+    // Local no-op. Karkhana persists via the
+    // tool_execution_start event. We just confirm to the LLM.
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `wrote note: ${key} (${content.length} chars)`,
+        },
+      ],
+      details: {
+        key,
+        content_len: content.length,
+        summary: summary ?? content.slice(0, 80),
+      },
+    };
+  },
+});
+
+// --- browser_eval (Chrome DevTools Protocol) ---
+//
+// Lets the worker run a JavaScript expression in the currently-
+// loaded page. Up to ~100× faster than the scroll/screenshot
+// dance for structured data extraction (PR titles, file lists,
+// table contents). The page stays loaded and visible to the
+// operator, so this preserves the watchable wedge for everything
+// that matters — only the read query itself is invisible, and
+// the operator can see WHICH page is being queried.
+//
+// Pipeline:
+//   1. Worker launched chromium with --remote-debugging-port=9222
+//      (kk-browser helper script installed at bake time uses this
+//      flag automatically; the worker just calls 'kk-browser <url>'
+//      and the right flags are applied).
+//   2. We hit http://localhost:9222/json to discover tabs.
+//   3. Pick the LAST page-typed entry (chromium orders them in
+//      most-recently-focused-last for /json).
+//   4. Open WS to its webSocketDebuggerUrl.
+//   5. Send Runtime.evaluate with the user code wrapped in an
+//      async IIFE that overrides fetch + XHR to block external
+//      hosts (mirroring the curl policy: same-host or localhost
+//      only, no random API endpoints).
+//   6. Return the value or the exception text.
+//
+// Why same-host/localhost only: the value-prop is "agent reads
+// what's on the loaded page." fetch('https://api.github.com/...')
+// would be curl wearing a wig. By restricting to the page's own
+// origin we let logged-in cookies and SPA AJAX calls work
+// naturally without opening a new bypass channel.
+
+const CDP_HOST = "localhost";
+const CDP_PORT = 9222;
+const CDP_DEFAULT_TIMEOUT_MS = 12_000;
+const CDP_RESULT_MAX_LEN = 50_000;
+
+interface CdpTab {
+  id: string;
+  type: string;
+  url: string;
+  title?: string;
+  webSocketDebuggerUrl?: string;
+}
+
+// Hit chromium's discovery endpoint. Returns the active page
+// tab (most-recently-focused is last by chrome convention).
+async function cdpFindActiveTab(): Promise<CdpTab> {
+  const tabs = await new Promise<CdpTab[]>((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: CDP_HOST,
+        port: CDP_PORT,
+        path: "/json",
+        method: "GET",
+        timeout: 3000,
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch (e) {
+            reject(new Error("CDP /json parse failed: " + (e as Error).message));
+          }
+        });
+      },
+    );
+    req.on("error", (e) =>
+      reject(
+        new Error(
+          `CDP /json connect failed: ${e.message} ` +
+            `(is chromium running with --remote-debugging-port=${CDP_PORT}? ` +
+            `use 'kk-browser <url>' to launch with the right flags)`,
+        ),
+      ),
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("CDP /json timed out"));
+    });
+    req.end();
+  });
+  const pages = tabs.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+  if (pages.length === 0) {
+    throw new Error(
+      "no chromium tabs open. Launch one with 'kk-browser <url>' first.",
+    );
+  }
+  // Chromium returns pages in most-recently-focused-LAST order.
+  return pages[pages.length - 1];
+}
+
+// Open WS, send Runtime.evaluate, close. One round trip per call.
+async function cdpEvaluate(tab: CdpTab, expression: string): Promise<{
+  ok: boolean;
+  value?: unknown;
+  description?: string;
+  exception?: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(tab.webSocketDebuggerUrl!, {
+      // Chrome's CDP rejects unknown origins in recent builds;
+      // the launch flag --remote-allow-origins=* permits any.
+      origin: "http://localhost",
+    });
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error(`CDP evaluate timed out after ${CDP_DEFAULT_TIMEOUT_MS}ms`));
+    }, CDP_DEFAULT_TIMEOUT_MS);
+
+    ws.on("open", () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: "Runtime.evaluate",
+          params: {
+            expression,
+            awaitPromise: true,
+            returnByValue: true,
+            // generatePreview gives us a human-readable string
+            // for non-serializable values (DOM nodes etc).
+            generatePreview: true,
+            timeout: CDP_DEFAULT_TIMEOUT_MS - 1000,
+          },
+        }),
+      );
+    });
+    ws.on("message", (data) => {
+      clearTimeout(timer);
+      ws.close();
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.error) {
+          resolve({ ok: false, exception: msg.error.message ?? "CDP error" });
+          return;
+        }
+        const r = msg.result?.result;
+        const ex = msg.result?.exceptionDetails;
+        if (ex) {
+          const exText =
+            ex.exception?.description ??
+            ex.exception?.value ??
+            ex.text ??
+            "JS exception";
+          resolve({ ok: false, exception: String(exText) });
+          return;
+        }
+        // r.value is JSON-cloned primitive/array/object; r.description
+        // is the toString-ish for non-serializable types (DOM nodes).
+        resolve({
+          ok: true,
+          value: r?.value,
+          description: r?.description,
+        });
+      } catch (e) {
+        resolve({
+          ok: false,
+          exception: "CDP response parse failed: " + (e as Error).message,
+        });
+      }
+    });
+    ws.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+// Wrap user code so fetch() / XHR to external hosts is blocked.
+// Same policy as the bash curl interceptor: same-origin and
+// localhost are allowed, external hosts are not. This is the
+// difference between "agent reads the loaded page" and "agent
+// uses the browser as an arbitrary HTTP client".
+function wrapUserCode(userCode: string): string {
+  // Use an async IIFE so the user can use await + return.
+  // The wrapper overrides fetch + XMLHttpRequest in this scope;
+  // since `window.fetch = ...` is a global mutation, the override
+  // persists for any code running on the page until the page
+  // reloads. That's fine for our use case (single eval cycle).
+  return `
+    (async () => {
+      const _allowedHost = (h) =>
+        !h || h === location.hostname ||
+        h === 'localhost' || h === '127.0.0.1';
+      const _origFetch = window.fetch;
+      window.fetch = function(input, init) {
+        try {
+          const u = (typeof input === 'string' || input instanceof URL)
+            ? new URL(input, location.href)
+            : new URL(input.url, location.href);
+          if (!_allowedHost(u.hostname)) {
+            return Promise.reject(new Error(
+              'browser_eval: fetch to external host blocked: ' + u.hostname +
+              ' (only ' + location.hostname + ' / localhost allowed)'
+            ));
+          }
+        } catch (_) {}
+        return _origFetch.apply(window, arguments);
+      };
+      const _origXHROpen = window.XMLHttpRequest.prototype.open;
+      window.XMLHttpRequest.prototype.open = function(method, url) {
+        try {
+          const u = new URL(url, location.href);
+          if (!_allowedHost(u.hostname)) {
+            throw new Error(
+              'browser_eval: XHR to external host blocked: ' + u.hostname
+            );
+          }
+        } catch (e) {
+          if (e && e.message && e.message.indexOf('blocked') !== -1) throw e;
+        }
+        return _origXHROpen.apply(this, arguments);
+      };
+      return await (async () => {
+        ${userCode}
+      })();
+    })()
+  `;
+}
+
+function truncateResult(s: string): string {
+  if (s.length <= CDP_RESULT_MAX_LEN) return s;
+  return (
+    s.slice(0, CDP_RESULT_MAX_LEN) +
+    `\n\n[truncated: result was ${s.length} chars, capped at ${CDP_RESULT_MAX_LEN}]`
+  );
+}
+
+const browserEvalTool = defineTool({
+  name: "browser_eval",
+  label: "Browser Eval (run JS in page)",
+  description:
+    "Run a JavaScript expression in the currently-loaded chromium " +
+    "tab. MUCH faster than scrolling + screenshotting for " +
+    "structured data extraction (PR titles, file lists, table " +
+    "rows, link hrefs, etc).\n\n" +
+    "WHEN TO USE:\n" +
+    "  - reading a list of repeated elements (issues, PRs, files, results)\n" +
+    "  - querying DOM for a specific value (document.title, table cell, attribute)\n" +
+    "  - extracting structured records to write_note them as JSON\n\n" +
+    "WHEN NOT TO USE:\n" +
+    "  - exploring an unfamiliar page (you don't know what to query) — use screenshot/scroll\n" +
+    "  - clicking links, navigation, form interaction — use left_click/type\n" +
+    "  - judging visual layout/design — use screenshot\n\n" +
+    "CONSTRAINTS (enforced):\n" +
+    "  - fetch() / XMLHttpRequest to EXTERNAL hosts is blocked. " +
+    "Same-origin and localhost are allowed.\n" +
+    "  - Result is serialized via returnByValue. DOM nodes won't " +
+    "serialize — use .textContent / .outerHTML / .getAttribute.\n" +
+    "  - 12s timeout, ~50KB result cap.\n" +
+    "  - Promises are awaited automatically.\n\n" +
+    "GOOD example: extract all PR titles from a github page:\n" +
+    "  browser_eval(`return Array.from(document.querySelectorAll('.js-issue-row a.Link--primary')).map(a => ({title: a.textContent.trim(), href: a.href}))`)\n\n" +
+    "BAD example (will be blocked): browser_eval(`return await fetch('https://api.github.com/...').then(r => r.json())`)",
+  parameters: Type.Object({
+    code: Type.String({
+      description:
+        "JavaScript to evaluate. Use `return <expr>` to get a value back. " +
+        "You can use `await` for promises. Runs in the page's global scope.",
+    }),
+  }),
+  async execute(_id, { code }) {
+    try {
+      const tab = await cdpFindActiveTab();
+      const wrapped = wrapUserCode(code);
+      const result = await cdpEvaluate(tab, wrapped);
+      if (!result.ok) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `(browser_eval error)\n${result.exception ?? "unknown error"}`,
+            },
+          ],
+          details: {
+            ok: false,
+            exception: result.exception,
+            tab_url: tab.url,
+          },
+        };
+      }
+      // Serialize for the LLM: prefer JSON of value, fall back
+      // to description string for non-serializable returns.
+      let resultText: string;
+      if (result.value !== undefined) {
+        try {
+          resultText =
+            typeof result.value === "string"
+              ? result.value
+              : JSON.stringify(result.value, null, 2);
+        } catch {
+          resultText = String(result.value);
+        }
+      } else if (result.description) {
+        resultText = result.description;
+      } else {
+        resultText = "undefined";
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: truncateResult(resultText),
+          },
+        ],
+        details: {
+          ok: true,
+          tab_url: tab.url,
+          result_len: resultText.length,
+          truncated: resultText.length > CDP_RESULT_MAX_LEN,
+        },
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        content: [
+          { type: "text" as const, text: `(browser_eval failed)\n${msg}` },
+        ],
+        details: { ok: false, error: msg },
+      };
+    }
+  },
+});
+
+// finish() is the worker's explicit termination signal.
+//
+// Why this exists when pi already has a natural "agent_end"
+// after a text-only assistant response: in practice that signal
+// has not been reliably propagating from the worker pi process,
+// through the bhatti exec/ws, and into Karkhana's driver event
+// stream — missions sat in wait_for_workers for the full 30 min
+// timeout even though the worker was idle on a clean "DONE".
+//
+// The robust mechanism is `terminate: true` in a tool result,
+// which makes pi's agent-loop set hasMoreToolCalls=false and
+// fall through to its agent_end emit unconditionally. So we
+// give the worker a tool whose ONLY purpose is to deliver that
+// signal, and instruct the preamble to call it as the last
+// action of every task.
+//
+// This mirrors the driver's `finish` tool which produces an
+// artifact; the worker's `finish` is simpler — just a
+// summary string that Karkhana stores as final_assistant_text
+// for the driver to read in wait_for_workers / tick contexts.
+const finishTool = defineTool({
+  name: "finish",
+  label: "Finish (terminate worker)",
+  description:
+    "Mark this worker's task complete. Call this as your VERY " +
+    "LAST tool call — immediately after your final write_note. " +
+    "The `summary` you pass is what the driver sees as your " +
+    "final answer; keep it short because your detailed findings " +
+    "are already in write_note. After this call returns, the " +
+    "worker terminates and the driver gets notified.\n\n" +
+    "Do NOT call any other tools after finish. Do NOT respond " +
+    "with a final assistant message after finish — the tool's " +
+    "text result IS your final response to the driver.",
+  parameters: Type.Object({
+    summary: Type.String({
+      description:
+        "Short summary (≤ 500 chars) of what you accomplished. " +
+        "Reference your blackboard keys (e.g. 'recorded 8 findings " +
+        "under bhatti_findings; see blackboard for details').",
+    }),
+  }),
+  async execute(_id, { summary }) {
+    return {
+      content: [{ type: "text" as const, text: summary }],
+      details: { summary },
+      // The critical bit: pi's agent-loop reads `terminate` on
+      // tool results; when true it sets hasMoreToolCalls=false
+      // for this batch and the inner loop falls through to
+      // agent_end. See pi-mono packages/agent/src/agent-loop.ts.
+      terminate: true,
+    };
+  },
+});
+
 const waitTool = defineTool({
   name: "wait",
   label: "Wait",
@@ -600,4 +1050,62 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(scrollTool);
   pi.registerTool(cursorPositionTool);
   pi.registerTool(waitTool);
+  pi.registerTool(writeNoteTool);
+  pi.registerTool(finishTool);
+  pi.registerTool(browserEvalTool);
+
+  // --- curl-as-browser-substitute interceptor ---
+  //
+  // Workers consistently fall back to `curl https://raw.github...`
+  // for research tasks even when explicitly told to use the
+  // browser, because the LLM correctly observes curl is faster.
+  // The preamble alone is not strong enough; we enforce at the
+  // tool layer.
+  //
+  // Policy:
+  //   - Block bash commands that contain `curl <http(s) URL>` or
+  //     `wget <http(s) URL>` (and common variants).
+  //   - Allow curl/wget against localhost / 127.0.0.1 /
+  //     sandbox-internal IPs — those are legitimate (api probes,
+  //     local servers, etc.).
+  //   - Allow `gh` CLI — it's a different shape and rarely
+  //     abused.
+  //
+  // The block returns a `reason` string that pi turns into a
+  // tool-result text the LLM sees. The reason explicitly tells
+  // the agent to use chromium + computer-use tools instead.
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return;
+    const cmd = (event as { input: { command?: string } }).input?.command ?? "";
+    if (!cmd) return;
+    // Strip leading shell comments / whitespace before testing.
+    // Workers love to prefix `# Check the README` then `curl ...`.
+    const stripped = cmd
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"))
+      .join("\n");
+    // Match curl/wget against an http(s) URL anywhere in the
+    // pipeline. We allow these against local/sandbox-internal
+    // hosts; the regex below catches public URLs.
+    const inetFetch =
+      /\b(curl|wget)\b[^|&;`]*\bhttps?:\/\/(?!(?:localhost|127\.0\.0\.1|10\.0\.\d+\.\d+|169\.254\.|192\.168\.))/i;
+    if (inetFetch.test(stripped)) {
+      return {
+        block: true,
+        reason:
+          "curl/wget against a public http(s) URL is blocked in " +
+          "this worker. You are a HEADFUL agent on an X11 desktop; " +
+          "open the URL in chromium and use the computer-use " +
+          "tools (screenshot, scroll, left_click, type, key) to " +
+          "read the content. The operator is watching the desktop " +
+          "— raw HTTP fetches defeat the purpose. If you need to " +
+          "hit a localhost/internal endpoint, that's still " +
+          "allowed; this only blocks external URLs.\n\n" +
+          "To open a URL: bash 'chromium --no-sandbox --test-type " +
+          "--new-window <url> &', then wait(2), then use the GUI " +
+          "tools.",
+      };
+    }
+  });
 }

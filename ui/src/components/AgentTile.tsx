@@ -39,6 +39,17 @@ export interface AgentTileData extends Record<string, unknown> {
   agent: Agent;
   recentEvents: KEvent[];
   focused: boolean;
+  // True while pi is mid-turn for this agent (driver only —
+  // workers ignore this since their iframe shows live state).
+  // Drives the border-glow animation.
+  streaming?: boolean;
+  // Live-thinking buffer accumulated from agent.thinking_delta
+  // events while pi is streaming a thinking block. Empty when
+  // no active stream. Rendered as a faded italic preview at the
+  // bottom of the driver chat so the operator sees the
+  // supervisor reasoning in real time during the 20-60s
+  // thinking phase that would otherwise look like dead air.
+  liveThinking?: string;
   onFocus: () => void;
   onTerminate?: () => void;
   // Set on the root tile of a mission only (the agent that has
@@ -65,6 +76,8 @@ export function AgentTile({ data, selected }: NodeProps) {
     agent,
     recentEvents,
     focused,
+    streaming,
+    liveThinking,
     onFocus,
     onTerminate,
     onDeleteMission,
@@ -74,6 +87,11 @@ export function AgentTile({ data, selected }: NodeProps) {
   } = data as AgentTileData;
   const isDriver = agent.role === "driver";
   const accent = isDriver ? "var(--accent)" : "var(--accent-worker)";
+  // Driver-only: while streaming, the border softly glows in
+  // the accent color so the operator can see at a glance that
+  // the supervisor is mid-thought. Implemented as an animated
+  // CSS keyframe defined in index.css (see .tile-streaming).
+  const driverStreaming = isDriver && !!streaming;
 
   // KasmVNC URL only used for the right-click "Open in new tab"
   // context-menu item. The actual iframe is owned by App.tsx's
@@ -91,18 +109,31 @@ export function AgentTile({ data, selected }: NodeProps) {
 
   const tile = (
     <div
-      className="tile"
+      className={
+        "tile" + (driverStreaming ? " tile-streaming" : "")
+      }
       style={{
         background: "var(--bg-1)",
-        border: `1px solid ${focused ? accent : "var(--border)"}`,
+        border: `1px solid ${
+          driverStreaming
+            ? accent
+            : focused
+              ? accent
+              : "var(--border)"
+        }`,
         borderRadius: "var(--radius)",
         width: "100%",
         height: "100%",
         display: "flex",
         flexDirection: "column",
-        boxShadow: focused ? `0 0 0 2px ${accent}33` : "none",
+        boxShadow: driverStreaming
+          ? `0 0 0 2px ${accent}55, 0 0 16px ${accent}44`
+          : focused
+            ? `0 0 0 2px ${accent}33`
+            : "none",
         overflow: "hidden",
         position: "relative",
+        transition: "border-color 200ms, box-shadow 250ms",
       }}
     >
       <NodeResizer
@@ -135,7 +166,11 @@ export function AgentTile({ data, selected }: NodeProps) {
           below. Both share one bounding tile. */}
       {isDriver ? (
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-          <ConversationStream events={recentEvents} />
+          <ConversationStream
+            events={recentEvents}
+            liveThinking={liveThinking ?? ""}
+            streaming={streaming ?? false}
+          />
         </div>
       ) : (
         <>
@@ -187,7 +222,13 @@ export function AgentTile({ data, selected }: NodeProps) {
 
       {/* spawn edges (driver → worker, worker → sub-worker).
           The view-edge to a separate log tile was removed when
-          workers merged log + desktop into one tile. */}
+          workers merged log + desktop into one tile.
+
+          The Right source handle is dedicated to blackboard
+          contribution edges: in v0.7 the blackboard sits to the
+          right of the worker grid, so right-side egress keeps
+          contribution stubs near-horizontal and visually
+          distinct from spawn edges (which run top-bottom). */}
       <Handle
         type="target"
         position={Position.Top}
@@ -197,6 +238,17 @@ export function AgentTile({ data, selected }: NodeProps) {
         type="source"
         position={Position.Bottom}
         style={{ background: "var(--border)", width: 6, height: 6 }}
+      />
+      <Handle
+        type="source"
+        id="contrib"
+        position={Position.Right}
+        style={{
+          background: "var(--accent-blackboard, var(--accent))",
+          width: 6,
+          height: 6,
+          top: 36, // anchor near the header so the edge enters above the iframe
+        }}
       />
     </div>
   );
@@ -716,7 +768,21 @@ function WorkerView({
 // special-case rendering for operator messages, ask_operator
 // blocks, report_progress, and finish so the driver chat reads
 // like a chat instead of a log.
-function ConversationStream({ events }: { events: KEvent[] }) {
+//
+// `liveThinking` is the incrementally-accumulated thinking
+// stream from agent.thinking_delta events (transient — server
+// doesn't persist them). Rendered as a faded italic bubble at
+// the bottom of the list while the supervisor is reasoning;
+// disappears when the consolidated worker.message lands.
+function ConversationStream({
+  events,
+  liveThinking,
+  streaming,
+}: {
+  events: KEvent[];
+  liveThinking: string;
+  streaming: boolean;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [stick, setStick] = useState(true);
 
@@ -734,7 +800,9 @@ function ConversationStream({ events }: { events: KEvent[] }) {
       el.scrollTop = el.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  }, [events.length, stick]);
+    // Re-scroll on event count or live-thinking length change
+    // so streaming deltas auto-follow the bottom.
+  }, [events.length, liveThinking.length, stick]);
 
   return (
     <div
@@ -750,7 +818,7 @@ function ConversationStream({ events }: { events: KEvent[] }) {
         position: "relative",
       }}
     >
-      {events.length === 0 ? (
+      {events.length === 0 && !liveThinking ? (
         <div
           style={{
             color: "var(--text-4)",
@@ -762,6 +830,16 @@ function ConversationStream({ events }: { events: KEvent[] }) {
         </div>
       ) : (
         events.map((ev) => <ConversationRow key={ev.id} ev={ev} />)
+      )}
+      {/* Streaming thinking preview. Visible only while pi is
+          mid-thinking-block AND a worker.message hasn't yet
+          replaced it. We show even a tiny stream so the
+          operator sees motion immediately after agent.streaming
+          (the LLM may take 5+ seconds before the first delta
+          arrives, which is OK — the typing-cursor below covers
+          that gap). */}
+      {streaming && (
+        <LiveThinkingBubble text={liveThinking} />
       )}
       {!stick && events.length > 5 && (
         <button
@@ -794,13 +872,73 @@ function ConversationStream({ events }: { events: KEvent[] }) {
   );
 }
 
+// LiveThinkingBubble — in-progress streaming preview of the
+// supervisor's thinking. Shown beneath the latest chat row
+// while pi is mid-thinking-block. The empty state (no text
+// yet, but agent.streaming is true) still renders so the
+// operator sees the typing cursor immediately on prompt send;
+// otherwise the canvas looks frozen during the 1-5s warmup
+// before the first thinking_delta arrives.
+function LiveThinkingBubble({ text }: { text: string }) {
+  // Truncate display to keep the bubble compact — the LLM can
+  // produce huge thinking blocks. We show a tail-clipped view
+  // (last ~800 chars) so the most-recent reasoning is always
+  // visible. The full content lives on the server for now and
+  // can be surfaced via expand-on-click later if needed.
+  const MAX_PREVIEW = 800;
+  const display =
+    text.length > MAX_PREVIEW
+      ? "…" + text.slice(text.length - MAX_PREVIEW)
+      : text;
+  const isEmpty = text.length === 0;
+
+  return (
+    <div
+      style={{
+        marginTop: 6,
+        marginBottom: 6,
+        padding: "6px 10px",
+        background: "color-mix(in srgb, var(--accent) 7%, var(--bg-1))",
+        borderLeft: "2px solid var(--accent)",
+        borderRadius: 4,
+        fontSize: 11,
+        lineHeight: 1.5,
+        color: "var(--text-3)",
+        fontStyle: "italic",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      }}
+    >
+      <div
+        style={{
+          color: "var(--accent)",
+          fontStyle: "normal",
+          fontWeight: 600,
+          fontSize: 9,
+          textTransform: "uppercase",
+          letterSpacing: 0.5,
+          marginBottom: isEmpty ? 0 : 2,
+        }}
+      >
+        thinking… <span className="blink-cursor">▊</span>
+      </div>
+      {!isEmpty && display}
+    </div>
+  );
+}
+
 function ConversationRow({ ev }: { ev: KEvent }) {
   const kind = ev.kind;
   const p = (ev.payload ?? {}) as Record<string, unknown>;
   const time = formatTime(ev.ts);
 
-  // operator typed something
-  if (kind === "operator.message" || kind === "driver.prompt_sent") {
+  // operator typed something. NOTE: driver.prompt_sent is an
+  // internal timing marker that the backend emits AFTER the
+  // operator's prompt is sent to pi; it carries the same text
+  // as the operator.message we already rendered, so showing it
+  // as a chat bubble would double-render the operator's first
+  // message. Kept out of the chat stream on purpose.
+  if (kind === "operator.message") {
     return (
       <ChatBubble role="operator" time={time} text={(p.text as string) ?? ""} />
     );
@@ -813,23 +951,14 @@ function ConversationRow({ ev }: { ev: KEvent }) {
     );
   }
 
-  // driver thinking
+  // worker.thinking events are pi's agent_start marker we
+  // re-emit with placeholder text "(agent started)". They're
+  // redundant in the driver chat now that we stream real
+  // thinking deltas (rendered as a LiveThinkingBubble) and
+  // pulse the tile border on agent.streaming. Drop them — the
+  // chat reads much cleaner without the noise.
   if (kind === "worker.thinking") {
-    return (
-      <div style={{ marginBottom: 4 }}>
-        <span style={{ color: "var(--text-4)", fontSize: 10 }}>{time}</span>
-        <span
-          style={{
-            color: "var(--text-3)",
-            marginLeft: 6,
-            fontStyle: "italic",
-            fontSize: 11,
-          }}
-        >
-          {(p.text as string) ?? "(thinking)"}
-        </span>
-      </div>
-    );
+    return null;
   }
 
   // driver tool call (spawn_worker, wait_for_workers, etc.)

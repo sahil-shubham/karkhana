@@ -306,8 +306,31 @@ func (d *Driver) Prompt(ctx context.Context, text string) error {
 	return d.send(map[string]any{"type": "prompt", "message": text})
 }
 
+// PromptOrQueue is the right primitive for waking the driver on
+// a tick. Behavior:
+//   - If the agent is currently IDLE (already emitted agent_end),
+//     pi starts a fresh run with this message as the user prompt.
+//   - If the agent is currently STREAMING (mid-turn), pi queues
+//     the message via follow_up semantics so it's processed when
+//     the current run ends.
+//
+// We learned the hard way that raw `follow_up` does NOT wake an
+// idle agent — pi's outer loop only checks the follow-up queue
+// during a run, between turns. After agent_end has fired, the
+// run is over and `follow_up` enqueues into a dead queue. The
+// tick dispatcher must use this method, not FollowUp.
+func (d *Driver) PromptOrQueue(ctx context.Context, text string) error {
+	d.isStreaming.Store(true)
+	return d.send(map[string]any{
+		"type":              "prompt",
+		"message":           text,
+		"streamingBehavior": "followUp",
+	})
+}
+
 // FollowUp queues a message to be delivered after the current
-// turn completes (pi semantics).
+// turn completes (pi semantics). Note: only effective WHILE a
+// run is in progress; for idle agents use PromptOrQueue.
 func (d *Driver) FollowUp(ctx context.Context, text string) error {
 	return d.send(map[string]any{"type": "follow_up", "message": text})
 }

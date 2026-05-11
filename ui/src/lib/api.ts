@@ -1,6 +1,6 @@
 // Thin fetch wrapper for /api/* endpoints.
 
-import type { Agent, Mission } from "./types";
+import type { Agent, Artifact, Mission, Note } from "./types";
 import { apiURL } from "./config";
 
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -65,4 +65,21 @@ export const api = {
         body: JSON.stringify({ text }),
       },
     ),
+
+  // Blackboard reads. Notes return oldest-first within the
+  // optional key filter (or all keys when omitted).
+  listNotes: (missionID: string, key?: string) =>
+    jsonFetch<Note[]>(
+      key
+        ? `/api/missions/${encodeURIComponent(missionID)}/notes?key=${encodeURIComponent(key)}`
+        : `/api/missions/${encodeURIComponent(missionID)}/notes`,
+    ),
+
+  listArtifacts: (missionID: string) =>
+    jsonFetch<Artifact[]>(
+      `/api/missions/${encodeURIComponent(missionID)}/artifacts`,
+    ),
+
+  getArtifact: (id: string) =>
+    jsonFetch<Artifact>(`/api/artifacts/${encodeURIComponent(id)}`),
 };

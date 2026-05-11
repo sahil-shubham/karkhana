@@ -1,0 +1,20 @@
+#!/bin/bash
+# kk-browser — Karkhana's chromium launcher.
+#
+# Always enables Chrome DevTools Protocol on :9222 so the
+# browser_eval computer-use tool can run JS in the loaded page.
+# The flag must be on the FIRST chromium invocation; subsequent
+# `chromium --new-window` calls go to the existing instance and
+# ignore launch flags. By centralising the launch in one script,
+# workers can't accidentally launch chromium without the debug
+# port being open.
+#
+# Usage: kk-browser <url> [<url> ...]
+#
+# Installed at /usr/local/bin/kk-browser by scripts/bake-image.sh.
+exec chromium \
+  --no-sandbox \
+  --test-type \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins=* \
+  --new-window "$@" &

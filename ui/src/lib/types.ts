@@ -49,6 +49,31 @@ export interface Agent {
   pi_session_file?: string;
 }
 
+// One blackboard note. Append-only — multiple notes under the
+// same key are normal; each is its own row keyed by id.
+export interface Note {
+  id: number;
+  mission_id: string;
+  key: string;
+  content: string;
+  summary?: string;
+  agent_id?: string;
+  ts: string;
+}
+
+// Typed mission output. v0.7: one per mission, type=
+// 'markdown:report', produced by driver.finish.
+export interface Artifact {
+  id: string;
+  mission_id: string;
+  type: string;
+  title?: string;
+  content: string;
+  summary?: string;
+  produced_by?: string;
+  created_at: string;
+}
+
 export interface KEvent {
   id: number;
   mission_id: string;

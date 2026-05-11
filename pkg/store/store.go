@@ -156,6 +156,40 @@ CREATE INDEX IF NOT EXISTS idx_events_mission_ts
     ON events(mission_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_agent_ts
     ON events(agent_id, ts) WHERE agent_id IS NOT NULL;
+
+-- v0.7: blackboard (per-mission shared scratchpad).
+-- Append-only by design — every write_note from any agent
+-- creates a new row. Concurrent writes don't collide because
+-- they don't share row identity. Reads of "key=X" return ALL
+-- entries for that key, oldest first.
+CREATE TABLE IF NOT EXISTS notes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id   TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    summary      TEXT,
+    agent_id     TEXT,
+    ts           TEXT NOT NULL,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_notes_mission_key ON notes(mission_id, key);
+CREATE INDEX IF NOT EXISTS idx_notes_mission_ts  ON notes(mission_id, id);
+
+-- v0.7: typed mission outputs. v0 has one type (markdown:report)
+-- and one artifact per mission, produced by driver.finish.
+-- Multi-type / multi-artifact missions in v1.
+CREATE TABLE IF NOT EXISTS artifacts (
+    id           TEXT PRIMARY KEY,    -- art_<12-hex>
+    mission_id   TEXT NOT NULL,
+    type         TEXT NOT NULL,       -- markdown:report (v0.7)
+    title        TEXT,
+    content      TEXT NOT NULL,
+    summary      TEXT,
+    produced_by  TEXT,                -- agent_id (usually the driver)
+    created_at   TEXT NOT NULL,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_mission ON artifacts(mission_id);
 `
 	_, err := s.db.Exec(schema)
 	return err
@@ -646,4 +680,219 @@ func (s *Store) MaxEventID(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return id.Int64, nil
+}
+
+// --- notes (mission blackboard) ---
+
+// Note is one blackboard entry. Append-only; concurrent writes
+// to the same key by different agents produce separate rows.
+type Note struct {
+	ID        int64     `json:"id"`
+	MissionID string    `json:"mission_id"`
+	Key       string    `json:"key"`
+	Content   string    `json:"content"`
+	Summary   string    `json:"summary,omitempty"`
+	AgentID   string    `json:"agent_id,omitempty"`
+	Ts        time.Time `json:"ts"`
+}
+
+// AppendNote writes a new blackboard entry. Returns the new note's ID.
+func (s *Store) AppendNote(ctx context.Context, n *Note) (int64, error) {
+	if n.Ts.IsZero() {
+		n.Ts = time.Now()
+	}
+	const q = `INSERT INTO notes (mission_id, key, content, summary, agent_id, ts)
+               VALUES (?, ?, ?, ?, ?, ?)`
+	res, err := s.db.ExecContext(ctx, q,
+		n.MissionID, n.Key, n.Content,
+		nullableString(n.Summary), nullableString(n.AgentID),
+		n.Ts.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	n.ID = id
+	return id, nil
+}
+
+// ListNotes returns notes for a mission. If key is non-empty,
+// filters to that key. Ordered by id (creation order).
+func (s *Store) ListNotes(ctx context.Context, missionID, key string) ([]Note, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if key == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, mission_id, key, content, summary, agent_id, ts
+             FROM notes WHERE mission_id = ? ORDER BY id`,
+			missionID)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, mission_id, key, content, summary, agent_id, ts
+             FROM notes WHERE mission_id = ? AND key = ? ORDER BY id`,
+			missionID, key)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Note
+	for rows.Next() {
+		var n Note
+		var summary, agentID, ts sql.NullString
+		if err := rows.Scan(&n.ID, &n.MissionID, &n.Key, &n.Content,
+			&summary, &agentID, &ts); err != nil {
+			return nil, err
+		}
+		n.Summary = summary.String
+		n.AgentID = agentID.String
+		n.Ts = parseTime(ts)
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// NoteManifestEntry is one row of the manifest — a key with its
+// entry count + latest contributor metadata. This is what agents
+// see in their prompt (instead of full note content) to keep
+// context windows tight.
+type NoteManifestEntry struct {
+	Key           string    `json:"key"`
+	Count         int       `json:"count"`
+	LatestSummary string    `json:"latest_summary,omitempty"`
+	LatestAgent   string    `json:"latest_agent,omitempty"`
+	LatestTs      time.Time `json:"latest_ts"`
+}
+
+// NoteManifest returns the per-key manifest for a mission.
+func (s *Store) NoteManifest(ctx context.Context, missionID string) ([]NoteManifestEntry, error) {
+	const q = `
+SELECT key,
+       COUNT(*) AS cnt,
+       MAX(id) AS last_id
+FROM notes
+WHERE mission_id = ?
+GROUP BY key
+ORDER BY last_id DESC`
+	rows, err := s.db.QueryContext(ctx, q, missionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type lastEntry struct {
+		key    string
+		count  int
+		lastID int64
+	}
+	var group []lastEntry
+	for rows.Next() {
+		var e lastEntry
+		if err := rows.Scan(&e.key, &e.count, &e.lastID); err != nil {
+			return nil, err
+		}
+		group = append(group, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// For each, fetch the latest entry's summary + agent + ts.
+	out := make([]NoteManifestEntry, 0, len(group))
+	for _, g := range group {
+		var summary, agent, ts sql.NullString
+		err := s.db.QueryRowContext(ctx,
+			`SELECT summary, agent_id, ts FROM notes WHERE id = ?`,
+			g.lastID).Scan(&summary, &agent, &ts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, NoteManifestEntry{
+			Key:           g.key,
+			Count:         g.count,
+			LatestSummary: summary.String,
+			LatestAgent:   agent.String,
+			LatestTs:      parseTime(ts),
+		})
+	}
+	return out, nil
+}
+
+// --- artifacts ---
+
+// Artifact is a typed mission output. v0.7: one per mission,
+// type="markdown:report", produced by the driver's finish tool.
+type Artifact struct {
+	ID         string    `json:"id"`
+	MissionID  string    `json:"mission_id"`
+	Type       string    `json:"type"`
+	Title      string    `json:"title,omitempty"`
+	Content    string    `json:"content"`
+	Summary    string    `json:"summary,omitempty"`
+	ProducedBy string    `json:"produced_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// CreateArtifact inserts an artifact row.
+func (s *Store) CreateArtifact(ctx context.Context, a *Artifact) error {
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
+	const q = `INSERT INTO artifacts
+               (id, mission_id, type, title, content, summary, produced_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, q,
+		a.ID, a.MissionID, a.Type,
+		nullableString(a.Title), a.Content,
+		nullableString(a.Summary), nullableString(a.ProducedBy),
+		a.CreatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+// GetArtifact fetches an artifact by ID.
+func (s *Store) GetArtifact(ctx context.Context, id string) (*Artifact, error) {
+	const q = `SELECT id, mission_id, type, title, content, summary, produced_by, created_at
+               FROM artifacts WHERE id = ?`
+	row := s.db.QueryRowContext(ctx, q, id)
+	var a Artifact
+	var title, summary, producedBy, ts sql.NullString
+	if err := row.Scan(&a.ID, &a.MissionID, &a.Type, &title,
+		&a.Content, &summary, &producedBy, &ts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	a.Title = title.String
+	a.Summary = summary.String
+	a.ProducedBy = producedBy.String
+	a.CreatedAt = parseTime(ts)
+	return &a, nil
+}
+
+// ListArtifacts returns all artifacts for a mission, newest first.
+func (s *Store) ListArtifacts(ctx context.Context, missionID string) ([]Artifact, error) {
+	const q = `SELECT id, mission_id, type, title, content, summary, produced_by, created_at
+               FROM artifacts WHERE mission_id = ? ORDER BY created_at DESC`
+	rows, err := s.db.QueryContext(ctx, q, missionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Artifact
+	for rows.Next() {
+		var a Artifact
+		var title, summary, producedBy, ts sql.NullString
+		if err := rows.Scan(&a.ID, &a.MissionID, &a.Type, &title,
+			&a.Content, &summary, &producedBy, &ts); err != nil {
+			return nil, err
+		}
+		a.Title = title.String
+		a.Summary = summary.String
+		a.ProducedBy = producedBy.String
+		a.CreatedAt = parseTime(ts)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

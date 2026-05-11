@@ -15,7 +15,7 @@ import { ConnectionIndicator } from "./components/ConnectionIndicator";
 import { connectEvents, type ConnState } from "./lib/ws";
 import { api } from "./lib/api";
 import { apiURL } from "./lib/config";
-import type { Agent, KEvent, Mission } from "./lib/types";
+import type { Agent, Artifact, KEvent, Mission, Note } from "./lib/types";
 
 // Each running worker gets exactly one <iframe> on the page,
 // keyed by agent ID and parked in this hidden pool. AgentTile
@@ -45,6 +45,46 @@ export default function App() {
     new Map(),
   );
   const [connState, setConnState] = useState<ConnState>("connecting");
+
+  // v0.7: per-mission blackboard contents + artifact list +
+  // most-recent-write cue. Notes accumulate as worker.note_write
+  // events arrive on the WS; artifacts arrive via
+  // artifact.created events. Hydrated from REST on initial
+  // mount.
+  const [notesByMission, setNotesByMission] = useState<
+    Map<string, Note[]>
+  >(new Map());
+  const [artifactsByMission, setArtifactsByMission] = useState<
+    Map<string, Artifact[]>
+  >(new Map());
+  const [lastNoteWriteByMission, setLastNoteWriteByMission] = useState<
+    Map<string, { agentID: string; ts: string }>
+  >(new Map());
+
+  // Driver activity tracking for canvas edge pulses + tile glow.
+  // - driverStreamingByAgent: did the driver just emit a turn_start
+  //   without a matching agent_end? Used to glow the driver tile.
+  // - lastDriverActionByAgent: per-worker, the latest action the
+  //   driver took (steer/terminate/spawn). Drives the
+  //   driver→worker spawn edge pulse, mirroring the worker→
+  //   blackboard contribution pulse.
+  const [driverStreamingByAgent, setDriverStreamingByAgent] = useState<
+    Map<string, boolean>
+  >(new Map());
+  const [lastDriverActionByAgent, setLastDriverActionByAgent] = useState<
+    Map<string, { kind: string; ts: string }>
+  >(new Map());
+
+  // Per-agent live thinking buffer. Streamed in via
+  // agent.thinking_delta events while pi is mid-thinking-block.
+  // Cleared on worker.message (the finalized assistant text
+  // takes over) or on the next agent.thinking_start. Gives the
+  // operator a real-time view of the supervisor's reasoning so
+  // there's no 20-60s dead air between agent.streaming and the
+  // first assistant token.
+  const [liveThinkingByAgent, setLiveThinkingByAgent] = useState<
+    Map<string, string>
+  >(new Map());
 
   // Right-click dispatch state. Non-null while the popover is
   // open. Holds BOTH screen coords (for popover positioning) and
@@ -174,11 +214,208 @@ export default function App() {
           });
         }
 
+        // Live thinking stream. These events are transient
+        // (server doesn't persist them) so they only appear in
+        // the live WS feed, not on reload — which is fine since
+        // the consolidated assistant text in worker.message IS
+        // persisted.
+        if (event.kind === "agent.thinking_start" && event.agent_id) {
+          setLiveThinkingByAgent((cur) => {
+            const next = new Map(cur);
+            next.set(event.agent_id!, "");
+            return next;
+          });
+        }
+        if (event.kind === "agent.thinking_delta" && event.agent_id) {
+          const delta =
+            (event.payload as Record<string, unknown> | undefined)?.delta;
+          if (typeof delta === "string" && delta.length > 0) {
+            setLiveThinkingByAgent((cur) => {
+              const next = new Map(cur);
+              const prev = cur.get(event.agent_id!) ?? "";
+              next.set(event.agent_id!, prev + delta);
+              return next;
+            });
+          }
+        }
+        // Clear the live thinking buffer when the assistant
+        // message lands (worker.message is the persisted final
+        // text — it supersedes the streamed thinking preview).
+        if (event.kind === "worker.message" && event.agent_id) {
+          setLiveThinkingByAgent((cur) => {
+            if (!cur.has(event.agent_id!)) return cur;
+            const next = new Map(cur);
+            next.delete(event.agent_id!);
+            return next;
+          });
+        }
+
+        // Per-agent streaming/idle tracking. Karkhana emits
+        // agent.streaming on pi's agent_start and agent.idle on
+        // agent_end, role-independent. The driver tile uses this
+        // to glow + pulse outgoing edges; worker tiles ignore it
+        // (their iframe already shows live activity).
+        if (event.agent_id && event.kind === "agent.streaming") {
+          setDriverStreamingByAgent((cur) => {
+            const next = new Map(cur);
+            next.set(event.agent_id!, true);
+            return next;
+          });
+        }
+        if (
+          event.agent_id &&
+          (event.kind === "agent.idle" || event.kind === "agent.completed")
+        ) {
+          setDriverStreamingByAgent((cur) => {
+            if (!cur.has(event.agent_id!)) return cur;
+            const next = new Map(cur);
+            next.delete(event.agent_id!);
+            return next;
+          });
+        }
+
+        // driver.steer_worker / driver.terminate_worker:
+        // remember the most-recent action per target worker so
+        // the canvas can pulse the driver→worker edge.
+        if (
+          event.agent_id &&
+          (event.kind === "driver.steer_worker" ||
+            event.kind === "driver.terminate_worker")
+        ) {
+          setLastDriverActionByAgent((cur) => {
+            const next = new Map(cur);
+            next.set(event.agent_id!, {
+              kind: event.kind,
+              ts: event.ts,
+            });
+            return next;
+          });
+        }
+
+        // worker.note_write: a worker/driver wrote to the
+        // mission blackboard. Append the note locally so the
+        // blackboard tile renders it without a roundtrip,
+        // and remember who wrote so the edge can pulse.
+        if (event.kind === "worker.note_write" && event.payload) {
+          const p = event.payload as Record<string, unknown>;
+          const noteID = p.note_id as number | undefined;
+          const key = p.key as string | undefined;
+          if (noteID != null && key) {
+            const newNote: Note = {
+              id: noteID,
+              mission_id: event.mission_id,
+              key,
+              // We don't get the full content in this event
+              // payload to keep replay light; fetch on demand
+              // when the operator expands the row. For now use
+              // the summary as the preview.
+              content: (p.content as string) ?? (p.summary as string) ?? "",
+              summary: p.summary as string | undefined,
+              agent_id: event.agent_id,
+              ts: event.ts,
+            };
+            setNotesByMission((cur) => {
+              const next = new Map(cur);
+              const arr = next.get(event.mission_id) ?? [];
+              if (arr.some((n) => n.id === newNote.id)) return cur;
+              next.set(event.mission_id, [...arr, newNote]);
+              return next;
+            });
+            if (event.agent_id) {
+              setLastNoteWriteByMission((cur) => {
+                const next = new Map(cur);
+                next.set(event.mission_id, {
+                  agentID: event.agent_id!,
+                  ts: event.ts,
+                });
+                return next;
+              });
+            }
+          }
+        }
+
+        // worker.tool_call: when a worker calls write_note,
+        // we ALSO get the full content here in payload.args.
+        // Stash it so expanding the note shows full content
+        // without a network fetch.
+        if (
+          event.kind === "worker.tool_call" &&
+          event.payload &&
+          (event.payload as Record<string, unknown>).tool === "write_note"
+        ) {
+          const p = event.payload as Record<string, unknown>;
+          const args = (p.args as Record<string, unknown>) ?? {};
+          const key = args.key as string | undefined;
+          const content = args.content as string | undefined;
+          if (key && content) {
+            // Find the most recent note for this mission+key
+            // matching this agent and back-fill its content.
+            setNotesByMission((cur) => {
+              const arr = cur.get(event.mission_id);
+              if (!arr) return cur;
+              const next = new Map(cur);
+              const updated = arr.map((n) =>
+                n.agent_id === event.agent_id &&
+                n.key === key &&
+                (!n.content || n.content === (n.summary ?? ""))
+                  ? { ...n, content }
+                  : n,
+              );
+              next.set(event.mission_id, updated);
+              return next;
+            });
+          }
+        }
+
+        // artifact.created: a new artifact is available. We get
+        // metadata in the payload; the ArtifactTile fetches
+        // full content on mount via api.getArtifact.
+        if (event.kind === "artifact.created" && event.payload) {
+          const p = event.payload as Record<string, unknown>;
+          const artID = p.artifact_id as string | undefined;
+          if (artID) {
+            const newArt: Artifact = {
+              id: artID,
+              mission_id: event.mission_id,
+              type: (p.type as string) ?? "markdown:report",
+              title: p.title as string | undefined,
+              content: "", // fetched on mount
+              summary: p.summary as string | undefined,
+              produced_by: event.agent_id,
+              created_at: event.ts,
+            };
+            setArtifactsByMission((cur) => {
+              const next = new Map(cur);
+              const arr = next.get(event.mission_id) ?? [];
+              if (arr.some((a) => a.id === newArt.id)) return cur;
+              next.set(event.mission_id, [...arr, newArt]);
+              return next;
+            });
+          }
+        }
+
+        // Transient lifecycle/streaming events are intercepted
+        // by the dedicated state setters above (liveThinking,
+        // driverStreaming, lastDriverAction) — they MUST NOT
+        // also flow into the visible event log, or the driver
+        // chat fills with hundreds of "agent.thinking_delta"
+        // dim rows during a single thinking turn. These match
+        // the kinds skipped by the server's publish() persist
+        // filter; they're for animation only.
+        const TRANSIENT_KINDS = new Set([
+          "agent.thinking_start",
+          "agent.thinking_delta",
+          "agent.thinking_end",
+          "agent.text_delta",
+          "agent.streaming",
+          "agent.idle",
+        ]);
+
         // append to per-agent event log. Dedup by event.id
         // because the WS sends a replay batch on connect (post-
         // restart hydration) and live events may overlap with
         // the replayed snapshot. See pkg/canvas/ws.go.
-        if (event.agent_id) {
+        if (event.agent_id && !TRANSIENT_KINDS.has(event.kind)) {
           setEventsByAgent((cur) => {
             const next = new Map(cur);
             const arr = next.get(event.agent_id!) ?? [];
@@ -214,6 +451,32 @@ export default function App() {
           b.created_at.localeCompare(a.created_at),
         );
         setMissions(sorted);
+        // For each mission, fan out a one-shot hydrate of
+        // its blackboard + artifacts. Cheap; runs in parallel.
+        for (const m of sorted) {
+          api
+            .listNotes(m.id)
+            .then((notes) => {
+              if (notes.length === 0) return;
+              setNotesByMission((cur) => {
+                const next = new Map(cur);
+                next.set(m.id, notes);
+                return next;
+              });
+            })
+            .catch(() => {});
+          api
+            .listArtifacts(m.id)
+            .then((arts) => {
+              if (arts.length === 0) return;
+              setArtifactsByMission((cur) => {
+                const next = new Map(cur);
+                next.set(m.id, arts);
+                return next;
+              });
+            })
+            .catch(() => {});
+        }
       })
       .catch((e) => console.warn("listMissions failed", e));
 
@@ -286,6 +549,24 @@ export default function App() {
           next.forEach((a, aid) => {
             if (a.mission_id === id) next.delete(aid);
           });
+          return next;
+        });
+        setNotesByMission((cur) => {
+          if (!cur.has(id)) return cur;
+          const next = new Map(cur);
+          next.delete(id);
+          return next;
+        });
+        setArtifactsByMission((cur) => {
+          if (!cur.has(id)) return cur;
+          const next = new Map(cur);
+          next.delete(id);
+          return next;
+        });
+        setLastNoteWriteByMission((cur) => {
+          if (!cur.has(id)) return cur;
+          const next = new Map(cur);
+          next.delete(id);
           return next;
         });
       } catch (e) {
@@ -385,6 +666,12 @@ export default function App() {
           agents={agents}
           missions={missions}
           eventsByAgent={eventsByAgent}
+          notesByMission={notesByMission}
+          artifactsByMission={artifactsByMission}
+          lastNoteWriteByMission={lastNoteWriteByMission}
+          driverStreamingByAgent={driverStreamingByAgent}
+          lastDriverActionByAgent={lastDriverActionByAgent}
+          liveThinkingByAgent={liveThinkingByAgent}
           onTerminateAgent={handleTerminateAgent}
           onDeleteMission={handleDeleteMission}
           onPaneContextMenu={handlePaneContextMenu}

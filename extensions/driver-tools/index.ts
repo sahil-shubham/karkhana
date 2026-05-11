@@ -177,48 +177,105 @@ interface WaitForWorkersResult {
   timed_out: boolean;
 }
 
+// --- steer_worker / terminate_worker (active supervision) ---
+
+const steerWorkerTool = defineTool({
+  name: "steer_worker",
+  label: "Steer Worker",
+  description:
+    "Inject a guidance message into a running worker's stream. " +
+    "The worker receives it as a supervisor steer and adjusts its " +
+    "current work without restarting. Use this when:\n" +
+    "  - a worker's progress reveals it's exploring the wrong angle\n" +
+    "  - you want to narrow scope mid-flight (e.g. \"focus on " +
+    "benchmarks, skip the architecture deep-dive\")\n" +
+    "  - peer findings suggest a specific follow-up for this worker\n\n" +
+    "Keep hints short and concrete. The worker keeps its existing " +
+    "conversation history; you're nudging, not redirecting.",
+  parameters: Type.Object({
+    worker_id: Type.String({ description: "Target worker id." }),
+    hint: Type.String({
+      description:
+        "Short guidance, typically 1-3 sentences. The worker reads " +
+        "this as a [supervisor steer] message.",
+    }),
+  }),
+  async execute(_id, { worker_id, hint }) {
+    await karkhanaCall<{ ok: boolean }>("/steer_worker", { worker_id, hint });
+    return {
+      content: [
+        { type: "text" as const, text: `steered ${worker_id}: ${hint}` },
+      ],
+      details: { worker_id, hint },
+    };
+  },
+});
+
+const terminateWorkerTool = defineTool({
+  name: "terminate_worker",
+  label: "Terminate Worker",
+  description:
+    "Force-stop a worker. Kills its bhatti sandbox and marks the " +
+    "agent terminated. Use when a worker is curl-looping, off-task, " +
+    "diminishing-returns, or no longer needed (you have enough " +
+    "info from peers).\n\n" +
+    "The worker's blackboard contributions are preserved. The " +
+    "reason you pass becomes the worker's final_assistant_text.",
+  parameters: Type.Object({
+    worker_id: Type.String({ description: "Target worker id." }),
+    reason: Type.String({
+      description:
+        "Why you're terminating. Shown in logs and the canvas event " +
+        "trail; helps the operator understand your reasoning.",
+    }),
+  }),
+  async execute(_id, { worker_id, reason }) {
+    await karkhanaCall<{ ok: boolean }>("/terminate_worker", {
+      worker_id,
+      reason,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `terminated ${worker_id}: ${reason}`,
+        },
+      ],
+      details: { worker_id, reason },
+    };
+  },
+});
+
+// wait_for_workers is DEPRECATED in active-driver mode. The
+// backend handler returns a snapshot immediately (no blocking)
+// plus a `notice` field telling you to use ticks. We keep the
+// tool registered ONLY so old cached extension bundles don't
+// hard-error; in normal use, do NOT call this — the supervisor
+// preamble teaches the tick model.
 const waitForWorkersTool = defineTool({
   name: "wait_for_workers",
-  label: "Wait For Workers",
+  label: "Wait For Workers (deprecated)",
   description:
-    "Block until all of the specified workers reach a terminal " +
-    "state (completed, terminated, or failed). Returns each " +
-    "worker's outcome and final assistant text. Use this after " +
-    "spawn_worker(s) to synchronize before reading their results.",
+    "DEPRECATED. Do not call. Karkhana auto-ticks you on every " +
+    "material worker event (note write, terminate, heartbeat) — " +
+    "just end your turn after spawning, you'll be woken with " +
+    "full context. This tool now returns an immediate snapshot " +
+    "plus a deprecation notice.",
   parameters: Type.Object({
-    worker_ids: Type.Array(Type.String(), {
-      description: "Worker IDs returned by spawn_worker.",
-    }),
-    timeout_seconds: Type.Optional(
-      Type.Number({
-        description:
-          "Maximum total wait time in seconds (default 1800 = 30min). " +
-          "Returns timed_out=true if exceeded; partial results are " +
-          "returned for workers that did finish. Long research " +
-          "workers can legitimately take 5-20 minutes; default high.",
-      }),
-    ),
+    worker_ids: Type.Array(Type.String()),
   }),
-  async execute(_id, { worker_ids, timeout_seconds }) {
-    const r = await karkhanaCall<WaitForWorkersResult>("/wait_for_workers", {
-      worker_ids,
-      timeout_seconds: timeout_seconds ?? 1800,
-    });
-    const summary = r.workers
-      .map(
-        (w) =>
-          `  ${w.worker_id}: ${w.status}${w.outcome ? `/${w.outcome}` : ""}` +
-          (w.cost_usd != null ? ` ($${w.cost_usd.toFixed(2)})` : ""),
-      )
-      .join("\n");
+  async execute(_id, { worker_ids }) {
+    const r = await karkhanaCall<WaitForWorkersResult & { notice?: string }>(
+      "/wait_for_workers",
+      { worker_ids },
+    );
     return {
       content: [
         {
           type: "text" as const,
           text:
-            `${r.workers.length} worker(s) ${r.timed_out ? "(TIMED OUT)" : "done"}:\n` +
-            summary +
-            "\n\nFull outputs in details.",
+            (r.notice ? r.notice + "\n\n" : "") +
+            `Snapshot: ${r.workers.length} worker(s)`,
         },
       ],
       details: r,
@@ -282,39 +339,168 @@ const reportProgressTool = defineTool({
   },
 });
 
-// --- finish ---
+// --- finish (now produces an artifact) ---
 
 const finishTool = defineTool({
   name: "finish",
-  label: "Finish",
+  label: "Finish (produce artifact)",
   description:
-    "Mark the current task complete and return a final result " +
-    "to the operator. The driver enters idle state — does NOT " +
-    "exit; the operator can follow up with another instruction " +
-    "and the driver picks it up with full conversation history. " +
-    "Call this when you've answered the operator's request, NOT " +
-    "as a process exit.",
+    "Mark the current task complete and produce the mission's " +
+    "final deliverable as a typed artifact. The artifact appears " +
+    "as its own tile on the canvas, addressable by ID, and the " +
+    "operator can reference it in follow-up prompts (e.g. " +
+    "\"extend section 3 of the report\"). The driver enters idle " +
+    "state after finish — does NOT exit; follow-up messages pick " +
+    "up with the full conversation + artifact still in context.",
   parameters: Type.Object({
     result: Type.String({
       description:
-        "The final answer / summary, formatted for the operator. " +
-        "Markdown is rendered in the driver tile.",
+        "The final report content as markdown. Use proper markdown " +
+        "structure: # headings, ## subheadings, bullets, tables, " +
+        "links to sources. This is the operator's deliverable; " +
+        "format it for reading, not just summarizing.",
     }),
+    title: Type.Optional(
+      Type.String({
+        description:
+          "Short title for the artifact tile (≤ 80 chars). " +
+          "Defaults to a truncation of the mission goal.",
+      }),
+    ),
   }),
-  async execute(_id, { result }) {
-    await karkhanaCall<unknown>("/finish", { result });
+  async execute(_id, { result, title }) {
+    const r = await karkhanaCall<{ artifact_id: string }>("/finish", {
+      result,
+      title,
+    });
     return {
       content: [
         {
           type: "text" as const,
-          text: "(finished — awaiting operator follow-up)",
+          text:
+            `(finished — artifact ${r.artifact_id} produced. ` +
+            `Operator can follow up.)`,
         },
       ],
-      details: { result },
-      // NOT terminate: true — the driver should keep running
-      // so the operator can chat further. Pi naturally idles
-      // after assistant_end with no more tool calls; the next
-      // prompt picks it back up.
+      details: { artifact_id: r.artifact_id, title },
+    };
+  },
+});
+
+// --- blackboard (driver-side) ---
+//
+// Drivers can read AND write the mission's shared scratchpad.
+// Workers can only write (their writes are intercepted from the
+// pi-rpc tool_execution_start stream by Karkhana's host
+// process; see extensions/computer-use/index.ts).
+//
+// Driver uses these to:
+//   - read worker contributions before synthesis (read_notes)
+//   - see what's been recorded at a glance (list_notes)
+//   - record its own planning notes for future turns (write_note)
+
+const writeNoteTool = defineTool({
+  name: "write_note",
+  label: "Write Note (blackboard)",
+  description:
+    "Append an entry to the mission blackboard. Useful for " +
+    "recording your own planning notes, intermediate synthesis, " +
+    "or operator answers. Append-only — multiple notes under the " +
+    "same key accumulate, none overwrites others.",
+  parameters: Type.Object({
+    key: Type.String({
+      description: "Topic label, snake_case (e.g. 'plan', 'critique_v1').",
+    }),
+    content: Type.String({ description: "The note content." }),
+    summary: Type.Optional(Type.String()),
+  }),
+  async execute(_id, { key, content, summary }) {
+    const r = await karkhanaCall<{ note_id: number }>("/notes/write", {
+      key,
+      content,
+      summary,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `wrote note: ${key} (note_id=${r.note_id})`,
+        },
+      ],
+      details: { key, note_id: r.note_id },
+    };
+  },
+});
+
+const readNotesTool = defineTool({
+  name: "read_notes",
+  label: "Read Notes (blackboard)",
+  description:
+    "Return all blackboard entries under a given key, in time " +
+    "order. Use this during synthesis to gather worker " +
+    "contributions on a topic. If no key is provided, returns " +
+    "ALL notes in the mission (use list_notes first to know " +
+    "what keys exist).",
+  parameters: Type.Object({
+    key: Type.Optional(
+      Type.String({
+        description:
+          "Topic label. Omit to read every note in the mission.",
+      }),
+    ),
+  }),
+  async execute(_id, { key }) {
+    const r = await karkhanaCall<{ notes: any[] }>("/notes/read", {
+      key: key ?? "",
+    });
+    const summary =
+      r.notes.length === 0
+        ? "no notes under this key"
+        : `${r.notes.length} note(s):\n` +
+          r.notes
+            .map(
+              (n: any) =>
+                `  [${n.id}] ${n.agent_id || "?"}: ${
+                  (n.summary as string) ?? (n.content as string).slice(0, 80)
+                }`,
+            )
+            .join("\n");
+    return {
+      content: [{ type: "text" as const, text: summary }],
+      details: r,
+    };
+  },
+});
+
+const listNotesTool = defineTool({
+  name: "list_notes",
+  label: "List Notes (blackboard manifest)",
+  description:
+    "Return the manifest of blackboard keys for this mission — " +
+    "each key with its entry count and the latest contributor's " +
+    "summary. Cheap; use this to decide what to read in detail " +
+    "via read_notes.",
+  parameters: Type.Object({}),
+  async execute() {
+    const r = await karkhanaCall<{ manifest: any[] }>("/notes/list", {});
+    const lines =
+      r.manifest.length === 0
+        ? ["(blackboard empty)"]
+        : r.manifest.map(
+            (e: any) =>
+              `  ${e.key} (×${e.count}, latest by ${e.latest_agent || "?"}): ${
+                e.latest_summary || ""
+              }`,
+          );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text:
+            `blackboard manifest:\n${lines.join("\n")}`,
+        },
+      ],
+      details: r,
     };
   },
 });
@@ -324,8 +510,13 @@ const finishTool = defineTool({
 export default function (pi: ExtensionAPI) {
   pi.registerTool(spawnWorkerTool);
   pi.registerTool(spawnWorkersTool);
+  pi.registerTool(steerWorkerTool);
+  pi.registerTool(terminateWorkerTool);
   pi.registerTool(waitForWorkersTool);
   pi.registerTool(askOperatorTool);
   pi.registerTool(reportProgressTool);
   pi.registerTool(finishTool);
+  pi.registerTool(writeNoteTool);
+  pi.registerTool(readNotesTool);
+  pi.registerTool(listNotesTool);
 }

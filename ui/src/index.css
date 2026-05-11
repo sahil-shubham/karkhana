@@ -73,3 +73,38 @@ textarea:focus {
 .react-flow__node {
   font-family: inherit;
 }
+
+/* Driver-tile streaming pulse. Applied to .tile.tile-streaming
+   by AgentTile when the driver is mid-turn. Subtle so it doesn't
+   distract during long synthesis; visible enough that the
+   operator notices when the supervisor wakes up. */
+@keyframes tile-streaming-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent),
+      0 0 16px color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent),
+      0 0 24px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+}
+.tile.tile-streaming {
+  animation: tile-streaming-pulse 1.8s ease-in-out infinite;
+}
+
+/* Blinking caret for the LiveThinkingBubble — makes the bubble
+   feel alive even when the LLM hasn't streamed the first
+   thinking_delta yet (typically a 1-5s warmup after
+   agent.streaming). Subtle so it doesn't compete with the
+   tile border pulse. */
+@keyframes blink-cursor {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.2; }
+}
+.blink-cursor {
+  display: inline-block;
+  animation: blink-cursor 0.9s steps(2, end) infinite;
+}

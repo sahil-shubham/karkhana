@@ -29,19 +29,45 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { AgentTile, type AgentTileData } from "./AgentTile";
-import type { Agent, KEvent, Mission } from "../lib/types";
+import { BlackboardTile, type BlackboardTileData } from "./BlackboardTile";
+import { ArtifactTile, type ArtifactTileData } from "./ArtifactTile";
+import type { Agent, Artifact, KEvent, Mission, Note } from "../lib/types";
 
 // v0.6 iteration: workers used to have a separate AgentLogTile
 // connected by a dashed view-edge. Merged into the main tile so
 // each worker is one bounded box (desktop on top, log below).
 const nodeTypes: NodeTypes = {
   agent: AgentTile,
+  blackboard: BlackboardTile,
+  artifact: ArtifactTile,
 };
 
 interface Props {
   agents: Map<string, Agent>;
   missions: Mission[];
   eventsByAgent: Map<string, KEvent[]>;
+  // Per-mission blackboard contents + artifact list, kept in App.
+  // The note count drives the blackboard tile body; artifacts
+  // (if any) spawn their own tiles.
+  notesByMission: Map<string, Note[]>;
+  artifactsByMission: Map<string, Artifact[]>;
+  // Per-mission "last write" cue: agent_id + ts of the most recent
+  // worker.note_write event. Drives the blackboard tile flash and
+  // the worker→blackboard edge pulse.
+  lastNoteWriteByMission: Map<string, { agentID: string; ts: string }>;
+  // Per-agent "is currently mid-turn" flag (true when pi emits
+  // agent_start, cleared on agent_end). Drives the driver tile
+  // border glow + outgoing edge pulse.
+  driverStreamingByAgent: Map<string, boolean>;
+  // Per-worker "the driver just acted on me" cue. Drives the
+  // driver→worker spawn edge pulse, mirroring how the worker→
+  // blackboard edge pulses on note_write.
+  lastDriverActionByAgent: Map<string, { kind: string; ts: string }>;
+  // Per-agent live thinking buffer. The driver tile renders
+  // this as a streaming preview bubble so the operator sees
+  // the supervisor's reasoning land word-by-word during the
+  // long thinking phase. Empty / missing = no active stream.
+  liveThinkingByAgent: Map<string, string>;
   onTerminateAgent?: (agentID: string) => void;
   onDeleteMission?: (missionID: string) => void;
   // Called on right-click. The handler receives both screen coords
@@ -83,6 +109,16 @@ const MISSION_GAP = 320;
 // to scan workers at readable size, not as thumbnails.
 const WORKER_GRID_MAX_COLS = 4;
 
+// Blackboard tile dimensions — chat-shaped, sibling to the
+// driver tile (positioned to its right by default).
+const BLACKBOARD_W_DEFAULT = 520;
+const BLACKBOARD_H_DEFAULT = 600;
+
+// Artifact tile dimensions — the final report; should feel
+// substantial since it's the deliverable. Operator can resize.
+const ARTIFACT_W_DEFAULT = 1100;
+const ARTIFACT_H_DEFAULT = 720;
+
 // gridLayout decides how to arrange N worker tiles. Up to 3 in
 // a single row (the common cases stay flat); 4+ get squared
 // into a grid using ceil(sqrt(N)) columns capped at
@@ -104,6 +140,12 @@ export function Canvas({
   agents,
   missions,
   eventsByAgent,
+  notesByMission,
+  artifactsByMission,
+  lastNoteWriteByMission,
+  driverStreamingByAgent,
+  lastDriverActionByAgent,
+  liveThinkingByAgent,
   onTerminateAgent,
   onDeleteMission,
   onPaneContextMenu,
@@ -120,6 +162,12 @@ export function Canvas({
         agents,
         missions,
         eventsByAgent,
+        notesByMission,
+        artifactsByMission,
+        lastNoteWriteByMission,
+        driverStreamingByAgent,
+        lastDriverActionByAgent,
+        liveThinkingByAgent,
         focusedID,
         setFocusedID,
         onTerminateAgent,
@@ -130,6 +178,12 @@ export function Canvas({
       agents,
       missions,
       eventsByAgent,
+      notesByMission,
+      artifactsByMission,
+      lastNoteWriteByMission,
+      driverStreamingByAgent,
+      lastDriverActionByAgent,
+      liveThinkingByAgent,
       focusedID,
       onTerminateAgent,
       onDeleteMission,
@@ -254,6 +308,12 @@ function buildGraph(
   agents: Map<string, Agent>,
   missions: Mission[],
   eventsByAgent: Map<string, KEvent[]>,
+  notesByMission: Map<string, Note[]>,
+  artifactsByMission: Map<string, Artifact[]>,
+  lastNoteWriteByMission: Map<string, { agentID: string; ts: string }>,
+  driverStreamingByAgent: Map<string, boolean>,
+  lastDriverActionByAgent: Map<string, { kind: string; ts: string }>,
+  liveThinkingByAgent: Map<string, string>,
   focusedID: string | null,
   setFocusedID: (id: string) => void,
   onTerminateAgent?: (agentID: string) => void,
@@ -346,6 +406,12 @@ function buildGraph(
       missionID,
       missionAgents,
       eventsByAgent,
+      notesByMission.get(missionID) ?? [],
+      artifactsByMission.get(missionID) ?? [],
+      lastNoteWriteByMission.get(missionID),
+      driverStreamingByAgent,
+      lastDriverActionByAgent,
+      liveThinkingByAgent,
       focusedID,
       setFocusedID,
       onTerminateAgent,
@@ -413,6 +479,12 @@ function layoutMissionLane(
   missionID: string,
   missionAgents: Agent[],
   eventsByAgent: Map<string, KEvent[]>,
+  notes: Note[],
+  artifacts: Artifact[],
+  lastNoteWrite: { agentID: string; ts: string } | undefined,
+  driverStreamingByAgent: Map<string, boolean>,
+  lastDriverActionByAgent: Map<string, { kind: string; ts: string }>,
+  liveThinkingByAgent: Map<string, string>,
   focusedID: string | null,
   setFocusedID: (id: string) => void,
   onTerminateAgent: ((agentID: string) => void) | undefined,
@@ -537,6 +609,13 @@ function layoutMissionLane(
         agent,
         recentEvents: eventsByAgent.get(agent.id) ?? [],
         focused: focusedID === agent.id,
+        // Driver tile uses this to glow the border while pi is
+        // mid-turn. Workers ignore it (their iframe already
+        // shows live state). Set by agent.streaming /
+        // agent.idle events from forwardPiEvent.
+        streaming: driverStreamingByAgent.get(agent.id) ?? false,
+        // Driver tile only. Empty string when no active thinking.
+        liveThinking: liveThinkingByAgent.get(agent.id) ?? "",
         onFocus: () => setFocusedID(agent.id),
         onTerminate: onTerminateAgent
           ? () => onTerminateAgent(agent.id)
@@ -574,24 +653,217 @@ function layoutMissionLane(
     }
   }
 
-  // Edges within this mission only. Spawn edges only — the
-  // dashed view-edge to a separate log tile is gone.
+  // Spawn edges (driver → worker). These also pulse when the
+  // driver acts on the worker (steer/terminate within the last
+  // ~1.5s), giving the operator a visual cue that mirrors the
+  // worker→blackboard contribution pulse.
+  const pulseHorizonMs = 1500;
+  const now = Date.now();
   for (const a of missionAgents) {
     if (a.parent_agent_id && byID.has(a.parent_agent_id)) {
+      const lastAction = lastDriverActionByAgent.get(a.id);
+      const driverActed =
+        !!lastAction &&
+        now - Date.parse(lastAction.ts) < pulseHorizonMs;
+      // Also pulse briefly when the driver spawns this worker.
+      const recentlySpawned = now - Date.parse(a.started_at) < 4000;
+      const pulsing =
+        driverActed || (a.status === "running" && recentlySpawned);
+      const isTerminate = lastAction?.kind === "driver.terminate_worker";
       edges.push({
         id: `${a.parent_agent_id}->${a.id}`,
         source: a.parent_agent_id,
         target: a.id,
-        animated: a.status === "running",
+        type: "smoothstep",
+        animated: pulsing,
         style: {
-          stroke:
-            a.spawn_kind === "fork" ? "var(--accent)" : "var(--border)",
-          strokeWidth: 1.5,
+          stroke: isTerminate
+            ? "var(--status-fail, #d96f6f)"
+            : a.spawn_kind === "fork"
+              ? "var(--accent)"
+              : "var(--accent-blackboard, var(--accent))",
+          strokeWidth: pulsing ? 2.5 : 1.5,
           strokeDasharray: a.spawn_kind === "fork" ? "4 4" : undefined,
+          opacity: pulsing ? 0.95 : 0.45,
         },
       });
     }
   }
 
+  // --- blackboard tile (one per mission) ---
+  //
+  // Positioning rules:
+  //   - If workers exist, the blackboard sits to the RIGHT of
+  //     the worker grid at the worker row's Y. Each worker's
+  //     right-edge "contrib" source handle aims at the
+  //     blackboard's left-edge "contrib" target handle, so
+  //     writes render as short ~horizontal stubs (smoothstep
+  //     routed) that are individually legible — not a fan of
+  //     bezier curves all collapsing to one point.
+  //   - If no workers yet (mission just dispatched, driver
+  //     hasn't fanned out), fall back to sibling-of-driver
+  //     placement so the tile exists from the start.
+  //   - Blackboard height stretches to match the worker grid
+  //     height when there are 2+ rows of workers, capped so
+  //     it doesn't dominate single-worker missions.
+  const driver = missionAgents.find((a) => a.role === "driver");
+  if (driver) {
+    const driverDepth = depth.get(driver.id) ?? 0;
+    const driverY = yByDepth.get(driverDepth) ?? laneOriginY;
+
+    // Find the worker row (if any).
+    const workerRow = missionAgents.filter(
+      (a) => a.role === "worker" && byID.has(a.parent_agent_id ?? ""),
+    );
+    const hasWorkers = workerRow.length > 0;
+
+    let bbX: number;
+    let bbY: number;
+    let bbH = BLACKBOARD_H_DEFAULT;
+    if (hasWorkers) {
+      // Use the FIRST worker's depth as the worker row.
+      // v0.7 has a single worker depth (drivers don't spawn
+      // sub-workers yet) so this is unambiguous.
+      const wDepth = depth.get(workerRow[0].id) ?? driverDepth + 1;
+      const wY = yByDepth.get(wDepth) ?? driverY + DRIVER_H_DEFAULT + ROW_GAP;
+      const grid = gridLayout(workerRow.length);
+      const gridW =
+        grid.cols * TILE_W_DEFAULT + (grid.cols - 1) * COL_GAP;
+      const gridH =
+        grid.rows * TILE_H_DEFAULT + (grid.rows - 1) * ROW_GAP;
+      // Right edge of the worker grid (worker tiles are
+      // centered on laneCenterX in the depth loop above).
+      const workerGridRightX = laneCenterX + gridW / 2;
+      bbX = workerGridRightX + COL_GAP;
+      bbY = wY;
+      // Match height to worker grid, but clamp so single-row
+      // missions don't get a stubby blackboard.
+      bbH = Math.max(BLACKBOARD_H_DEFAULT, gridH);
+    } else {
+      bbX =
+        laneCenterX - DRIVER_W_DEFAULT / 2 + DRIVER_W_DEFAULT + COL_GAP;
+      bbY = driverY;
+    }
+
+    nodes.push({
+      id: missionID + ":blackboard",
+      type: "blackboard",
+      dragHandle: ".drag-handle",
+      position: { x: bbX, y: bbY },
+      width: BLACKBOARD_W_DEFAULT,
+      height: bbH,
+      style: { width: BLACKBOARD_W_DEFAULT, height: bbH },
+      data: {
+        missionID,
+        notes,
+        lastWriteAt: lastNoteWrite?.ts,
+      } as BlackboardTileData,
+    });
+
+    // Driver → blackboard: enters via the top "driver" handle.
+    // Smoothstep so it doesn't bezier-curve across the canvas.
+    edges.push({
+      id: `${driver.id}->${missionID}:blackboard`,
+      source: driver.id,
+      target: missionID + ":blackboard",
+      targetHandle: "driver",
+      type: "smoothstep",
+      animated: false,
+      style: {
+        stroke: "var(--accent-blackboard, var(--accent))",
+        strokeWidth: 1.25,
+        opacity: 0.45,
+      },
+    });
+
+    // Worker → blackboard contribution edges. One per worker
+    // that has actually written a note; pulsing on most-recent.
+    // Source handle = worker's "contrib" (right side).
+    // Target handle = blackboard's "contrib" (left side).
+    // Smoothstep routes them as right-angle stubs that don't
+    // overlap each other.
+    const contributors = new Set<string>();
+    for (const n of notes) {
+      if (n.agent_id && n.agent_id !== driver.id) {
+        contributors.add(n.agent_id);
+      }
+    }
+    for (const wid of contributors) {
+      if (!byID.has(wid)) continue;
+      const pulsing = lastNoteWrite?.agentID === wid;
+      edges.push({
+        id: `${wid}->${missionID}:blackboard:contrib`,
+        source: wid,
+        sourceHandle: "contrib",
+        target: missionID + ":blackboard",
+        targetHandle: "contrib",
+        type: "smoothstep",
+        animated: pulsing,
+        style: {
+          stroke: "var(--accent-blackboard, var(--accent))",
+          strokeWidth: pulsing ? 2.5 : 1.75,
+          strokeDasharray: "6 4",
+          opacity: pulsing ? 0.95 : 0.6,
+        },
+      });
+    }
+  }
+
+  // --- artifact tile (one per mission, if produced) ---
+  //
+  // The artifact represents the mission's deliverable; we
+  // position it BELOW the workers (after all depth rows have
+  // been laid out). For v0.7 we expect at most one artifact
+  // per mission; loop to be future-proof.
+  if (artifacts.length > 0 && driver) {
+    // yCursor after the depth loop above gives us the bottom of
+    // the workers area. Place artifact a bit below.
+    const artifactY = yCursor + 40;
+    let artifactX = laneCenterX - ARTIFACT_W_DEFAULT / 2;
+    for (const a of artifacts) {
+      nodes.push({
+        id: "artifact:" + a.id,
+        type: "artifact",
+        dragHandle: ".drag-handle",
+        position: { x: artifactX, y: artifactY },
+        width: ARTIFACT_W_DEFAULT,
+        height: ARTIFACT_H_DEFAULT,
+        style: {
+          width: ARTIFACT_W_DEFAULT,
+          height: ARTIFACT_H_DEFAULT,
+        },
+        data: {
+          artifactID: a.id,
+          type: a.type,
+          title: a.title ?? "(untitled)",
+          summary: a.summary,
+          createdAt: a.created_at,
+        } as ArtifactTileData,
+      });
+      // Production edge: driver -> artifact, slightly bolder so
+      // it reads as "this is the deliverable."
+      edges.push({
+        id: `${driver.id}->artifact:${a.id}`,
+        source: driver.id,
+        target: "artifact:" + a.id,
+        animated: false,
+        style: {
+          stroke: "var(--accent-artifact, #e6b800)",
+          strokeWidth: 2,
+          opacity: 0.7,
+        },
+      });
+      // Multi-artifact case (v1): step right for the next one.
+      artifactX += ARTIFACT_W_DEFAULT + COL_GAP;
+      if (artifactX + ARTIFACT_W_DEFAULT > laneCenterX + laneWidth) {
+        // Wrap to next row.
+        artifactX = laneCenterX - ARTIFACT_W_DEFAULT / 2;
+      }
+    }
+    // The blackboard width contribution to the lane is handled
+    // implicitly by NodeResizer; for v0.7 we don't grow the
+    // lane to include the blackboard / artifact (they overflow
+    // to the right / below). Operator drags if it's a problem.
+  }
   return { nodes, edges, laneWidth };
 }

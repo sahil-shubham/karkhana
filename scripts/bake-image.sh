@@ -225,9 +225,22 @@ if [[ $SKIP_EXTENSION -eq 0 ]]; then
     remote_put_file "$SBID" "$EXTENSION_LOCAL_DIR/README.md" "$EXTENSION_REMOTE_DIR/README.md"
   fi
 
-  log "installing extension deps (typebox)"
+  log "installing extension deps (typebox, ws)"
   REMOTE_TIMEOUT=120 remote_exec "$SBID" \
     bash -c "cd $EXTENSION_REMOTE_DIR && sudo npm install --omit=dev --silent" >/dev/null
+
+  # --- kk-browser helper: launches chromium with the CDP flags
+  # so the browser_eval tool can connect over
+  # http://localhost:9222. The flag must be on the FIRST chromium
+  # invocation; subsequent `chromium --new-window` calls go to
+  # the existing instance and ignore flags. Centralising the
+  # launch in one script means workers can't accidentally launch
+  # chromium without the debug port.
+  log "installing kk-browser helper (/usr/local/bin/kk-browser)"
+  remote_put_file "$SBID" "$REPO_ROOT/scripts/kk-browser" "/tmp/kk-browser"
+  REMOTE_TIMEOUT=5 remote_exec "$SBID" \
+    sudo install -m 0755 /tmp/kk-browser /usr/local/bin/kk-browser >/dev/null
+  REMOTE_TIMEOUT=5 remote_exec "$SBID" which kk-browser >/dev/null
 
   log "verifying extension loads via pi"
   # `pi --extension <path> --version` exercises the extension

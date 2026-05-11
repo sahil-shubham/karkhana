@@ -104,6 +104,8 @@ func main() {
 		driverTokens:      map[string]string{},
 		driverPendingAsk:  map[string]chan string{},
 		timingLogged:      map[string]map[string]bool{},
+		tickDispatchers:   map[string]*TickDispatcher{},
+		ctx:               context.Background(),
 	}
 
 	// Seed the event ID counter from the persisted max so newly
@@ -151,6 +153,7 @@ func main() {
 	mux.HandleFunc("/api/missions/", state.handleMissionByID)
 	mux.HandleFunc("/api/agents", state.handleAgents)
 	mux.HandleFunc("/api/agents/", state.handleAgentByID)
+	mux.HandleFunc("/api/artifacts/", state.handleArtifactByID)
 	mux.HandleFunc("/api/events", canvas.EventStreamHandler(bus, state))
 	mux.HandleFunc("/proxy/", kasmproxy.Handler("/proxy/", state))
 	// Driver-tool callbacks. Authed via per-driver bearer
@@ -231,6 +234,17 @@ type serverState struct {
 	// the log fills up). See timing.go in pkg/mission for the
 	// canonical milestone definitions.
 	timingLogged map[string]map[string]bool
+
+	// Active-driver tick dispatchers. One per mission; created
+	// when the driver is connected, stopped on mission delete /
+	// driver disconnect. Owns its own goroutine. See tick.go.
+	tickMu          sync.Mutex
+	tickDispatchers map[string]*TickDispatcher
+
+	// ctx is the lifetime context for all background dispatchers.
+	// Cancelled on graceful shutdown (currently unused; reserved
+	// for SIGTERM handling).
+	ctx context.Context
 }
 
 func (s *serverState) nextEventID() int64 {
@@ -314,6 +328,12 @@ func (s *serverState) handleMissionByID(w http.ResponseWriter, r *http.Request) 
 		case "timing":
 			s.handleMissionTiming(w, r, missionID)
 			return
+		case "notes":
+			s.handleMissionNotes(w, r, missionID)
+			return
+		case "artifacts":
+			s.handleMissionArtifacts(w, r, missionID)
+			return
 		default:
 			http.Error(w, "unknown sub-route: "+action, 404)
 			return
@@ -336,6 +356,76 @@ func (s *serverState) handleMissionByID(w http.ResponseWriter, r *http.Request) 
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// handleMissionNotes returns blackboard notes for a mission.
+// Used by the frontend on initial hydrate / when the operator
+// expands a note row.
+//
+//   GET /api/missions/:id/notes        — all notes
+//   GET /api/missions/:id/notes?key=X  — only notes with key=X
+//
+// Always returns oldest-first within a key (creation order).
+func (s *serverState) handleMissionNotes(w http.ResponseWriter, r *http.Request, missionID string) {
+	if s.store == nil {
+		http.Error(w, "persistence disabled", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	notes, err := s.store.ListNotes(ctx, missionID, r.URL.Query().Get("key"))
+	if err != nil {
+		http.Error(w, "read notes failed: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, 200, notes)
+}
+
+// handleMissionArtifacts returns the artifact list for a mission.
+// v0.7: usually 0 or 1 artifact per mission (created when the
+// driver calls finish). Newer-first ordering.
+//
+//   GET /api/missions/:id/artifacts
+func (s *serverState) handleMissionArtifacts(w http.ResponseWriter, r *http.Request, missionID string) {
+	if s.store == nil {
+		http.Error(w, "persistence disabled", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	arts, err := s.store.ListArtifacts(ctx, missionID)
+	if err != nil {
+		http.Error(w, "read artifacts failed: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, 200, arts)
+}
+
+// handleArtifactByID returns a single artifact's full content.
+//
+//   GET /api/artifacts/:id
+func (s *serverState) handleArtifactByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/artifacts/")
+	if id == "" {
+		http.Error(w, "id required", 400)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "persistence disabled", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	art, err := s.store.GetArtifact(ctx, id)
+	if err != nil {
+		http.Error(w, "read artifact failed: "+err.Error(), 500)
+		return
+	}
+	if art == nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+	writeJSON(w, 200, art)
 }
 
 // handleMissionTiming returns mission.MissionTiming — milestone
@@ -374,6 +464,10 @@ func (s *serverState) handleMissionTiming(w http.ResponseWriter, r *http.Request
 // unreachable, we still clean up Karkhana state.
 func (s *serverState) deleteMission(m *mission.Mission) {
 	slog.Info("delete mission", "mission", m.ID, "goal", truncate(m.Goal, 60))
+
+	// Stop the tick dispatcher first so it doesn't fire follow_ups
+	// against an about-to-be-closed driver.
+	s.stopTickDispatcher(m.ID)
 
 	// Snapshot all agents belonging to this mission, then operate
 	// outside the lock (terminate calls bhatti, can take seconds).
@@ -625,6 +719,11 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 		"mission", m.ID,
 		"goal_len", len(m.Goal),
 		"warmup_ms", promptSentAt.Sub(m.CreatedAt).Milliseconds())
+
+	// Active-driver tick dispatcher. Wakes the driver on every
+	// material mission event (note_write, worker_terminated,
+	// heartbeat). See tick.go for the loop.
+	s.startTickDispatcher(m, drv, driverID)
 
 	// We do NOT AwaitCompletion. The driver is persistent — it
 	// finishes a turn (agent_end) but stays running, awaiting
@@ -895,77 +994,109 @@ func (s *serverState) ensurePi(ctx context.Context, m *mission.Mission, workerID
 // lifecycle (finish is a checkpoint, not an exit).
 func wrapGoalWithDriverContext(goal string) string {
 	env := `<environment>
-You are the DRIVER agent for a Karkhana mission. You orchestrate worker agents to accomplish what the operator asks. You run on the Karkhana host (no desktop, just bash/read/write/edit + your orchestration tools); your workers run inside isolated bhatti microVMs with full Linux desktops, Chromium, and computer-use tools (screenshot, click, type, scroll). The operator watches all of you live on a single canvas.
+You are the SUPERVISOR of a Karkhana mission. You orchestrate worker agents AND narrate your reasoning live to the operator who is watching on a canvas. You run on the Karkhana host (no desktop — just bash/read/write/edit + your orchestration tools); your workers run inside isolated bhatti microVMs with full Linux desktops, Chromium, and computer-use tools (screenshot, click, type, scroll).
 
-Your orchestration tools:
+## You are not a batch coordinator — you are LIVE
 
-  spawn_worker(task)                    one worker; returns its worker_id immediately
-  spawn_workers(tasks)                  N workers in ONE tool call, fanned out in parallel.
-                                         PREFER this for fan-out (N≥2).
-  wait_for_workers(worker_ids, timeout) block until those workers finish; returns outputs
-  ask_operator(question)                pause and ask the human; blocks until they reply
-  report_progress(message)              send a status update without blocking
-  finish(result)                        checkpoint the current task with a final answer
+This is what makes Karkhana different from every other research agent. You do not:
+  - spawn N workers, block until they all finish, then synthesize once
+  - hide your reasoning between worker turns
+  - emit one final report at the end
 
-## Always parallelize when possible
+You DO:
+  - fan out workers in parallel when the task's parts are already known
+  - scout progressively when the dimensions of the task are NOT yet known
+  - get auto-ticked by Karkhana every time something material happens (worker writes a note, worker terminates, ~45s heartbeat)
+  - narrate your reasoning OUT LOUD in 1-2 sentences per tick, so the operator can follow your thinking
+  - re-plan, steer workers, terminate workers that are off-task
+  - call finish() to produce the artifact ONLY when you have enough
 
-If the operator's goal has TWO OR MORE independent parts, spawn them ALL via a single spawn_workers([t1, t2, ..., tN]) call — bhatti boots them concurrently. Then wait_for_workers([w1, w2, ...]) on all of them at once.
+## When to fan out vs. scout
 
-  Good:    "compare A, B, C"          → spawn_workers([tA, tB, tC]), wait once, synthesize
-           "summarize 5 articles"     → spawn_workers([t1..t5]), wait once, combine
-  OK:      spawn_worker for a single one-off (no fan-out)
-  Bad:     spawn_worker, wait, spawn_worker, wait, ...   (defeats the parallelism)
+This matters. Wrong default kills the wedge.
 
-## Phased pattern: discovery + fan-out
+FAN OUT (spawn ALL workers immediately via spawn_workers([t1..tN])):
+  - The operator already named the items: "compare A, B, C, D, E", "summarize these 5 articles", "check these 7 URLs".
+  - The task shape is clear and the worker tasks are mostly the same template with different inputs.
+  - You have nothing to gain from waiting; bhatti boots them all in parallel for ~3-4s.
 
-Many tasks have TWO PHASES — first find a list, then research each item in parallel. Recognize this and chain accordingly:
+SCOUT first (spawn 1-2, wait for early findings, then dispatch the rest):
+  - The operator described a SHAPE but not the items: "find the top 5 PRs in this repo, then summarize each".
+  - You don't yet know the dimensions and worker tasks would be guesses until a scout reports back.
+  - You think a quick early finding will sharpen subsequent tasks ("if A turns out to use libkrun, I want the others to specifically check libkrun-vs-firecracker").
 
-  Phase 1 (1 worker, serial):
-    spawn_worker("find items, return URLs as plain text, max N")
-    wait_for_workers([w1])
-    parse URLs from w1's result
+DEFAULT TO FAN OUT. The progressive pattern is for genuine uncertainty, not for hedging. If the operator gave you 5 URLs, spawn 5 workers in one spawn_workers call. Don't be cute.
 
-  Phase 2 (N workers, parallel — ONE call):
-    spawn_workers(["research <url_1>", "research <url_2>", ..., "research <url_N>"])
-    wait_for_workers([w2..wN+1])
-    synthesize
+The operator chose Karkhana because they want to WATCH a supervisor think in real time. Your value is in the narration + dynamic decisions, not the templated fan-out.
 
-Goals that fit this shape:
-  "search HN for X submissions, then research each in detail"
-  "find the top 5 PRs in this repo, summarize each"
-  "list the components on this page, audit each for accessibility"
+## The tick loop
 
-Key rules for the discovery worker (Phase 1):
-  - Cap the count (N=5..20 usually). Don't spawn 100 sandboxes.
-  - Tell it EXPLICITLY: "return ONLY a list of items, plain text, one per line, no other commentary". Makes parsing reliable on your end.
-  - Worker task MUST end with "do not call any more tools after that" so it terminates and unblocks your wait.
+After your initial response, you'll start receiving "[karkhana tick]" messages. Each one carries:
+  - what just changed (a new note, a worker terminated, etc.)
+  - current mission state (worker statuses, blackboard manifest, elapsed/cost)
+  - the supervisor protocol reminder
 
-## When wait_for_workers returns timed_out=true
+On each tick, do ONE of:
+  - Narrate a sentence about what's interesting and end with "(watching)" if nothing needs action.
+  - Narrate + take ONE tool action (spawn_worker, steer_worker, terminate_worker, write_note, finish).
 
-If wait_for_workers returns with timed_out=true, look at the partial results before deciding what to do:
+Keep tick responses short. The operator reads each one in your driver tile chat.
 
-  - If a worker has final_assistant_text that already contains the answer you need, USE IT. The worker may have produced a clean answer but failed to reach pi's agent_end terminal state. Retrying would be wasteful and would hit the same edge case.
-  - Only re-spawn a worker if its result is genuinely empty / useless / off-task.
-  - Always prefer summarizing partial results over retrying. The operator would rather see "here's what 8 of 10 workers found" than wait another 30 minutes for a clean run.
+## Orchestration tools
 
-## Worker tasks must have explicit completion criteria
+  spawn_worker(task)                    one worker; returns worker_id immediately
+  spawn_workers(tasks)                  N workers in ONE call (parallel; prefer for fan-out)
+  steer_worker(worker_id, hint)         inject mid-flight guidance into a running worker
+  terminate_worker(worker_id, reason)   force-stop a worker (off-task, looping, no-longer-needed)
+  ask_operator(question)                pause and ask the human; blocks until reply
+  report_progress(message)              quick status update (you can also just narrate)
+  finish(result, title?)                produce the FINAL ARTIFACT and enter idle
 
-Workers don't see your conversation with the operator — only what you put in their task. Each task MUST end with a sentence like:
+  list_notes()                          manifest of blackboard keys + entry counts
+  read_notes(key?)                      read all entries for a key (or whole blackboard)
+  write_note(key, content, summary?)    append your own planning note
 
-  "When done, respond with <X> as plain text. Do not call any more tools after that."
+DO NOT call wait_for_workers. It is deprecated; ticks replace it. After spawning workers, just end your turn — Karkhana ticks you on every material event.
 
-Without this, the worker may keep clicking/exploring forever and never signal completion. The literal phrase "do not call any more tools" is what triggers pi's agent_end and unblocks your wait_for_workers.
+## Blackboard
 
-Example good task:
-  "Open https://news.ycombinator.com in the browser. Extract the top 3 story titles from the front page. When done, respond with the three titles as a numbered list, plain text only. Do not call any more tools after that."
+The mission's shared scratchpad. Workers contribute findings via write_note continuously. You read those contributions during synthesis. Append-only — multiple notes under the same key accumulate.
 
-## Other behaviours
+WHEN YOU SPAWN WORKERS, the task description must:
+  1. Pin a SPECIFIC blackboard key (e.g. 'bhatti_findings', 'pricing_x').
+  2. Instruct INCREMENTAL writes — write_note as findings are discovered, NOT one final dump.
+  3. Tell the worker to use the BROWSER (chromium + click/scroll/screenshot), not curl. (Karkhana now BLOCKS curl against public URLs at the tool layer, but you should still spell it out so the worker plans correctly.)
+  4. End with "call finish(summary) when done." — the literal phrase "finish" is the worker's deterministic termination signal.
 
-- For tasks that involve browsing, clicking, GUI work, or anything visual, ALWAYS spawn a worker. You do not have a desktop yourself.
-- ALWAYS call finish() with a result when you have completed what the operator asked. After finish, you remain available; the operator may follow up. finish is a checkpoint, NOT an exit.
-- Use ask_operator only when you genuinely need human input (ambiguous goal, credentials, decisions the agent shouldn't make). Don't use it for confirmations.
+Example task string:
 
-Your conversation with the operator persists across days. The first message below is their initial goal; later messages will arrive as follow-ups.
+  "Open https://X in the browser. Explore visually — read the overview, scroll, click into sections. AS YOU DISCOVER each finding, call write_note('topic_x', <markdown>, <one-line summary>). Don't save everything for a final dump — stream notes as you find them. When you've covered the task adequately, call finish('summary line referencing your notes')."
+
+## Active supervision patterns
+
+The tick loop enables patterns you couldn't do before:
+
+  Progressive fan-out:
+    Tick 0:  spawn 2 scout workers, see what the landscape looks like
+    Tick 3:  one scout reports "X uses approach A". Spawn 3 more workers on similar items now that you know the dimensions.
+  Mid-flight redirect:
+    Tick N:  worker W's notes show it's down a rabbit hole. steer_worker(W, "skip the kernel deep-dive; focus on the public API surface").
+
+  Cutting losses:
+    Tick M:  worker W has written 12 notes that duplicate worker V's. terminate_worker(W, "diminishing returns; V covered this dimension thoroughly").
+
+  Diverge→converge:
+    Spawn N workers each on a different angle. As notes accumulate, spot the through-line and write_note('synthesis_v1', …) yourself. On final tick, finish() with a polished version.
+
+## When to finish()
+
+When the blackboard answers the operator's question. Not when every worker has terminated — you can finish() even while workers are still running (Karkhana terminates them when you finish).
+
+finish() produces a markdown artifact that appears on the canvas as its own tile. The driver tile stays active; the operator can follow up with "extend section 3" or "compare with Y" and you pick up with full conversation history.
+
+## Your conversation persists
+
+The first message below is the operator's goal. Tick messages arrive automatically. Operator follow-ups arrive as normal user messages. All of these accumulate in your context — you remember everything across days.
 </environment>`
 	return env + `
 
@@ -1002,9 +1133,14 @@ The desktop resolution is 1280x720, DISPLAY=:99. The operator watches you live o
 
 ## Completion criteria are mandatory
 
-When you have produced your final answer, respond with TEXT ONLY — do NOT call any more tools after that. The text-only response is what signals you're done; without it the driver thinks you're still working and the mission hangs.
+When you have finished your task, call the finish(summary) tool as your VERY LAST action. This is the ONLY reliable termination signal — do NOT just stop responding or end with a text-only message; pi will keep the agent loop alive and the driver will block forever waiting for you.
 
-The driver's task description below usually includes the explicit phrase "do not call any more tools after that" — honour it literally. Once you have what was asked, write it out and stop.
+The finish tool:
+  - Takes a short 'summary' (≤ 500 chars) that becomes your final answer to the driver.
+  - Returns terminate:true which deterministically ends the worker's pi loop.
+  - Should be called IMMEDIATELY after your final write_note. Don't add a chatty wrap-up message after — the summary string IS your wrap-up.
+
+Flow at end-of-task: last write_note(...)  →  finish("recorded N notes under <key>; see blackboard for details")  →  worker terminates.
 
 ## Tools
 
@@ -1024,15 +1160,80 @@ In addition to bash/read/write/edit, you have a full computer-use toolset that d
 Every action tool returns a fresh screenshot in its result, so you have visual feedback automatically — you do NOT need to call screenshot() after each click. Use coordinates from the latest screenshot you have.
 
 Workflow for "open <url>" / "go to <site>" / "browse to X":
-  1. bash: 'chromium --no-sandbox --test-type --new-window <url> &' to launch.
-     IMPORTANT: include --test-type along with --no-sandbox. It suppresses the
-     yellow infobars ("You are using an unsupported command-line flag", "Google API
-     keys are missing") that otherwise eat the top ~80px of the viewport and
-     confuse screenshot-driven coordinate work.
+  1. bash: 'kk-browser <url>' to launch chromium with Chrome DevTools
+     Protocol enabled on port 9222. ALWAYS use kk-browser, never call
+     chromium directly — kk-browser sets the flags that make browser_eval
+     work, AND it suppresses the yellow infobars that would otherwise eat
+     the top ~80px of the viewport.
   2. wait(2)  — let the window appear and the page render
-  3. screenshot() if needed, then click/type/scroll to interact
+  3. Then either:
+       - browser_eval('<js>') for fast structured data extraction (see below)
+       - screenshot() + click/scroll/type for visual interaction
 
 Do NOT interpret bare hostnames like "bhatti.sh" as local files. They are URLs (prefix https:// when launching).
+
+## browser_eval — fast structured extraction from the loaded page
+
+browser_eval(code) runs JavaScript in the chromium tab you opened with kk-browser. It is MUCH faster than scrolling + screenshotting when you need to pull repeated/structured data off the loaded page:
+
+  - all PR titles + URLs from a github page
+  - all filenames in a directory listing
+  - all rows of a pricing table
+  - title / metadata of the current page
+  - links matching a CSS selector
+
+The data lands as a JSON value in the tool result; write_note it directly.
+
+GOOD pattern (preferred over scroll-screenshot loops):
+
+  bash 'kk-browser https://github.com/X/Y/pulls'
+  wait(2)
+  browser_eval("return Array.from(document.querySelectorAll('.js-issue-row')).map(r => ({ title: r.querySelector('a.Link--primary')?.textContent.trim(), author: r.querySelector('.opened-by a')?.textContent.trim() }))")
+  write_note('prs', '...JSON result here...', 'top PR titles + authors')
+
+browser_eval CANNOT bypass the page boundary:
+  - fetch() / XHR to EXTERNAL hosts (e.g. api.github.com from a github.com page is NOT external; external means a totally different domain) is blocked
+  - same-origin and localhost fetches still work for SPA-style apps
+  - the operator still sees the page you're querying — transparency preserved
+
+## Curl against public URLs is BLOCKED
+
+The bash tool refuses curl/wget against any external http(s) URL. Use kk-browser + browser_eval instead. Local/internal URLs (localhost, 127.0.0.1, 10.0.x.x, 169.254.x.x, 192.168.x.x) are still allowed for legitimate sandbox-internal needs.
+
+Why the block: you exist as a HEADFUL agent on a real X11 desktop. Curl turns you into an invisible HTTP scraper. browser_eval gives you the SAME speed while keeping the page (with its session, cookies, JS-rendered content) visible to the operator. That distinction is why Karkhana exists.
+
+## When to use which tool
+
+| Goal                                  | Tool                                |
+|---------------------------------------|-------------------------------------|
+| Open a URL                            | bash 'kk-browser <url>' + wait(2)   |
+| Read a list of repeated items         | browser_eval (returns JSON)         |
+| Get one specific value (title, attr)  | browser_eval                        |
+| Click a link / button / form          | left_click(x, y) from screenshot    |
+| Type in a field                       | screenshot → click → type(text)     |
+| Scroll through long content           | scroll(direction)                   |
+| Judge layout, design, screenshots     | screenshot()                        |
+| Explore unfamiliar page first time    | screenshot() then decide            |
+| Read source code on github page       | browser_eval('return document.querySelector(".blob-code-content")?.textContent') |
+
+Default: if you know the SHAPE of the data you want and just need to extract it — browser_eval. If you need to SEE something or navigate — GUI tools.
+
+## Blackboard — record findings as you discover them
+
+When the driver's task includes phrases like "write findings to write_note(...)", "contribute under key X", or "record what you find", call:
+
+  write_note(key, content, summary?)
+
+This appends a contribution to the mission's shared scratchpad. Other agents (the driver, possibly peer workers) read it during synthesis.
+
+KEY POINT: write notes INCREMENTALLY — every time you discover a meaningful chunk (a project's stated purpose, the architecture summary you just read, a relevant pricing tier, etc.), write_note it immediately. Do NOT save up everything to dump in a single giant final note. Reasons:
+  - if you crash or time out, partial findings are still preserved
+  - the operator and driver see your progress in real time
+  - multiple smaller notes are easier to synthesize than one wall of text
+
+Typical rhythm for a research task: open page → read overview → write_note(key, 'overview: ...') → explore section → write_note(key, 'architecture: ...') → explore another → write_note(key, 'limitations: ...') → respond 'DONE'.
+
+Multiple notes under the same key are normal — they accumulate, none overwrites others. Use a stable key the driver specified; don't invent your own.
 
 Narrate what you're doing in short assistant messages between tool calls. The operator watches both your reasoning and the desktop live.
 </environment>`
@@ -1134,6 +1335,16 @@ func (s *serverState) fetchKasmCreds(ctx context.Context, sandboxID string) (str
 func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event) {
 	t, _ := ev["type"].(string)
 
+	// Diagnostic: we observed workers that responded text-only,
+	// went idle, but never produced an agent_end on the wire.
+	// Log every event type so we can see exactly what pi emits
+	// during the suspect window. Cheap; gated to debug-volume
+	// types via the if below to avoid log spam.
+	if t == "agent_end" || t == "extension_error" {
+		slog.Info("pi event",
+			"mission", missionID, "agent", agentID, "type", t)
+	}
+
 	switch t {
 	case "agent_start":
 		s.maybeLogFirstReaction(missionID, agentID, "agent_start")
@@ -1142,9 +1353,77 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 			Kind: "worker.thinking", Ts: time.Now(),
 			Payload: map[string]any{"text": "(agent started)"},
 		})
+		// Role-aware streaming signal. The frontend uses
+		// agent.streaming / agent.idle to glow the driver tile
+		// border + pulse outgoing edges while the supervisor
+		// thinks. We emit one event regardless of role; the UI
+		// decides what to do with it.
+		s.publish(mission.Event{
+			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+			Kind: "agent.streaming", Ts: time.Now(),
+			Payload: map[string]any{},
+		})
 
 	case "turn_start":
 		// Quiet event; useful if we want a turn counter but skip for now.
+
+	case "message_update":
+		// Pi emits message_update for each streaming chunk during
+		// an assistant turn — including thinking_delta. We surface
+		// thinking deltas as a live feed so the operator can SEE
+		// the supervisor reasoning during the long thinking phase
+		// (Sonnet 4.6 on high thinking can spend 20-60s reasoning
+		// before emitting any text; without this, the canvas
+		// looks frozen).
+		//
+		// These events are TRANSIENT (skipped by persist) so we
+		// don't fill SQLite with kilobytes of streaming chunks.
+		// The final assistant message is still persisted via
+		// message_end → worker.message.
+		ame, _ := ev["assistantMessageEvent"].(map[string]any)
+		ameType, _ := ame["type"].(string)
+		switch ameType {
+		case "thinking_start":
+			s.publish(mission.Event{
+				ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+				Kind: "agent.thinking_start", Ts: time.Now(),
+				Payload: map[string]any{},
+			})
+		case "thinking_delta":
+			delta, _ := ame["delta"].(string)
+			if delta == "" {
+				return
+			}
+			s.publish(mission.Event{
+				ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+				Kind: "agent.thinking_delta", Ts: time.Now(),
+				Payload: map[string]any{"delta": delta},
+			})
+		case "thinking_end":
+			// Marker the UI uses to finalize the live thinking
+			// bubble (lock it in, stop accepting deltas under the
+			// same block).
+			s.publish(mission.Event{
+				ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+				Kind: "agent.thinking_end", Ts: time.Now(),
+				Payload: map[string]any{},
+			})
+		case "text_delta":
+			// Mirror thinking deltas for the post-thinking assistant
+			// text. Makes the driver's spoken reply land word-by-
+			// word in the chat instead of as one block at
+			// message_end. Cheap; the final message_end still fires
+			// for the canonical persisted record.
+			delta, _ := ame["delta"].(string)
+			if delta == "" {
+				return
+			}
+			s.publish(mission.Event{
+				ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+				Kind: "agent.text_delta", Ts: time.Now(),
+				Payload: map[string]any{"delta": delta},
+			})
+		}
 
 	case "turn_end":
 		// Extract token usage to update accounting.
@@ -1190,6 +1469,31 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 		args, _ := ev["args"].(map[string]any)
 		summary := summarizeToolCall(toolName, args)
 		s.maybeLogFirstAction(missionID, agentID, toolName)
+		// Intercept write_note: workers can't call Karkhana via HTTP
+		// (sandbox network reach to host is fragile across deployment
+		// shapes), so we use the pi-rpc tool_execution_start event
+		// stream as the transport. Tool args carry the note data;
+		// the worker's tool execute() is a local no-op that just
+		// returns success. See extensions/computer-use/index.ts.
+		if toolName == "write_note" && args != nil {
+			go s.persistBlackboardWrite(missionID, agentID, args)
+		}
+		// Worker's `finish` tool. The tool result's `terminate: true`
+		// drives pi's natural agent_end, which our case "agent_end"
+		// below handles. But the `summary` arg is the worker's
+		// authoritative final answer to the driver, so we capture
+		// it eagerly here so it's available the moment the driver's
+		// next tick reads final_assistant_text — even if the
+		// downstream agent_end is slow to propagate.
+		if toolName == "finish" && args != nil {
+			if summ, ok := args["summary"].(string); ok && summ != "" {
+				s.mu.Lock()
+				if a, ok := s.agents[agentID]; ok && a.Role == mission.RoleWorker {
+					a.FinalAssistantText = truncate(summ, 1000)
+				}
+				s.mu.Unlock()
+			}
+		}
 		s.publish(mission.Event{
 			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
 			Kind: "worker.tool_call", Ts: time.Now(),
@@ -1241,6 +1545,13 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 		if a != nil && a.Role == mission.RoleWorker && a.Status == mission.StatusRunning {
 			s.markWorkerCompleted(missionID, agentID)
 		}
+		// Idle signal mirroring agent.streaming above. The UI
+		// uses this to stop glowing the driver tile.
+		s.publish(mission.Event{
+			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+			Kind: "agent.idle", Ts: time.Now(),
+			Payload: map[string]any{},
+		})
 
 	case "extension_error":
 		extPath, _ := ev["extensionPath"].(string)
@@ -1368,9 +1679,17 @@ func (s *serverState) markWorkerCompleted(missionID, workerID string) {
 		s.mu.Unlock()
 		return
 	}
+	// Idempotency: don't double-fire if already terminated. The
+	// dual call sites (AwaitCompletion + forwardPiEvent agent_end)
+	// can both reach here for the same worker.
+	if w.Status == mission.StatusTerminated {
+		s.mu.Unlock()
+		return
+	}
 	w.Status = mission.StatusTerminated
 	w.Outcome = mission.StatusDone
 	w.TerminatedAt = &now
+	finalText := w.FinalAssistantText
 	if d := s.drivers[workerID]; d != nil {
 		go d.Close()
 		delete(s.drivers, workerID)
@@ -1382,7 +1701,17 @@ func (s *serverState) markWorkerCompleted(missionID, workerID string) {
 		ID: s.nextEventID(), MissionID: missionID, AgentID: workerID,
 		Kind: "agent.completed", Ts: time.Now(),
 		Payload: map[string]any{
-			"final_assistant_text": w.FinalAssistantText,
+			"final_assistant_text": finalText,
+		},
+	})
+
+	// Wake the active driver: a worker just terminated.
+	s.enqueueTick(missionID, Tick{
+		Reason:  tickReasonWorkerTerminated,
+		AgentID: workerID,
+		Payload: map[string]any{
+			"final_text": finalText,
+			"reason":     "clean termination",
 		},
 	})
 }
@@ -1441,6 +1770,18 @@ func (s *serverState) terminateAgent(a *mission.Agent) {
 		Kind: "agent.terminated", Ts: time.Now(),
 		Payload: map[string]any{"reason": "terminated by operator"},
 	})
+	// Wake the active driver if a worker was terminated mid-flight
+	// (operator UI or driver's terminate_worker tool path).
+	if a.Role == mission.RoleWorker {
+		s.enqueueTick(a.MissionID, Tick{
+			Reason:  tickReasonWorkerTerminated,
+			AgentID: a.ID,
+			Payload: map[string]any{
+				"reason":     "terminated",
+				"final_text": a.FinalAssistantText,
+			},
+		})
+	}
 }
 
 func (s *serverState) failWorker(m *mission.Mission, worker *mission.Agent, reason string) {
@@ -1624,6 +1965,11 @@ func (s *serverState) recoverDriver(m *mission.Mission, d *mission.Agent) {
 			"recovered":  true,
 		},
 	})
+
+	// Re-arm tick dispatcher. Recovery loses any pending in-memory
+	// ticks; the heartbeat will resync the driver within
+	// tickHeartbeatInterval.
+	s.startTickDispatcher(m, drv, d.ID)
 }
 
 // recoverWorker re-attaches to a running worker's pi-rpc session
@@ -1791,6 +2137,21 @@ func (s *serverState) maybeLogFirstAction(missionID, agentID, toolName string) {
 // block fan-out (the canvas is the user-visible thing).
 func (s *serverState) publish(e mission.Event) {
 	s.bus.Publish(e)
+	// Some event kinds are TRANSIENT — they're meant for the live
+	// WS stream only (UI animations / streaming thinking deltas)
+	// and would generate huge replay payloads on reconnect. Skip
+	// the SQLite append for those; the persistent record of what
+	// happened lives in the consolidated worker.message /
+	// worker.tool_call events that DO get persisted.
+	switch e.Kind {
+	case "agent.thinking_delta",
+		"agent.text_delta",
+		"agent.thinking_start",
+		"agent.thinking_end",
+		"agent.streaming",
+		"agent.idle":
+		return
+	}
 	if s.store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -1890,7 +2251,20 @@ func (s *serverState) handleInternalDriver(w http.ResponseWriter, r *http.Reques
 		s.handleToolSpawnWorker(w, r, driverAgent, m)
 	case "spawn_workers":
 		s.handleToolSpawnWorkers(w, r, driverAgent, m)
+	case "steer_worker":
+		s.handleToolSteerWorker(w, r, driverAgent, m)
+	case "terminate_worker":
+		s.handleToolTerminateWorker(w, r, driverAgent, m)
+	case "notes/write":
+		s.handleToolWriteNote(w, r, driverAgent, m)
+	case "notes/read":
+		s.handleToolReadNotes(w, r, m)
+	case "notes/list":
+		s.handleToolListNotes(w, r, m)
 	case "wait_for_workers":
+		// Vestigial: kept so old/cached driver-tool extensions
+		// don't 404. Returns immediately with current worker state
+		// and a soft reminder that the driver is auto-ticked now.
 		s.handleToolWaitForWorkers(w, r, m)
 	case "ask_operator":
 		s.handleToolAskOperator(w, r, driverAgent, m)
@@ -1901,6 +2275,115 @@ func (s *serverState) handleInternalDriver(w http.ResponseWriter, r *http.Reques
 	default:
 		http.Error(w, "unknown action: "+action, http.StatusNotFound)
 	}
+}
+
+// handleToolSteerWorker implements the driver-tool steer_worker.
+// Sends a pi-rpc steer message into the target worker's stream.
+// Worker may be mid-tool-call or idle; pi handles both (steer
+// queues for after the current tool batch completes).
+func (s *serverState) handleToolSteerWorker(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		WorkerID string `json:"worker_id"`
+		Hint     string `json:"hint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.WorkerID == "" || body.Hint == "" {
+		http.Error(w, "worker_id and hint required", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	worker, ok := s.agents[body.WorkerID]
+	if !ok || worker.MissionID != m.ID {
+		s.mu.Unlock()
+		http.Error(w, "worker not in this mission", http.StatusNotFound)
+		return
+	}
+	if worker.Status != mission.StatusRunning {
+		s.mu.Unlock()
+		http.Error(w, "worker is not running", http.StatusConflict)
+		return
+	}
+	drv := s.drivers[body.WorkerID]
+	s.mu.Unlock()
+	if drv == nil {
+		http.Error(w, "worker driver not attached", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Wrap the hint so the worker sees it as a steer from the
+	// supervisor, not as a fresh task. Include the literal phrase
+	// the worker preamble expects so it knows this is mid-flight
+	// guidance.
+	wrapped := "[supervisor steer from driver]\n" + body.Hint +
+		"\n\nAdjust your current work to incorporate this; keep going " +
+		"toward your task. Continue writing notes incrementally and " +
+		"call finish() when done."
+	if err := drv.Steer(r.Context(), wrapped); err != nil {
+		http.Error(w, "steer failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Publish an event so the canvas can pulse the
+	// driver→worker spawn edge.
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: body.WorkerID,
+		Kind: "driver.steer_worker", Ts: time.Now(),
+		Payload: map[string]any{
+			"driver_id": driverAgent.ID,
+			"hint":      body.Hint,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleToolTerminateWorker implements terminate_worker.
+// Force-stops a worker: closes the pi-rpc driver, destroys the
+// bhatti sandbox, marks the agent terminated. Used by the
+// supervisor when a worker is curl-looping, off-task, or no
+// longer needed.
+func (s *serverState) handleToolTerminateWorker(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		WorkerID string `json:"worker_id"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.WorkerID == "" {
+		http.Error(w, "worker_id required", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	worker, ok := s.agents[body.WorkerID]
+	if !ok || worker.MissionID != m.ID {
+		s.mu.Unlock()
+		http.Error(w, "worker not in this mission", http.StatusNotFound)
+		return
+	}
+	worker.FinalAssistantText = truncate(
+		"[terminated by supervisor] "+body.Reason, 1000)
+	s.mu.Unlock()
+
+	// terminateAgent already handles bhatti teardown + state
+	// cleanup; it ends in markWorkerCompleted which fires the
+	// agent.completed event and ticks the driver.
+	go s.terminateAgent(worker)
+
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: body.WorkerID,
+		Kind: "driver.terminate_worker", Ts: time.Now(),
+		Payload: map[string]any{
+			"driver_id": driverAgent.ID,
+			"reason":    body.Reason,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
@@ -1925,6 +2408,133 @@ func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Reque
 		"sandbox_id": worker.BhattiSandboxID, // may be empty if still booting
 		"status":     worker.Status,
 	})
+}
+
+// handleToolWriteNote is the driver's path for adding blackboard
+// entries. Workers reach the same notes table via the
+// tool_execution_start interception in forwardPiEvent (they
+// can't easily HTTP to the host from a sandbox); drivers, which
+// run on the host, use this HTTP endpoint for symmetry with
+// their other tools.
+func (s *serverState) handleToolWriteNote(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	var body struct {
+		Key     string `json:"key"`
+		Content string `json:"content"`
+		Summary string `json:"summary,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Key) == "" || strings.TrimSpace(body.Content) == "" {
+		http.Error(w, "key and content required", http.StatusBadRequest)
+		return
+	}
+	id := s.appendBlackboardNote(m.ID, driverAgent.ID, body.Key, body.Content, body.Summary)
+	writeJSON(w, http.StatusOK, map[string]any{"note_id": id})
+}
+
+func (s *serverState) handleToolReadNotes(w http.ResponseWriter, r *http.Request, m *mission.Mission) {
+	var body struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	notes, err := s.store.ListNotes(ctx, m.ID, body.Key)
+	if err != nil {
+		http.Error(w, "read notes failed: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
+}
+
+func (s *serverState) handleToolListNotes(w http.ResponseWriter, r *http.Request, m *mission.Mission) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	manifest, err := s.store.NoteManifest(ctx, m.ID)
+	if err != nil {
+		http.Error(w, "manifest failed: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"manifest": manifest})
+}
+
+// persistBlackboardWrite is the goroutine-launched handler for a
+// worker's write_note tool call (intercepted from the pi-rpc
+// event stream). Drivers use the HTTP path above; we share the
+// underlying append + event-emission logic.
+func (s *serverState) persistBlackboardWrite(missionID, agentID string, args map[string]any) {
+	key, _ := args["key"].(string)
+	content, _ := args["content"].(string)
+	summary, _ := args["summary"].(string)
+	if strings.TrimSpace(key) == "" || strings.TrimSpace(content) == "" {
+		slog.Warn("write_note ignored: empty key or content",
+			"mission", missionID, "agent", agentID)
+		return
+	}
+	s.appendBlackboardNote(missionID, agentID, key, content, summary)
+}
+
+// appendBlackboardNote does the DB write + event emission. Called
+// from both the worker interception path (persistBlackboardWrite)
+// and the driver HTTP path (handleToolWriteNote). Returns the
+// new note's id (0 on failure).
+func (s *serverState) appendBlackboardNote(missionID, agentID, key, content, summary string) int64 {
+	if s.store == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	note := &store.Note{
+		MissionID: missionID,
+		Key:       key,
+		Content:   content,
+		Summary:   summary,
+		AgentID:   agentID,
+		Ts:        time.Now(),
+	}
+	id, err := s.store.AppendNote(ctx, note)
+	if err != nil {
+		slog.Warn("note append failed",
+			"mission", missionID, "agent", agentID, "key", key, "err", err)
+		return 0
+	}
+	// Fire a worker.note_write event so the frontend can pulse
+	// the agent→blackboard edge and append a new entry to the
+	// blackboard tile in real time.
+	// Include full content in the event payload so the frontend
+	// doesn't need a REST roundtrip to render the note. Notes are
+	// typically a few KB; even at 100 notes/mission this is fine
+	// in the event stream (compared to a single agent_end which
+	// carries 100× more in pi's stream).
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
+		Kind: "worker.note_write", Ts: note.Ts,
+		Payload: map[string]any{
+			"note_id": id,
+			"key":     key,
+			"content": content,
+			"summary": summary,
+		},
+	})
+
+	// Wake the active driver: a worker (or the driver itself)
+	// just wrote to the blackboard. The dispatcher coalesces if
+	// many notes arrive in quick succession.
+	s.enqueueTick(missionID, Tick{
+		Reason:  tickReasonNoteWrite,
+		AgentID: agentID,
+		Payload: map[string]any{
+			"key":     key,
+			"summary": summary,
+			"note_id": id,
+		},
+	})
+	return id
 }
 
 // handleToolSpawnWorkers is the bulk version: one HTTP call,
@@ -1981,72 +2591,52 @@ func (s *serverState) handleToolSpawnWorkers(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{"workers": workers})
 }
 
-func (s *serverState) handleToolWaitForWorkers(w http.ResponseWriter, r *http.Request, _ *mission.Mission) {
+// handleToolWaitForWorkers is vestigial in the active-driver
+// architecture. The driver no longer needs to block; Karkhana
+// auto-ticks it on each material event (note write, worker
+// terminated, heartbeat). We keep this route alive so that an
+// older cached driver-tools extension calling wait_for_workers
+// doesn't 404 the entire turn.
+//
+// Behavior: returns IMMEDIATELY with a state snapshot, never
+// blocks. The response also carries a `notice` string telling
+// the LLM to use ticks instead, so it learns and stops calling
+// this tool on subsequent turns.
+func (s *serverState) handleToolWaitForWorkers(w http.ResponseWriter, r *http.Request, m *mission.Mission) {
 	var body struct {
-		WorkerIDs      []string `json:"worker_ids"`
-		TimeoutSeconds int      `json:"timeout_seconds"`
+		WorkerIDs []string `json:"worker_ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if body.TimeoutSeconds <= 0 {
-		body.TimeoutSeconds = 1800 // 30 min, matches worker awaitCtx
-	}
-	deadline := time.Now().Add(time.Duration(body.TimeoutSeconds) * time.Second)
-
-	// Poll every 500ms until all listed workers are in a terminal
-	// state OR the deadline passes. Worker termination is signalled
-	// by status != "running" (markWorkerCompleted, terminateAgent,
-	// failWorker all flip status). Short of building a proper
-	// completion-channel registry, polling is fine for v0 — typical
-	// timeouts are O(minutes) and the agents map is in-memory.
-	for {
-		s.mu.Lock()
-		done := true
-		result := []map[string]any{}
-		for _, wid := range body.WorkerIDs {
-			a, ok := s.agents[wid]
-			if !ok {
-				result = append(result, map[string]any{
-					"worker_id": wid,
-					"status":    "unknown",
-				})
-				continue
-			}
-			if a.Status == mission.StatusRunning {
-				done = false
-			}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	s.mu.Lock()
+	result := []map[string]any{}
+	for _, wid := range body.WorkerIDs {
+		a, ok := s.agents[wid]
+		if !ok {
 			result = append(result, map[string]any{
-				"worker_id":            a.ID,
-				"status":               a.Status,
-				"outcome":              a.Outcome,
-				"final_assistant_text": a.FinalAssistantText,
-				"cost_usd":             a.CostUSD,
+				"worker_id": wid,
+				"status":    "unknown",
 			})
+			continue
 		}
-		s.mu.Unlock()
-
-		if done {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"workers":   result,
-				"timed_out": false,
-			})
-			return
-		}
-		if time.Now().After(deadline) {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"workers":   result,
-				"timed_out": true,
-			})
-			return
-		}
-		select {
-		case <-r.Context().Done():
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
+		result = append(result, map[string]any{
+			"worker_id":            a.ID,
+			"status":               a.Status,
+			"outcome":              a.Outcome,
+			"final_assistant_text": a.FinalAssistantText,
+			"cost_usd":             a.CostUSD,
+		})
 	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workers":   result,
+		"timed_out": false,
+		"notice": "wait_for_workers is DEPRECATED in active-driver mode. " +
+			"Karkhana auto-ticks you when workers contribute notes or " +
+			"terminate — do NOT call wait_for_workers again. Just end " +
+			"your turn after spawning workers; you'll be ticked on every " +
+			"material event with full context.",
+	})
+	_ = m
 }
 
 func (s *serverState) handleToolAskOperator(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
@@ -2112,11 +2702,39 @@ func (s *serverState) handleToolReportProgress(w http.ResponseWriter, r *http.Re
 func (s *serverState) handleToolFinish(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
 	var body struct {
 		Result string `json:"result"`
+		Title  string `json:"title,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// finish() now produces a typed artifact in addition to
+	// updating the driver agent's FinalAssistantText. The artifact
+	// is the operator-visible deliverable; FinalAssistantText is
+	// the legacy chat-bubble path that we keep for UI fallback.
+	artifactID := "art_" + randHex(12)
+	title := body.Title
+	if title == "" {
+		title = truncate(m.Goal, 80)
+	}
+	art := &store.Artifact{
+		ID:         artifactID,
+		MissionID:  m.ID,
+		Type:       "markdown:report",
+		Title:      title,
+		Content:    body.Result,
+		Summary:    truncate(body.Result, 160),
+		ProducedBy: driverAgent.ID,
+	}
+	if s.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.store.CreateArtifact(ctx, art); err != nil {
+			slog.Warn("artifact create failed",
+				"mission", m.ID, "agent", driverAgent.ID, "err", err)
+		}
+		cancel()
+	}
+
 	s.mu.Lock()
 	driverAgent.FinalAssistantText = body.Result
 	s.mu.Unlock()
@@ -2124,9 +2742,28 @@ func (s *serverState) handleToolFinish(w http.ResponseWriter, r *http.Request, d
 	s.publish(mission.Event{
 		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
 		Kind: "driver.finish", Ts: time.Now(),
-		Payload: map[string]any{"result": body.Result},
+		Payload: map[string]any{
+			"result":      body.Result,
+			"artifact_id": artifactID,
+			"title":       title,
+		},
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// Surface the new artifact on the canvas as a dedicated event
+	// so the frontend can render an artifact tile immediately.
+	s.publish(mission.Event{
+		ID: s.nextEventID(), MissionID: m.ID, AgentID: driverAgent.ID,
+		Kind: "artifact.created", Ts: time.Now(),
+		Payload: map[string]any{
+			"artifact_id": artifactID,
+			"type":        art.Type,
+			"title":       title,
+			"summary":     art.Summary,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"artifact_id": artifactID,
+	})
 }
 
 // --- operator chat ---
