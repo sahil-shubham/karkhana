@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: go (vet + test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt -d (no diff allowed)
+        run: |
+          out=$(gofmt -d -s $(find . -name '*.go' -not -path './ui/node_modules/*' -not -path './extensions/*/node_modules/*'))
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo ""
+            echo "gofmt found issues. Run 'make fmt'."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with -race)
+        run: go test -race ./...
+
+      - name: go build (binary + embedded UI is a separate concern)
+        run: go build ./...
+
+  ui:
+    name: ui (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      - name: tsc --noEmit
+        working-directory: ui
+        run: npx tsc --noEmit
+
+      - name: vite build
+        working-directory: ui
+        run: npm run build

@@ -1,4 +1,4 @@
-.PHONY: dev-server dev-ui build clean install-deps
+.PHONY: dev-server dev-ui build clean install-deps test test-update vet fmt
 
 dev-server:
 	go run ./cmd/karkhana
@@ -25,3 +25,11 @@ fmt:
 
 vet:
 	go vet ./...
+
+test:
+	go test ./...
+
+# Regenerate prompt golden files after an intentional template change.
+# Review the diff under prompts/testdata/ before committing.
+test-update:
+	go test ./prompts/ -update

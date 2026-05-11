@@ -112,7 +112,10 @@ var (
 	prodErr   error
 )
 
-func loadFromEmbed(name string) (*template.Template, error) {
+// ensureProdLoaded populates prodCache from the embedded FS exactly
+// once. Subsequent calls are a no-op. Returns the cached load error
+// (if any) so callers don't have to repeat that check.
+func ensureProdLoaded() error {
 	prodOnce.Do(func() {
 		prodCache = map[string]*template.Template{}
 		entries, err := fs.ReadDir(embedded, ".")
@@ -138,8 +141,12 @@ func loadFromEmbed(name string) (*template.Template, error) {
 			prodCache[tmplName] = t
 		}
 	})
-	if prodErr != nil {
-		return nil, prodErr
+	return prodErr
+}
+
+func loadFromEmbed(name string) (*template.Template, error) {
+	if err := ensureProdLoaded(); err != nil {
+		return nil, err
 	}
 	t, ok := prodCache[name]
 	if !ok {
@@ -198,8 +205,10 @@ func List() []string {
 		}
 		return out
 	}
-	// Force the embedded cache to populate, then enumerate it.
-	_, _ = loadFromEmbed("__force_init__")
+	// Production mode: enumerate the embedded cache.
+	if err := ensureProdLoaded(); err != nil {
+		return nil
+	}
 	out := make([]string, 0, len(prodCache))
 	for k := range prodCache {
 		out = append(out, k)

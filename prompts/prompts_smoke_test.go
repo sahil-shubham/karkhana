@@ -65,9 +65,9 @@ func TestMissingTemplateError(t *testing.T) {
 func TestListIncludesAllThree(t *testing.T) {
 	names := List()
 	want := map[string]bool{
-		"driver":              false,
+		"driver":               false,
 		"worker.desktop-watch": false,
-		"worker.bash-only":    false,
+		"worker.bash-only":     false,
 	}
 	for _, n := range names {
 		if _, ok := want[n]; ok {
