@@ -10,15 +10,23 @@ name: images
 # is still built via scripts/bake-image.sh against an existing
 # bhatti host; once that's Dockerfile-ified, add a matrix entry.
 
+# Triggers:
+#   - any push to main (cheap when nothing changed; buildx GHA
+#     cache makes a no-op build ~30s).
+#   - any kk-dev-v* tag.
+#   - manual dispatch from the Actions UI.
+#
+# An earlier version of this file scoped pushes to changes under
+# images/kk-dev/ etc. via `paths:`. That filter doesn't fire on
+# the initial push to a new branch (GitHub can't diff against a
+# nonexistent previous ref), which kept the workflow dark on
+# day one. Dropping `paths:` removes the footgun; we accept the
+# extra (cheap) runs.
 on:
   push:
     branches: [main]
     tags:
       - "kk-dev-v*"
-    paths:
-      - "images/kk-dev/**"
-      - "extensions/computer-use-cli/**"
-      - ".github/workflows/images.yml"
   workflow_dispatch:
 
 jobs:
