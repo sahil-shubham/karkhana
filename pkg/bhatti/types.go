@@ -75,6 +75,20 @@ type OutputSpec struct {
 	Name string `json:"name"`
 }
 
+// Image describes one entry in `GET /images`. The name is the
+// local handle (what SandboxSpec.Image references); the source
+// is typically the OCI ref the image was pulled from. Karkhana
+// only needs Name for the startup-presence check, but Source
+// and OCIDigest are useful for surfacing in the error message.
+type Image struct {
+	ID        string    `json:"id,omitempty"`
+	Name      string    `json:"name"`
+	Source    string    `json:"source,omitempty"` // e.g. "oci:ghcr.io/...:tag"
+	OCIDigest string    `json:"oci_digest,omitempty"`
+	SizeMB    int       `json:"size_mb,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
 // Sandbox is the create-sandbox response (and list-element).
 // Mirrors what `GET /sandboxes/:id` returns from bhatti today.
 type Sandbox struct {

@@ -164,6 +164,17 @@ func main() {
 	cancelSmoke()
 	slog.Info("bhatti connection ok")
 
+	// Verify the bhatti host has every image + secret our
+	// recipes reference. Missing items don't block startup
+	// (operator may only run a subset of recipes today), but we
+	// print the exact remediation command per missing item.
+	// The default recipe's image IS hard-required — if missing,
+	// no spawn will work and we exit.
+	checkCtx, cancelCheck := context.WithTimeout(context.Background(), 10*time.Second)
+	validateRecipeImages(checkCtx, bhattiCli, recipeReg)
+	validateRecipeSecrets(checkCtx, bhattiCli, recipeReg)
+	cancelCheck()
+
 	// Hydrate from store + reattach to running agents.
 	// recoverFromStore replaces v0.5's bhatti-scan-only recovery:
 	// it reads missions/agents/events from SQLite, rebuilds the
@@ -657,7 +668,7 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 
 	argv := buildDriverArgv(sessDir, s.piProvider, s.piModel, s.driverToolsPath, false)
 
-	env := s.piEnvFromHost()
+	env := s.driverEnvFromHost()
 	env["KARKHANA_INTERNAL_URL"] = s.internalURL
 	env["KARKHANA_DRIVER_TOKEN"] = token
 	env["KARKHANA_DRIVER_ID"] = driverID
@@ -819,13 +830,13 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 		timeoutSecs = defaultWorkerTimeoutSecs
 	}
 
-	// 1. Create sandbox. piEnv injection is the pre-v0.7 path
-	// (carries API keys from karkhana host into the sandbox);
-	// recipe.Secrets is the new path (bhatti decrypts named
-	// secrets at boot, karkhana never sees values). Day 4 of the
-	// plan deletes piEnvFromHost entirely once operators have
-	// migrated to `bhatti secret set`.
-	piEnv := s.piEnvFromHost()
+	// 1. Create sandbox. Worker secrets travel exclusively via
+	// SandboxSpec.SecretNames — bhatti decrypts named secrets at
+	// boot, karkhana never sees values, and the spec recorded in
+	// karkhana's events table contains only the names. The
+	// operator runs `bhatti secret set <name> <value>` once per
+	// host; missing secrets are surfaced at startup (see
+	// validateRecipeSecrets).
 	sb, err := s.bhatti.CreateSandbox(ctx, bhatti.SandboxSpec{
 		Name:        sandboxName,
 		Image:       rec.Image,
@@ -833,7 +844,6 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 		MemoryMB:    mem,
 		TimeoutSecs: timeoutSecs,
 		KeepHot:     true,
-		Env:         piEnv,
 		SecretNames: rec.Secrets,
 		Metadata: map[string]string{
 			"karkhana.dev/mission_id": m.ID,
@@ -918,7 +928,9 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 		Provider:   s.piProvider,
 		Model:      s.piModel,
 		Extensions: rec.Extensions,
-		Env:        piEnv,
+		// Env: nil — secrets are injected by bhatti at sandbox
+		// boot from SecretNames; the worker pi process inherits
+		// them from its parent shell. No karkhana-side env path.
 		OnEvent: func(ev driver.Event) {
 			s.forwardPiEvent(m.ID, workerID, ev)
 		},
@@ -1094,7 +1106,98 @@ func buildDriverArgv(sessDir, provider, model, driverToolsPath string, continueS
 	return argv
 }
 
-func (s *serverState) piEnvFromHost() map[string]string {
+// validateRecipeImages walks every recipe's image and checks
+// that bhatti has it locally. For missing images:
+//   - Default recipe missing → hard exit (karkhana cannot spawn
+//     anything).
+//   - Other recipes missing → warn, suggest the exact
+//     `bhatti image pull` command, and continue (the missing
+//     recipe is unusable but the rest of karkhana works).
+func validateRecipeImages(ctx context.Context, cli *bhatti.Client, reg *recipes.Registry) {
+	images, err := cli.ListImages(ctx)
+	if err != nil {
+		slog.Warn("bhatti image list failed; skipping image validation", "err", err)
+		return
+	}
+	have := map[string]bool{}
+	for _, img := range images {
+		have[img.Name] = true
+	}
+	defaultName := reg.DefaultName()
+	for _, r := range reg.List() {
+		if have[r.Image] {
+			continue
+		}
+		suggested := suggestImagePull(r.Image)
+		if r.Name == defaultName {
+			slog.Error("default recipe image not present on bhatti host",
+				"recipe", r.Name, "image", r.Image,
+				"remediation", suggested)
+			os.Exit(1)
+		}
+		slog.Warn("recipe image not present on bhatti host; recipe will fail to spawn until pulled",
+			"recipe", r.Name, "image", r.Image,
+			"remediation", suggested)
+	}
+}
+
+// suggestImagePull maps a local image name to the OCI ref we
+// know about. For unknown images we return a placeholder so the
+// operator still gets a copy-paste-shaped command.
+func suggestImagePull(name string) string {
+	switch name {
+	case "kk-dev":
+		return "bhatti image pull ghcr.io/sahil-shubham/karkhana-kk-dev:latest --name kk-dev"
+	case "kk-base":
+		// kk-base is still built via scripts/bake-image.sh as
+		// of v0.7 day-4; suggest that path until the Dockerfile
+		// lands.
+		return "./scripts/bake-image.sh   (or `bhatti image pull <ref> --name kk-base` once published)"
+	default:
+		return fmt.Sprintf("bhatti image pull <oci-ref> --name %s", name)
+	}
+}
+
+// validateRecipeSecrets checks that every secret named by a
+// recipe is set in bhatti. Missing secrets are warned (workers
+// will fail at boot otherwise with a less obvious error).
+func validateRecipeSecrets(ctx context.Context, cli *bhatti.Client, reg *recipes.Registry) {
+	names, err := cli.ListSecretNames(ctx)
+	if err != nil {
+		slog.Warn("bhatti secret list failed; skipping secret validation", "err", err)
+		return
+	}
+	have := map[string]bool{}
+	for _, n := range names {
+		have[n] = true
+	}
+	seen := map[string]bool{} // dedupe across recipes
+	for _, r := range reg.List() {
+		for _, s := range r.Secrets {
+			if have[s] || seen[s] {
+				continue
+			}
+			seen[s] = true
+			slog.Warn("recipe references secret not set in bhatti; workers using this recipe will fail at boot",
+				"secret", s, "recipe", r.Name,
+				"remediation", fmt.Sprintf("bhatti secret set %s <value>", s))
+		}
+	}
+}
+
+// driverEnvFromHost extracts the env vars the DRIVER pi-rpc
+// subprocess needs to authenticate against its LLM provider.
+// The driver runs ON the karkhana host (not inside a bhatti
+// sandbox), so bhatti secrets do not reach it; this single
+// bootstrap path reads from karkhana's own env.
+//
+// Workers do NOT use this path. Workers get their secrets via
+// SandboxSpec.SecretNames — bhatti decrypts the named secrets
+// at sandbox boot and injects them as env vars, and karkhana
+// never sees the values. A future plan can also containerise
+// the driver and remove this last karkhana-side secret hold;
+// out of scope for v0.7.
+func (s *serverState) driverEnvFromHost() map[string]string {
 	keys := []string{
 		"ANTHROPIC_API_KEY",
 		"OPENAI_API_KEY",
@@ -1733,7 +1836,7 @@ func (s *serverState) recoverDriver(m *mission.Mission, d *mission.Agent) {
 
 	// pi --continue resumes the most recent session in --session-dir.
 	argv := buildDriverArgv(sessDir, s.piProvider, s.piModel, s.driverToolsPath, true)
-	env := s.piEnvFromHost()
+	env := s.driverEnvFromHost()
 	env["KARKHANA_INTERNAL_URL"] = s.internalURL
 	env["KARKHANA_DRIVER_TOKEN"] = token
 	env["KARKHANA_DRIVER_ID"] = d.ID

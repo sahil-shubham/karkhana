@@ -116,6 +116,39 @@ func (c *Client) RestoreSnapshot(ctx context.Context, snapshotID string, restore
 	return resp.Sandboxes, nil
 }
 
+// ListImages returns the local images bhatti has cached for the
+// current API key. Karkhana uses this at startup to verify the
+// images referenced by recipes have been pulled, surfacing a
+// clear `bhatti image pull <ref> --name <local>` command for any
+// missing ones.
+func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
+	var imgs []Image
+	if err := c.get(ctx, "/images", &imgs); err != nil {
+		return nil, err
+	}
+	return imgs, nil
+}
+
+// ListSecretNames returns the names of every age-encrypted
+// secret bhatti has stored for the current API key. Values are
+// never exposed by this endpoint — secrets only decrypt when
+// bhatti injects them into a sandbox at boot (via SandboxSpec
+// .SecretNames). Karkhana uses this at startup to verify that
+// every secret referenced by a recipe is set.
+func (c *Client) ListSecretNames(ctx context.Context) ([]string, error) {
+	var secrets []struct {
+		Name string `json:"name"`
+	}
+	if err := c.get(ctx, "/secrets", &secrets); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(secrets))
+	for _, s := range secrets {
+		out = append(out, s.Name)
+	}
+	return out, nil
+}
+
 // Publish exposes a sandbox port via the bhatti public proxy.
 // Returns a URL the operator (and the canvas) can hit. KasmVNC
 // for the computer tier is on port 6080.
