@@ -110,6 +110,19 @@ type TickDispatcher struct {
 	// driver. Used to enforce tickMinSpacing. Protected by mu.
 	mu          sync.Mutex
 	lastFiredAt time.Time
+
+	// drained is the "post-finish quiescence" flag. After the
+	// driver calls finish(), the mission is `done` but workers
+	// may keep producing teardown events (worker_terminated
+	// pings from bhatti's async sandbox destroy) for ~30s. Each
+	// of those would otherwise wake the driver to say
+	// "(watching)" — a useless full LLM turn. While drained:
+	// events still publish to the canvas bus (operator sees the
+	// activity), but the dispatcher does NOT send follow_up
+	// prompts to the driver. The next operator chat message
+	// re-arms the dispatcher (SetDrained(false)) so a follow-up
+	// mission turn picks up ticks again.
+	drained bool
 }
 
 func newTickDispatcher(s *serverState, m *mission.Mission, drv *driver.Driver, driverAgentID string) *TickDispatcher {
@@ -156,6 +169,28 @@ func (d *TickDispatcher) Stop() {
 	d.cancel()
 }
 
+// SetDrained toggles the dispatcher's quiescence mode. Set true
+// when the mission transitions to a terminal state (after
+// finish()); set false when the operator sends a follow-up
+// prompt that should re-engage the supervisor loop.
+func (d *TickDispatcher) SetDrained(v bool) {
+	d.mu.Lock()
+	prev := d.drained
+	d.drained = v
+	d.mu.Unlock()
+	if prev != v {
+		slog.Info("tick dispatcher drain state changed",
+			"mission", d.missionID, "drained", v)
+	}
+}
+
+// isDrained reads the flag under the lock. Cheap.
+func (d *TickDispatcher) isDrained() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.drained
+}
+
 // Run drives the dispatcher loop. Blocks until ctx is cancelled.
 func (d *TickDispatcher) Run() {
 	var pending []Tick
@@ -195,6 +230,21 @@ func (d *TickDispatcher) Run() {
 		if len(pending) == 0 {
 			return
 		}
+
+		// Drain mode: discard pending without waking the driver.
+		// The events themselves already published to the canvas bus
+		// at the call-site of enqueueTick; the dispatcher's only
+		// job is the driver follow_up, which we skip here. This
+		// silences the post-finish() termination-loop noise that
+		// cost ~$0.10 of "(watching)" turns in the v0.7 field test.
+		if d.isDrained() {
+			slog.Debug("tick dispatcher drained; dropping batch",
+				"mission", d.missionID, "reason", reason,
+				"batch_size", len(pending))
+			pending = nil
+			return
+		}
+
 		// Respect minimum spacing between follow_ups.
 		d.mu.Lock()
 		since := time.Since(d.lastFiredAt)
@@ -256,10 +306,10 @@ func (d *TickDispatcher) Run() {
 
 		case <-heartbeatTimer.C:
 			// Heartbeat: enqueue a synthetic tick IF there are
-			// running workers; otherwise the driver is either
-			// in idle synthesis or post-mission and shouldn't
-			// be poked.
-			if d.state.missionHasRunningWorkers(d.missionID) {
+			// running workers AND we're not drained. Drain mode
+			// is the post-finish() quiescence; the driver doesn't
+			// need to be reminded that workers are tearing down.
+			if !d.isDrained() && d.state.missionHasRunningWorkers(d.missionID) {
 				pending = append(pending, Tick{
 					Reason: tickReasonHeartbeat,
 					Ts:     time.Now(),
@@ -523,6 +573,19 @@ func (s *serverState) startTickDispatcher(m *mission.Mission, drv *driver.Driver
 	go d.Run()
 	slog.Info("tick dispatcher started",
 		"mission", m.ID, "driver", driverAgentID)
+}
+
+// setDispatcherDrained toggles the drain flag on the dispatcher
+// for the given mission, if one exists. Safe to call from any
+// goroutine; no-op if there's no dispatcher (e.g. mission was
+// never spawned, or already torn down).
+func (s *serverState) setDispatcherDrained(missionID string, v bool) {
+	s.tickMu.Lock()
+	d := s.tickDispatchers[missionID]
+	s.tickMu.Unlock()
+	if d != nil {
+		d.SetDrained(v)
+	}
 }
 
 // stopTickDispatcher tears down a mission's dispatcher. Called

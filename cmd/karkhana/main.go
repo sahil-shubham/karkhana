@@ -1421,14 +1421,39 @@ func (s *serverState) forwardPiEvent(missionID, agentID string, ev driver.Event)
 				s.mu.Unlock()
 			}
 		}
+		// Look up the agent's role so consumers can distinguish a
+		// driver tool call (runs on the karkhana host, host bash,
+		// security-relevant) from a worker tool call (runs in a
+		// bhatti sandbox, scoped). The event kind stays
+		// "worker.tool_call" for frontend compatibility; the role
+		// field is the new audit-relevant signal.
+		role := ""
+		s.mu.Lock()
+		if a, ok := s.agents[agentID]; ok {
+			role = string(a.Role)
+		}
+		s.mu.Unlock()
+		payload := map[string]any{
+			"text": summary,
+			"tool": toolName,
+			"args": args,
+			"role": role,
+		}
+		// Flag bash-on-host explicitly so the canvas can render it
+		// with a security badge. Driver bash reads operator files;
+		// the audit trail should make those calls visually distinct.
+		if role == string(mission.RoleDriver) && toolName == "bash" {
+			payload["host_bash"] = true
+			if cmd, ok := args["command"].(string); ok {
+				slog.Info("driver host bash",
+					"mission", missionID, "driver", agentID,
+					"cmd", truncate(cmd, 200))
+			}
+		}
 		s.publish(mission.Event{
 			ID: s.nextEventID(), MissionID: missionID, AgentID: agentID,
 			Kind: "worker.tool_call", Ts: time.Now(),
-			Payload: map[string]any{
-				"text": summary,
-				"tool": toolName,
-				"args": args,
-			},
+			Payload: payload,
 		})
 
 	case "tool_execution_end":
@@ -2701,6 +2726,15 @@ func (s *serverState) handleToolFinish(w http.ResponseWriter, r *http.Request, d
 			"summary":     art.Summary,
 		},
 	})
+	// Quiesce the tick dispatcher for this mission. After finish(),
+	// terminate_worker calls + bhatti's async sandbox teardown
+	// produce a flurry of worker.terminated events; without the
+	// drain mode each would wake the driver to say "(watching)"
+	// — a useless full LLM turn (~$0.05-0.10 of waste per mission
+	// in the v0.7 field test). The next operator follow-up message
+	// re-arms the dispatcher in handleAgentPrompt.
+	s.setDispatcherDrained(m.ID, true)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"artifact_id": artifactID,
@@ -2763,6 +2797,10 @@ func (s *serverState) handleAgentPrompt(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "agent has no live driver", http.StatusConflict)
 		return
 	}
+
+	// Operator just sent a new message — the mission is live again.
+	// Re-arm the tick dispatcher in case finish() had quiesced it.
+	s.setDispatcherDrained(agent.MissionID, false)
 
 	ctx := r.Context()
 
