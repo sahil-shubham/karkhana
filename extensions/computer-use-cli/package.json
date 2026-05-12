@@ -1,0 +1,15 @@
+{
+  "name": "karkhana-computer-use-cli",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Karkhana headless-worker extension for pi-coding-agent. No GUI tools — just write_note + finish on top of pi's built-in bash/read/write/edit/grep/find. Loaded by the headless-dev recipe.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "typebox": "^1.1.24"
+  }
+}

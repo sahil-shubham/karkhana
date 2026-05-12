@@ -1,0 +1,68 @@
+name: images
+
+# Build + push Karkhana's bhatti images to ghcr.io.
+#
+# Tags:
+#   - On push to main: `:latest`
+#   - On tag matching `<image>-v<x.y.z>`: `:<x.y.z>` and `:latest`
+#
+# Today this builds kk-dev. kk-base (the headful desktop image)
+# is still built via scripts/bake-image.sh against an existing
+# bhatti host; once that's Dockerfile-ified, add a matrix entry.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "kk-dev-v*"
+    paths:
+      - "images/kk-dev/**"
+      - "extensions/computer-use-cli/**"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+jobs:
+  kk-dev:
+    name: kk-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/karkhana-kk-dev"
+          TAGS="$REPO:latest"
+          if [[ "${{ github.ref }}" =~ ^refs/tags/kk-dev-v(.+)$ ]]; then
+            TAGS="$TAGS,$REPO:${BASH_REMATCH[1]}"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Will push: $TAGS"
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/kk-dev/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
