@@ -150,9 +150,16 @@ export function AgentTile({ data, selected }: NodeProps) {
         missionWorkers={isDriver ? missionWorkers : undefined}
       />
 
-      {/* Body region. For drivers: scrolling chat. For workers:
-          two stacked regions — desktop iframe on top, log
-          below. Both share one bounding tile. */}
+      {/* Body region. Layout depends on whether this worker has
+          a desktop:
+            - driver:        scrolling chat (full height).
+            - desktop-watch / mixed: desktop iframe on top, log
+              below — the operator wants to SEE the desktop.
+            - headless-dev:  log fills the tile. No iframe slot;
+              there's no KasmVNC server in the kk-dev image. The
+              tile's job is to surface the worker's reasoning
+              + tool calls cleanly so the operator can follow
+              the dev work in the log alone. */}
       {isDriver ? (
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           <ConversationStream
@@ -160,6 +167,18 @@ export function AgentTile({ data, selected }: NodeProps) {
             liveThinking={liveThinking ?? ""}
             streaming={streaming ?? false}
           />
+        </div>
+      ) : isHeadlessRecipe(agent.recipe) ? (
+        // No desktop region; the log gets the whole tile.
+        <div
+          style={{
+            flex: 1,
+            minHeight: 200,
+            background: "var(--bg-1)",
+            overflow: "hidden",
+          }}
+        >
+          <EventStream events={recentEvents} />
         </div>
       ) : (
         <>
@@ -336,6 +355,27 @@ export function TileHeader({
     >
       <StatusDot status={agent.status} />
       <span style={{ color: accent, fontWeight: 600 }}>{roleLabel}</span>
+      {agent.recipe && agent.role === "worker" && (
+        <>
+          <span style={{ color: "var(--text-3)" }}>·</span>
+          <span
+            title={`recipe: ${agent.recipe}`}
+            style={{
+              color: "var(--text-3)",
+              fontSize: 9,
+              fontWeight: 500,
+              padding: "1px 6px",
+              border: "1px solid var(--border)",
+              borderRadius: 3,
+              background: "var(--bg-1)",
+              textTransform: "none",
+              letterSpacing: 0,
+            }}
+          >
+            {agent.recipe}
+          </span>
+        </>
+      )}
       <span style={{ color: "var(--text-3)" }}>·</span>
       <span
         style={{
@@ -1233,6 +1273,20 @@ function DriverChatInput({
 }
 
 // --- exported helpers ---
+
+// isHeadlessRecipe returns true for recipes that don't run a
+// KasmVNC desktop server inside the sandbox. Workers under
+// these recipes render with the log filling the tile (no
+// iframe slot). Driven by recipe name rather than a presence
+// check on agent.kasmvnc_url because the URL field arrives
+// asynchronously after sandbox boot — we want the layout to be
+// stable from spawn, not pop after a few seconds.
+//
+// Keep the list in sync with recipes/*.yaml whose `canvas
+// .primary_tile` is `log`.
+export function isHeadlessRecipe(recipe: string | undefined): boolean {
+  return recipe === "headless-dev";
+}
 
 export function lastEventText(events: KEvent[]): string | null {
   if (events.length === 0) return null;

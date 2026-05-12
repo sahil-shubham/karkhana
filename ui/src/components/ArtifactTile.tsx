@@ -2,14 +2,16 @@
 // canvas node. v0.7: one per mission, type "markdown:report",
 // produced when the driver calls finish().
 //
-// Visual: title bar + scrollable rendered body. We deliberately
-// don't pull in a heavy markdown renderer for v0; the content
-// is shown verbatim with whitespace + simple heading hinting.
-// Operator can right-click → "Open fullscreen" for a richer view
-// later; for now the tile content reads like a textarea.
+// Visual: title bar + scrollable rendered body. Renders proper
+// markdown (headings / lists / tables / code / links) via
+// react-markdown + remark-gfm. The header has a copy-raw
+// button so the operator can paste the original markdown
+// elsewhere; useful for archiving or pasting into docs.
 
 import { Handle, NodeResizer, Position, type NodeProps } from "@xyflow/react";
 import { useEffect, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Artifact } from "../lib/types";
 import { api } from "../lib/api";
 import { formatTime } from "./AgentTile";
@@ -111,6 +113,9 @@ export function ArtifactTile({ data, selected }: NodeProps) {
         >
           {title}
         </span>
+        {artifact && (
+          <CopyRawButton text={artifact.content} />
+        )}
         <span style={{ color: "var(--text-4)", fontSize: 10 }}>
           {type.replace("markdown:", "")}
         </span>
@@ -175,86 +180,246 @@ export function ArtifactTile({ data, selected }: NodeProps) {
   );
 }
 
-// MarkdownPreview — quick-and-dirty renderer. For v0.7 we keep
-// it dependency-free: preserve whitespace, bold-ish headings,
-// monospace code spans. If we end up wanting real markdown,
-// swap in react-markdown later.
+// MarkdownPreview renders the artifact via react-markdown +
+// remark-gfm (GitHub-flavoured markdown: tables, strikethrough,
+// task lists, autolinks). Inline component overrides give us
+// the canvas-native typography — we don't pull in a stylesheet.
+//
+// Code blocks are mono-styled but NOT syntax-highlighted (~100KB
+// of highlight.js would dominate the bundle; for the current
+// artifact shape — research reports, comparison tables — plain
+// mono is fine). If a future artifact type needs highlighting,
+// swap in rehype-highlight under a feature flag.
 function MarkdownPreview({ content }: { content: string }) {
-  const lines = content.split("\n");
   return (
-    <>
-      {lines.map((line, i) => {
-        // Heading levels by `#` count.
-        if (line.startsWith("# ")) {
-          return (
-            <div
-              key={i}
+    <div className="karkhana-artifact-md">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => (
+            <h1
               style={{
-                fontSize: 18,
+                fontSize: 20,
                 fontWeight: 700,
-                marginTop: i === 0 ? 0 : 16,
+                marginTop: 16,
+                marginBottom: 8,
+                paddingBottom: 6,
+                borderBottom: "1px solid var(--border)",
+              }}
+            >
+              {children}
+            </h1>
+          ),
+          h2: ({ children }) => (
+            <h2
+              style={{
+                fontSize: 16,
+                fontWeight: 600,
+                marginTop: 14,
                 marginBottom: 6,
               }}
             >
-              {line.slice(2)}
-            </div>
-          );
-        }
-        if (line.startsWith("## ")) {
-          return (
-            <div
-              key={i}
+              {children}
+            </h2>
+          ),
+          h3: ({ children }) => (
+            <h3
               style={{
-                fontSize: 15,
-                fontWeight: 600,
-                marginTop: 14,
-                marginBottom: 4,
-              }}
-            >
-              {line.slice(3)}
-            </div>
-          );
-        }
-        if (line.startsWith("### ")) {
-          return (
-            <div
-              key={i}
-              style={{
-                fontSize: 13,
+                fontSize: 14,
                 fontWeight: 600,
                 marginTop: 12,
                 marginBottom: 4,
               }}
             >
-              {line.slice(4)}
-            </div>
-          );
-        }
-        if (line.match(/^\s*[-*]\s/)) {
-          return (
-            <div key={i} style={{ paddingLeft: 16, position: "relative" }}>
-              <span
+              {children}
+            </h3>
+          ),
+          p: ({ children }) => (
+            <p style={{ margin: "6px 0" }}>{children}</p>
+          ),
+          ul: ({ children }) => (
+            <ul style={{ margin: "6px 0", paddingLeft: 22 }}>{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol style={{ margin: "6px 0", paddingLeft: 22 }}>{children}</ol>
+          ),
+          li: ({ children }) => (
+            <li style={{ margin: "2px 0" }}>{children}</li>
+          ),
+          a: ({ children, href }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--accent, #4a9eff)" }}
+            >
+              {children}
+            </a>
+          ),
+          code: ({ children, className }) => {
+            // react-markdown calls this for BOTH inline and
+            // fenced code; fenced ones come with a language
+            // className (e.g. language-rust). Distinguish by
+            // looking for a className.
+            const isBlock = !!className;
+            if (isBlock) {
+              return (
+                <code
+                  style={{
+                    display: "block",
+                    padding: "8px 10px",
+                    background: "var(--bg-2)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 4,
+                    fontFamily:
+                      "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    fontSize: 11.5,
+                    overflowX: "auto",
+                    whiteSpace: "pre",
+                  }}
+                >
+                  {children}
+                </code>
+              );
+            }
+            return (
+              <code
                 style={{
-                  position: "absolute",
-                  left: 4,
-                  color: "var(--text-3)",
+                  padding: "1px 5px",
+                  background: "var(--bg-2)",
+                  borderRadius: 3,
+                  fontFamily:
+                    "ui-monospace, SFMono-Regular, Menlo, monospace",
+                  fontSize: 11.5,
                 }}
               >
-                •
-              </span>
-              {line.replace(/^\s*[-*]\s/, "")}
+                {children}
+              </code>
+            );
+          },
+          pre: ({ children }) => (
+            // Our `code` block already paints the box; pre is a
+            // pass-through wrapper so we don't double-pad.
+            <pre style={{ margin: "8px 0" }}>{children}</pre>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote
+              style={{
+                margin: "8px 0",
+                padding: "4px 12px",
+                borderLeft: "3px solid var(--border)",
+                color: "var(--text-3)",
+              }}
+            >
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div style={{ overflowX: "auto", margin: "8px 0" }}>
+              <table
+                style={{
+                  borderCollapse: "collapse",
+                  fontSize: 12,
+                  width: "100%",
+                }}
+              >
+                {children}
+              </table>
             </div>
-          );
+          ),
+          th: ({ children }) => (
+            <th
+              style={{
+                textAlign: "left",
+                padding: "6px 8px",
+                borderBottom: "1px solid var(--border)",
+                background: "var(--bg-2)",
+                fontWeight: 600,
+              }}
+            >
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td
+              style={{
+                padding: "6px 8px",
+                borderBottom: "1px solid var(--border)",
+                verticalAlign: "top",
+              }}
+            >
+              {children}
+            </td>
+          ),
+          hr: () => (
+            <hr
+              style={{
+                border: "none",
+                borderTop: "1px solid var(--border)",
+                margin: "14px 0",
+              }}
+            />
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+// CopyRawButton puts the unrendered markdown source on the
+// clipboard. The button gives a visual ack for ~1.2s so the
+// operator knows the click registered (clipboard writes are
+// otherwise silent in the browser).
+function CopyRawButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1200);
+        } catch (err) {
+          // Clipboard API can fail on insecure origins (http://
+          // without localhost). Fall back to a hidden textarea
+          // + execCommand for those rare cases.
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            document.execCommand("copy");
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1200);
+          } catch {
+            // last-resort: log; operator can still right-click
+            // the artifact body and copy manually.
+            console.error("copy failed:", err);
+          }
+          document.body.removeChild(ta);
         }
-        if (line.trim() === "") {
-          return <div key={i} style={{ height: 6 }} />;
-        }
-        return (
-          <div key={i} style={{ whiteSpace: "pre-wrap" }}>
-            {line}
-          </div>
-        );
-      })}
-    </>
+      }}
+      title="Copy raw markdown to clipboard"
+      style={{
+        background: "transparent",
+        color: copied ? "var(--status-ok, #4ade80)" : "var(--text-3)",
+        border: "1px solid var(--border)",
+        borderRadius: 3,
+        padding: "1px 8px",
+        fontSize: 10,
+        fontWeight: 500,
+        textTransform: "none",
+        letterSpacing: 0,
+        cursor: "pointer",
+        transition: "color 120ms",
+      }}
+    >
+      {copied ? "✓ copied" : "copy raw"}
+    </button>
   );
 }
