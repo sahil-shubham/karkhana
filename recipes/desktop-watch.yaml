@@ -15,12 +15,23 @@ resources:
   memory_mb: 4096
   timeout_secs: 1800
 
-# Bhatti secrets to inject as env vars at sandbox boot. Run
-# `bhatti secret set ANTHROPIC_API_KEY <key>` once on the host.
-# v0.7 day-3: SecretNames is plumbed through the client but not
-# yet replacing piEnvFromHost() — day 4 deletes piEnvFromHost.
+# Bhatti secrets to inject as env vars at sandbox boot. The
+# worker pi process needs ONE of the LLM-provider keys to
+# authenticate; list all the common ones here and bhatti only
+# injects the names that are actually set on the host. The
+# karkhana startup validator warns about any that are missing
+# but does not block boot — you can run with just one provider.
+#
+# Set whichever your pi config uses, once per host:
+#   bhatti secret set OPENROUTER_API_KEY  <value>
+#   bhatti secret set ANTHROPIC_API_KEY   <value>
+#   bhatti secret set OPENAI_API_KEY      <value>
+#   bhatti secret set GOOGLE_API_KEY      <value>
 secrets:
+  - OPENROUTER_API_KEY
   - ANTHROPIC_API_KEY
+  - OPENAI_API_KEY
+  - GOOGLE_API_KEY
 
 # Pi extension paths, interpreted INSIDE the sandbox filesystem.
 # scripts/bake-image.sh installs the computer-use extension at

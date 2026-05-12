@@ -15,7 +15,10 @@ resources:
   timeout_secs: 1800
 
 secrets:
+  - OPENROUTER_API_KEY
   - ANTHROPIC_API_KEY
+  - OPENAI_API_KEY
+  - GOOGLE_API_KEY
   - GH_TOKEN
 
 # Same extension as desktop-watch — the worker has the full GUI

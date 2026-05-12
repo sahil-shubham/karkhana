@@ -21,8 +21,13 @@ resources:
   memory_mb: 2048
   timeout_secs: 1800
 
+# LLM provider key + dev-shell extras. See desktop-watch.yaml
+# for the multi-provider rationale.
 secrets:
+  - OPENROUTER_API_KEY
   - ANTHROPIC_API_KEY
+  - OPENAI_API_KEY
+  - GOOGLE_API_KEY
   - GH_TOKEN
 
 # computer-use-cli is the headless variant: bash, read, write,
