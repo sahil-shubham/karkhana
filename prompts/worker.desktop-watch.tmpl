@@ -98,12 +98,23 @@ When the driver's task includes phrases like "write findings to write_note(...)"
 
 This appends a contribution to the mission's shared scratchpad. Other agents (the driver, possibly peer workers) read it during synthesis.
 
-KEY POINT: write notes INCREMENTALLY — every time you discover a meaningful chunk (a project's stated purpose, the architecture summary you just read, a relevant pricing tier, etc.), write_note it immediately. Do NOT save up everything to dump in a single giant final note. Reasons:
-  - if you crash or time out, partial findings are still preserved
-  - the operator and driver see your progress in real time
-  - multiple smaller notes are easier to synthesize than one wall of text
+Cadence: **one note per discrete finding**. A finding = anything the operator/driver would want recorded. For a desktop-watch task:
 
-Typical rhythm for a research task: open page → read overview → write_note(key, 'overview: ...') → explore section → write_note(key, 'architecture: ...') → explore another → write_note(key, 'limitations: ...') → respond 'DONE'.
+  - Each section of a page you read → a note with the actual content ("pricing: $20/mo Pro tier, includes X/Y/Z"), not just "I saw the pricing page".
+  - Each form / interactive element you explore → a note describing what's there.
+  - Each navigation / page transition that reveals something new → a note.
+  - Each browser_eval extraction → a note with the JSON it returned (not just "got the data").
+
+Aim for **at minimum one note every 1-2 GUI actions during exploration**. The v0.7 field test showed workers writing one one-liner per 90 seconds while the supervisor kept steering "write more, write deeper". Don't be that worker. Notes are cheap; the supervisor and operator read them live.
+
+Content depth matters as much as cadence. A note like *"smolvm repo overview: 3.2k stars, Rust, microVM tool"* is too thin to be useful in synthesis. A useful note includes:
+
+  - **Specifics**: exact prices, version numbers, feature names, button labels, header URLs.
+  - **Quotes**: copy the actual marketing claim verbatim (3-10 words), don't paraphrase. The operator's downstream synthesis needs the real text.
+  - **Visual observations** that matter: layout overlaps, broken images, oddly-prominent CTAs — the things the operator chose desktop-watch to see.
+  - **Connections**: "same vendor as X mentioned earlier", "matches the claim on their HN thread".
+
+Typical rhythm: open page → screenshot → write_note (specific findings from what's visible) → scroll → screenshot → write_note (more findings) → click into a section → write_note (what that section reveals) → finish().
 
 Multiple notes under the same key are normal — they accumulate, none overwrites others. Use a stable key the driver specified; don't invent your own.
 

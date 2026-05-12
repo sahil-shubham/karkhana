@@ -82,13 +82,23 @@ gh api repos/owner/repo/contents/path/to/file.go --jq -r '.content' | base64 -d
 
 Faster than cloning when you genuinely need only one file.
 
-## Blackboard discipline
+## Blackboard discipline (this is the operator's view of your work)
 
-Write notes INCREMENTALLY as you discover findings. Do NOT save up for a single final dump at the end. Reasons:
+Cadence: **one note per discrete finding**. A finding = anything the operator/driver would want recorded. Concretely:
 
-- If the supervisor steers or terminates you mid-flight, partial findings survive.
-- The operator sees your progress in real time in the blackboard tile.
-- Multiple small notes synthesize better than one wall of text.
+  - Each file you read carefully → a note (with relevant excerpts, not just "I read it").
+  - Each `rg` / `gh` query that returns interesting structure → a note.
+  - Each architectural insight that builds across files → a note.
+  - Each dead-end / dependency-missing surprise → a note (negative findings save other workers' time).
+
+Aim for **at minimum one note every 1-2 tool calls during exploration**. Workers in the v0.7 field test averaged one note per 90 seconds while the driver kept steering "write more, write deeper" — do not be that worker. Notes are cheap; the supervisor is reading them live.
+
+Content depth matters as much as cadence. A note like *"smolvm repo overview: 3.2k stars, Rust, microVM tool"* is too thin to be useful in synthesis. A useful note includes:
+
+  - **Specifics**: file paths (`src/vmm/firecracker.rs:42`), function names, dependency versions, exact CLI invocations.
+  - **Excerpts**: 3-10 lines of actual code or doc text where it matters, not paraphrase.
+  - **Connections**: "depends on libkrun like microsandbox does", "differs from kata-containers in X".
+  - **Quotes from README/docs**: copy the actual marketing claim verbatim, then reality-check it against the source.
 
 Use the stable key the driver specified in your task. Don't invent your own. Multiple notes under the same key accumulate; that's normal and intended.
 
@@ -96,9 +106,11 @@ Per-note shape:
 
   write_note(
     key='repo_arch',
-    content='Concrete finding in markdown. Include file paths, line refs, URLs. Keep it short — one cohesive observation per note.',
-    summary='one-line summary <= 80 chars'
+    content='## Hypervisor stack\n\nUses libkrun via FFI (`src/vmm/krun.rs:1-30`). Boots via:\n```rust\nkrun_create_ctx()  // create VMM ctx\nkrun_set_root(...) // attach rootfs\nkrun_start_enter() // boot + block\n```\nNo Firecracker, no QEMU, no cloud-hypervisor.',
+    summary='Hypervisor: libkrun via FFI, no firecracker'
   )
+
+That note is ~70 words and worth more than 10 one-liner overviews.
 
 ## Completion contract
 
