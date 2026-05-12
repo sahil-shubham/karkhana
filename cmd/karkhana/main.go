@@ -1107,12 +1107,20 @@ func buildDriverArgv(sessDir, provider, model, driverToolsPath string, continueS
 }
 
 // validateRecipeImages walks every recipe's image and checks
-// that bhatti has it locally. For missing images:
-//   - Default recipe missing → hard exit (karkhana cannot spawn
-//     anything).
-//   - Other recipes missing → warn, suggest the exact
-//     `bhatti image pull` command, and continue (the missing
-//     recipe is unusable but the rest of karkhana works).
+// that bhatti has it locally. Always advisory — it prints the
+// exact `bhatti image pull` command for any missing image but
+// does NOT block startup. Reasons:
+//   - bhatti.ListImages() returns user-pulled images; built-in
+//     tier names ("computer") and scripts/bake-image.sh outputs
+//     may not be listed there even though they're valid spawn
+//     targets. We can't safely tell the difference at startup.
+//   - Even a genuinely-missing default recipe shouldn't kill
+//     karkhana — the operator may want to boot it, fix the
+//     issue with `bhatti image pull`, and have karkhana already
+//     up to verify.
+//
+// The actual hard failure for a missing image happens at
+// CreateSandbox time, which surfaces a clear bhatti error.
 func validateRecipeImages(ctx context.Context, cli *bhatti.Client, reg *recipes.Registry) {
 	images, err := cli.ListImages(ctx)
 	if err != nil {
@@ -1129,13 +1137,11 @@ func validateRecipeImages(ctx context.Context, cli *bhatti.Client, reg *recipes.
 			continue
 		}
 		suggested := suggestImagePull(r.Image)
+		level := "recipe image not listed by bhatti.ListImages (may still work if it's a built-in tier or bake-image.sh output); spawn will surface the real error if missing"
 		if r.Name == defaultName {
-			slog.Error("default recipe image not present on bhatti host",
-				"recipe", r.Name, "image", r.Image,
-				"remediation", suggested)
-			os.Exit(1)
+			level = "DEFAULT recipe's image not listed by bhatti.ListImages; check `bhatti image list` and pull if genuinely absent"
 		}
-		slog.Warn("recipe image not present on bhatti host; recipe will fail to spawn until pulled",
+		slog.Warn(level,
 			"recipe", r.Name, "image", r.Image,
 			"remediation", suggested)
 	}
