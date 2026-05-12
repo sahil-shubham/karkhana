@@ -1,0 +1,64 @@
+name: headless-dev
+description: |
+  Fast headless shell for code work. Clone repos, run builds,
+  grep, read files. No GUI, no chromium, no kasmvnc. Boots in
+  ~1s; ~10x faster than kk-base.
+
+  This is the recipe the driver should pick for "research this
+  github project" prompts. The operator watches the log tile.
+
+# The kk-dev bhatti image is built from images/kk-dev/Dockerfile
+# and pushed to ghcr.io. First-run operator setup:
+#
+#   bhatti image pull ghcr.io/sahil-shubham/karkhana-kk-dev:latest --name kk-dev
+#
+# Day 4 of the v0.7 plan adds a startup check that prints exactly
+# this command if the image isn't pulled.
+image: kk-dev
+
+resources:
+  cpu: 2
+  memory_mb: 2048
+  timeout_secs: 1800
+
+secrets:
+  - ANTHROPIC_API_KEY
+  - GH_TOKEN
+
+# computer-use-cli is the headless variant: bash, read, write,
+# edit, grep, find, write_note, finish — NO screenshot/click/
+# type/scroll/browser_eval. Day 4 builds it (or a smaller
+# extension), today this is a forward reference.
+extensions:
+  - /usr/local/share/karkhana/extensions/computer-use-cli/index.ts
+
+prompt: worker.headless-dev
+
+# Dev workers may reach package registries and code-hosting
+# domains directly. The recipe-aware curl policy lands in a
+# follow-up; declared here so it's authoritative.
+allow_http:
+  - api.github.com
+  - raw.githubusercontent.com
+  - github.com
+  - codeload.github.com
+  - registry.npmjs.org
+  - pypi.org
+  - proxy.golang.org
+  - crates.io
+deny_curl_to_others: false
+
+# Any server the worker starts on these ports gets auto-published
+# at https://<alias>.bhatti.sh. Wired in a later day; declared now.
+auto_publish:
+  port_range: [3000, 9000]
+  alias_template: "{worker_short}-{port}"
+  ttl_secs: 900
+
+idle:
+  pause_after_secs: 300
+  stop_after_secs: 1800
+
+canvas:
+  primary_tile: log
+  show_published_urls: true

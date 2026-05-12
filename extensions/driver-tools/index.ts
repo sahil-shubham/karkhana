@@ -91,11 +91,16 @@ const spawnWorkerTool = defineTool({
   name: "spawn_worker",
   label: "Spawn Worker",
   description:
-    "Spawn ONE worker agent in its own bhatti microVM, with the " +
-    "computer-use toolset (browser, screenshot, click, type, " +
-    "scroll). Returns immediately with the worker's ID. " +
-    "For fanouts of 2 or more workers, prefer `spawn_workers` " +
-    "(plural) — it spawns them all in one tool call.",
+    "Spawn ONE worker agent in its own bhatti microVM. The `recipe` " +
+    "argument picks the worker's shape:\n\n" +
+    "  - desktop-watch  (default) headful chromium + computer-use " +
+    "tools. Use for visible UI work, research, QA, click-through.\n" +
+    "  - headless-dev   fast shell only, no GUI. Use for cloning " +
+    "repos, grep, builds, API calls from bash.\n" +
+    "  - mixed          both. Use when the shape is genuinely " +
+    "unclear; most tasks fit one of the two above.\n\n" +
+    "Returns immediately with the worker's ID. For fan-outs of " +
+    "2 or more workers, prefer `spawn_workers` (plural).",
   parameters: Type.Object({
     task: Type.String({
       description:
@@ -105,15 +110,26 @@ const spawnWorkerTool = defineTool({
         "Workers don't see the conversation history with the " +
         "operator, only what you put here.",
     }),
+    recipe: Type.Optional(
+      Type.String({
+        description:
+          "Recipe name: 'desktop-watch' (default), 'headless-dev', " +
+          "or 'mixed'. Omit to use the operator-configured default.",
+      }),
+    ),
   }),
-  async execute(_id, { task }) {
-    const r = await karkhanaCall<SpawnWorkerResult>("/spawn_worker", { task });
+  async execute(_id, { task, recipe }) {
+    const r = await karkhanaCall<SpawnWorkerResult>("/spawn_worker", {
+      task,
+      recipe,
+    });
     return {
       content: [
         {
           type: "text" as const,
           text:
             `worker spawned: ${r.worker_id}\n` +
+            `recipe: ${(r as { recipe?: string }).recipe ?? "(default)"}\n` +
             `sandbox: ${r.sandbox_id}\n` +
             `status: ${r.status}`,
         },
@@ -128,20 +144,36 @@ const spawnWorkersTool = defineTool({
   label: "Spawn Workers (bulk)",
   description:
     "Spawn N worker agents in parallel — ONE tool call, N " +
-    "sandboxes booted concurrently on bhatti. Each worker gets " +
-    "its own task description and runs independently. Returns " +
-    "the list of worker IDs in the same order as the tasks. " +
-    "Use this for fan-out (compare A/B/C, summarize 5 articles, " +
-    "phase-2 of discovery+research). For a single worker, use " +
-    "`spawn_worker`. Returns immediately — does NOT block.",
+    "sandboxes booted concurrently on bhatti. Each task may pick " +
+    "its own recipe; missions often mix recipes (e.g. one " +
+    "headless-dev worker clones the repo while a desktop-watch " +
+    "worker looks at the docs site). Returns immediately — does " +
+    "NOT block on worker completion.\n\n" +
+    "Each entry may be a plain task string (recipe defaults) or " +
+    "an object `{task, recipe}` to pick a recipe per worker.",
   parameters: Type.Object({
     tasks: Type.Array(
-      Type.String({
-        description:
-          "One task description per worker. Each is self-contained " +
-          "and must end with 'do not call any more tools after that' " +
-          "so the worker terminates cleanly when done.",
-      }),
+      Type.Union([
+        Type.Object({
+          task: Type.String({
+            description:
+              "Self-contained task description. Include URLs, " +
+              "success criteria, and 'call finish(summary) when done'.",
+          }),
+          recipe: Type.Optional(
+            Type.String({
+              description:
+                "Recipe name for THIS worker: 'desktop-watch' | " +
+                "'headless-dev' | 'mixed'. Omit for operator default.",
+            }),
+          ),
+        }),
+        Type.String({
+          description:
+            "Plain task string — uses the operator default recipe. " +
+            "Prefer the object form when you want to pick a recipe.",
+        }),
+      ]),
       { minItems: 1, maxItems: 20 },
     ),
   }),
@@ -149,9 +181,10 @@ const spawnWorkersTool = defineTool({
     const r = await karkhanaCall<SpawnWorkersResult>("/spawn_workers", {
       tasks,
     });
-    const lines = r.workers.map(
-      (w, i) => `  ${i + 1}. ${w.worker_id}  (sandbox=${w.sandbox_id})`,
-    );
+    const lines = r.workers.map((w, i) => {
+      const recipe = (w as { recipe?: string }).recipe ?? "(default)";
+      return `  ${i + 1}. ${w.worker_id}  [${recipe}]  (sandbox=${w.sandbox_id})`;
+    });
     return {
       content: [
         {

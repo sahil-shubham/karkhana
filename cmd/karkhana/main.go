@@ -37,6 +37,7 @@ import (
 	"github.com/sahil-shubham/karkhana/pkg/mission"
 	"github.com/sahil-shubham/karkhana/pkg/store"
 	"github.com/sahil-shubham/karkhana/prompts"
+	"github.com/sahil-shubham/karkhana/recipes"
 )
 
 const (
@@ -88,17 +89,48 @@ func main() {
 	defer db.Close()
 	slog.Info("store opened", "path", cfg.DBPath)
 
+	// Recipes: load *.yaml from recipes/, validate against the
+	// prompt template list. A recipe that references a missing
+	// prompt is a startup error — better to fail loudly here than
+	// on first spawn three hours into a mission.
+	recipeReg, err := recipes.Load(prompts.List(), cfg.DefaultRecipe)
+	if err != nil {
+		slog.Error("recipe load failed", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("recipes loaded",
+		"default", recipeReg.DefaultName(),
+		"available", recipeReg.Names())
+
+	// DEPRECATED env-var overrides on the default recipe. Operators
+	// migrating from pre-v0.7 may still have KARKHANA_WORKER_IMAGE /
+	// KARKHANA_PI_EXTENSIONS set; honour them by mutating the
+	// resolved default recipe at startup, with a deprecation
+	// notice nudging them to edit the YAML.
+	if cfg.WorkerImage != "" || len(cfg.PiExtensions) > 0 {
+		def, _ := recipeReg.Default()
+		if cfg.WorkerImage != "" && cfg.WorkerImage != def.Image {
+			slog.Warn("KARKHANA_WORKER_IMAGE overrides recipe (deprecated; edit recipes/"+def.Name+".yaml instead)",
+				"recipe", def.Name, "old", def.Image, "new", cfg.WorkerImage)
+			def.Image = cfg.WorkerImage
+		}
+		if len(cfg.PiExtensions) > 0 {
+			slog.Warn("KARKHANA_PI_EXTENSIONS overrides recipe (deprecated; edit recipes/"+def.Name+".yaml instead)",
+				"recipe", def.Name, "old", def.Extensions, "new", cfg.PiExtensions)
+			def.Extensions = cfg.PiExtensions
+		}
+	}
+
 	state := &serverState{
 		bus:               bus,
 		bhatti:            bhattiCli,
 		store:             db,
+		recipes:           recipeReg,
 		missions:          map[string]*mission.Mission{},
 		agents:            map[string]*mission.Agent{},
 		drivers:           map[string]driver.AgentDriver{},
 		piProvider:        cfg.PiProvider,
 		piModel:           cfg.PiModel,
-		workerImage:       cfg.WorkerImage,
-		piExtensions:      cfg.PiExtensions,
 		driverToolsPath:   cfg.DriverToolsPath,
 		driverSessionRoot: cfg.DriverSessionRoot,
 		internalURL:       cfg.InternalURL,
@@ -117,16 +149,9 @@ func main() {
 	} else {
 		slog.Warn("max event id read failed (non-fatal)", "err", err)
 	}
-	if len(cfg.PiExtensions) > 0 {
-		slog.Info("pi extensions enabled",
-			"count", len(cfg.PiExtensions),
-			"paths", cfg.PiExtensions)
-	}
 	slog.Info("pi provider resolved",
 		"provider", cfg.PiProvider,
 		"model", cfg.PiModel)
-	slog.Info("worker image", "image", cfg.WorkerImage,
-		"hint", "set KARKHANA_WORKER_IMAGE=kk-base after running scripts/bake-image.sh to skip pi install")
 
 	// Smoke-test the bhatti connection at startup.
 	smokeCtx, cancelSmoke := context.WithTimeout(context.Background(), 10*time.Second)
@@ -193,6 +218,7 @@ type serverState struct {
 	bus      *eventbus.Bus
 	bhatti   *bhatti.Client
 	store    *store.Store
+	recipes  *recipes.Registry // worker compositions; loaded at startup
 	missions map[string]*mission.Mission
 	agents   map[string]*mission.Agent
 	drivers  map[string]driver.AgentDriver // keyed by agentID
@@ -201,15 +227,6 @@ type serverState struct {
 	// pi-coding-agent provider/model, resolved at startup
 	piProvider string
 	piModel    string
-
-	// Worker bhatti image. "computer" (default) requires runtime
-	// pi install; "kk-base" (after bake-image.sh) has pi pre-baked.
-	workerImage string
-
-	// Pi --extension paths (interpreted in the sandbox FS) to
-	// load on every worker spawn. With kk-base, this is the
-	// computer-use extension; with raw "computer", empty.
-	piExtensions []string
 
 	// Driver-side: paths/URLs for spawning the host driver pi
 	// process and routing its tool callbacks back here.
@@ -728,8 +745,16 @@ func (s *serverState) runMission(m *mission.Mission, canvasX, canvasY *float64) 
 // spawnWorker creates a new worker sandbox + pi-rpc agent under
 // the given driver. Called by the /internal/driver/:id/spawn_worker
 // HTTP handler when the driver invokes its spawn_worker tool.
+//
+// recipeName resolves through s.recipes (empty string → default
+// recipe). The resolved recipe's image, resources, extensions,
+// secrets, and prompt template are all carried into runWorker.
 // Returns the worker agent record (already in s.agents).
-func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, task string) (*mission.Agent, error) {
+func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, task, recipeName string) (*mission.Agent, error) {
+	rec, err := s.recipes.Get(recipeName)
+	if err != nil {
+		return nil, err
+	}
 	workerID := "agent_" + randHex(12)
 	worker := &mission.Agent{
 		ID:            workerID,
@@ -738,7 +763,7 @@ func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, tas
 		Role:          mission.RoleWorker,
 		SpawnKind:     mission.SpawnSpawn,
 		Task:          task,
-		Recipe:        "computer-use",
+		Recipe:        rec.Name,
 		Status:        mission.StatusRunning,
 		StartedAt:     time.Now(),
 	}
@@ -754,6 +779,8 @@ func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, tas
 			"role":   "worker",
 			"task":   task,
 			"parent": parentDriverID,
+			"recipe": rec.Name,
+			"image":  rec.Image,
 			"stage":  "creating sandbox",
 		},
 	})
@@ -761,7 +788,7 @@ func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, tas
 	// Spawn the rest asynchronously so the driver tool returns
 	// quickly with a worker_id; sandbox boot + pi connect take
 	// a couple seconds even on kk-base.
-	go s.runWorker(parentDriverID, m, worker)
+	go s.runWorker(parentDriverID, m, worker, rec)
 	return worker, nil
 }
 
@@ -770,26 +797,48 @@ func (s *serverState) spawnWorker(parentDriverID string, m *mission.Mission, tas
 // prompt. This is the meat of v0.5's runMission, just renamed
 // and parameterized by parentDriverID + task. Failures call
 // failAgent (which used to be failWorker).
-func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worker *mission.Agent) {
+func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worker *mission.Agent, rec *recipes.Recipe) {
 	workerID := worker.ID
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	sandboxName := fmt.Sprintf("kk-%s", workerID[len(workerID)-8:])
 
-	// 1. Create sandbox
+	// Recipe resources, with sensible fallbacks if the YAML
+	// omitted timeout_secs.
+	cpus := rec.Resources.CPU
+	if cpus <= 0 {
+		cpus = defaultWorkerCPUs
+	}
+	mem := rec.Resources.MemoryMB
+	if mem <= 0 {
+		mem = defaultWorkerMemoryMB
+	}
+	timeoutSecs := rec.Resources.TimeoutSecs
+	if timeoutSecs <= 0 {
+		timeoutSecs = defaultWorkerTimeoutSecs
+	}
+
+	// 1. Create sandbox. piEnv injection is the pre-v0.7 path
+	// (carries API keys from karkhana host into the sandbox);
+	// recipe.Secrets is the new path (bhatti decrypts named
+	// secrets at boot, karkhana never sees values). Day 4 of the
+	// plan deletes piEnvFromHost entirely once operators have
+	// migrated to `bhatti secret set`.
 	piEnv := s.piEnvFromHost()
 	sb, err := s.bhatti.CreateSandbox(ctx, bhatti.SandboxSpec{
 		Name:        sandboxName,
-		Image:       s.workerImage,
-		CPUs:        defaultWorkerCPUs,
-		MemoryMB:    defaultWorkerMemoryMB,
-		TimeoutSecs: defaultWorkerTimeoutSecs,
+		Image:       rec.Image,
+		CPUs:        cpus,
+		MemoryMB:    mem,
+		TimeoutSecs: timeoutSecs,
 		KeepHot:     true,
-		Env:         piEnv, // pre-set so pi can read on first run
+		Env:         piEnv,
+		SecretNames: rec.Secrets,
 		Metadata: map[string]string{
 			"karkhana.dev/mission_id": m.ID,
 			"karkhana.dev/agent_id":   workerID,
+			"karkhana.dev/recipe":     rec.Name,
 			"karkhana.dev/goal":       truncate(m.Goal, 200),
 		},
 	})
@@ -868,7 +917,7 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 		},
 		Provider:   s.piProvider,
 		Model:      s.piModel,
-		Extensions: s.piExtensions,
+		Extensions: rec.Extensions,
 		Env:        piEnv,
 		OnEvent: func(ev driver.Event) {
 			s.forwardPiEvent(m.ID, workerID, ev)
@@ -895,22 +944,15 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 		Payload: map[string]any{"session_id": drv.SessionID()},
 	})
 
-	// 5. Send the WORKER's task as the first prompt, with the
-	// desktop-context preamble so the worker pi knows it has a
-	// visible KasmVNC display and the computer-use toolset.
-	//
-	// Template choice: workers with the computer-use extension
-	// loaded get worker.desktop-watch.tmpl (full GUI toolset);
-	// workers without it fall back to worker.bash-only.tmpl
-	// (chromium-from-bash idiom). The recipe model in v0.7 will
-	// replace this boolean with an explicit recipe.Prompt field.
-	tmplName := "worker.bash-only"
-	if len(s.piExtensions) > 0 {
-		tmplName = "worker.desktop-watch"
-	}
-	prompt, err := prompts.Render(tmplName, prompts.Context{Task: worker.Task})
+	// 5. Send the WORKER's task as the first prompt. The recipe
+	// dictates which preamble template renders (e.g. desktop-watch
+	// gets the GUI-first preamble, headless-dev gets the
+	// shell-only preamble). v0.7-day-3 replaces the pre-v0.7
+	// `len(s.piExtensions) > 0` boolean with this explicit
+	// recipe.Prompt field.
+	prompt, err := prompts.Render(rec.Prompt, prompts.Context{Task: worker.Task})
 	if err != nil {
-		s.failAgent(m, worker, "render "+tmplName+" prompt: "+err.Error())
+		s.failAgent(m, worker, "render "+rec.Prompt+" prompt: "+err.Error())
 		return
 	}
 	if err := drv.Prompt(context.Background(), prompt); err != nil {
@@ -927,7 +969,7 @@ func (s *serverState) runWorker(parentDriverID string, m *mission.Mission, worke
 	go func() {
 		awaitCtx, awaitCancel := context.WithTimeout(
 			context.Background(),
-			time.Duration(defaultWorkerTimeoutSecs)*time.Second,
+			time.Duration(timeoutSecs)*time.Second,
 		)
 		defer awaitCancel()
 		if err := drv.AwaitCompletion(awaitCtx); err != nil {
@@ -2151,7 +2193,8 @@ func (s *serverState) handleToolTerminateWorker(w http.ResponseWriter, r *http.R
 
 func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
 	var body struct {
-		Task string `json:"task"`
+		Task   string `json:"task"`
+		Recipe string `json:"recipe,omitempty"` // empty → default
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
@@ -2161,14 +2204,15 @@ func (s *serverState) handleToolSpawnWorker(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "task required", http.StatusBadRequest)
 		return
 	}
-	worker, err := s.spawnWorker(driverAgent.ID, m, body.Task)
+	worker, err := s.spawnWorker(driverAgent.ID, m, body.Task, body.Recipe)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"worker_id":  worker.ID,
 		"sandbox_id": worker.BhattiSandboxID, // may be empty if still booting
+		"recipe":     worker.Recipe,
 		"status":     worker.Status,
 	})
 }
@@ -2311,8 +2355,12 @@ func (s *serverState) appendBlackboardNote(missionID, agentID, key, content, sum
 // pi-rpc connect dance. No semaphore needed; bhatti's API
 // handles the concurrent CreateSandbox calls fine.
 func (s *serverState) handleToolSpawnWorkers(w http.ResponseWriter, r *http.Request, driverAgent *mission.Agent, m *mission.Mission) {
+	// tasks may be either an array of plain strings (legacy
+	// shape) or an array of {task, recipe} objects (v0.7+). We
+	// decode into a json.RawMessage list and parse each entry
+	// permissively so old driver-tool bundles keep working.
 	var body struct {
-		Tasks []string `json:"tasks"`
+		Tasks []json.RawMessage `json:"tasks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
@@ -2330,24 +2378,45 @@ func (s *serverState) handleToolSpawnWorkers(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	workers := make([]map[string]any, 0, len(body.Tasks))
-	for _, task := range body.Tasks {
-		if strings.TrimSpace(task) == "" {
+	type taskEntry struct {
+		task   string
+		recipe string
+	}
+	entries := make([]taskEntry, 0, len(body.Tasks))
+	for i, raw := range body.Tasks {
+		// Try object form first; fall back to plain string.
+		var asObj struct {
+			Task   string `json:"task"`
+			Recipe string `json:"recipe,omitempty"`
+		}
+		if err := json.Unmarshal(raw, &asObj); err == nil && asObj.Task != "" {
+			entries = append(entries, taskEntry{task: asObj.Task, recipe: asObj.Recipe})
 			continue
 		}
-		worker, err := s.spawnWorker(driverAgent.ID, m, task)
+		var asStr string
+		if err := json.Unmarshal(raw, &asStr); err == nil && strings.TrimSpace(asStr) != "" {
+			entries = append(entries, taskEntry{task: asStr})
+			continue
+		}
+		slog.Warn("bulk spawn: skipping malformed task entry", "index", i)
+	}
+
+	workers := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		worker, err := s.spawnWorker(driverAgent.ID, m, e.task, e.recipe)
 		if err != nil {
 			// Continue with the rest; partial success is
 			// preferable to refusing the whole batch. The driver
 			// will see fewer worker IDs than tasks and can
 			// decide what to do.
 			slog.Warn("bulk spawn: one worker failed",
-				"err", err, "task", truncate(task, 80))
+				"err", err, "recipe", e.recipe, "task", truncate(e.task, 80))
 			continue
 		}
 		workers = append(workers, map[string]any{
 			"worker_id":  worker.ID,
 			"sandbox_id": worker.BhattiSandboxID,
+			"recipe":     worker.Recipe,
 			"status":     worker.Status,
 		})
 	}

@@ -1,0 +1,43 @@
+name: desktop-watch
+description: |
+  Headful Linux microVM with XFCE + Chromium. Operator watches the
+  desktop live over KasmVNC. Use for research, QA, click-through —
+  any task where SEEING the page is the point.
+
+  This recipe matches Karkhana's pre-v0.7 default behaviour. New
+  deployments should consider headless-dev for code-shaped tasks
+  and mixed for exploratory work.
+
+image: kk-base
+
+resources:
+  cpu: 2
+  memory_mb: 4096
+  timeout_secs: 1800
+
+# Bhatti secrets to inject as env vars at sandbox boot. Run
+# `bhatti secret set ANTHROPIC_API_KEY <key>` once on the host.
+# v0.7 day-3: SecretNames is plumbed through the client but not
+# yet replacing piEnvFromHost() — day 4 deletes piEnvFromHost.
+secrets:
+  - ANTHROPIC_API_KEY
+
+# Pi extension paths, interpreted INSIDE the sandbox filesystem.
+# scripts/bake-image.sh installs the computer-use extension at
+# this path.
+extensions:
+  - /usr/local/share/karkhana/extensions/computer-use/index.ts
+
+prompt: worker.desktop-watch
+
+# Network policy. Today these are documented but not yet enforced
+# at the substrate level — the curl regex block in
+# computer-use/index.ts is recipe-agnostic. Enforcement lands in
+# a follow-up; declared now so recipes that need it can.
+allow_http:
+  - "*"
+deny_curl_to_others: true
+
+canvas:
+  primary_tile: desktop
+  show_published_urls: false

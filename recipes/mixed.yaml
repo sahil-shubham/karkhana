@@ -1,0 +1,41 @@
+name: mixed
+description: |
+  Both shells: headful chromium with the computer-use toolset
+  AND a dev shell. Use only when the task shape is genuinely
+  unclear ("explore this repo's docs, the website, and the
+  codebase, then summarize"). For most tasks pick desktop-watch
+  or headless-dev directly — mixed is the fallback, not the
+  default.
+
+image: kk-base
+
+resources:
+  cpu: 2
+  memory_mb: 4096
+  timeout_secs: 1800
+
+secrets:
+  - ANTHROPIC_API_KEY
+  - GH_TOKEN
+
+# Same extension as desktop-watch — the worker has the full GUI
+# toolset PLUS pi's built-in bash/read/write/edit. (The dev
+# tooling difference is at the IMAGE layer; kk-base has chromium
+# + git + node, kk-dev drops chromium.)
+extensions:
+  - /usr/local/share/karkhana/extensions/computer-use/index.ts
+
+prompt: worker.mixed
+
+allow_http:
+  - "*"
+deny_curl_to_others: true
+
+auto_publish:
+  port_range: [3000, 9000]
+  alias_template: "{worker_short}-{port}"
+  ttl_secs: 900
+
+canvas:
+  primary_tile: desktop
+  show_published_urls: true

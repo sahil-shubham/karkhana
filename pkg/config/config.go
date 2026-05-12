@@ -69,6 +69,12 @@ type Config struct {
 	// from whichever API key is present in the env.
 	PiProvider string // e.g. "openrouter" | "anthropic" | "openai"
 	PiModel    string // e.g. "anthropic/claude-sonnet-4.6"
+
+	// DefaultRecipe is the recipe name used when a driver calls
+	// spawn_worker without an explicit recipe argument. Must be a
+	// recipe present under recipes/*.yaml (validated at load).
+	// Default: "desktop-watch" (Karkhana's pre-v0.7 behaviour).
+	DefaultRecipe string
 }
 
 // DefaultComputerUseExtensionPath is where bake-image.sh installs
@@ -127,9 +133,17 @@ func Load() (*Config, error) {
 		cfg.PiProvider, cfg.PiModel = autoDetectPiProvider(cfg.PiModel)
 	}
 
-	// Worker image. Default to "computer"; user can switch to a
-	// pre-baked image (e.g. kk-base from scripts/bake-image.sh).
-	cfg.WorkerImage = envOr("KARKHANA_WORKER_IMAGE", "computer")
+	// Worker image. DEPRECATED at v0.7 in favour of
+	// recipes/<name>.yaml. Still honoured: if set, overrides the
+	// default recipe's image at load time. Unset means "use the
+	// recipe as authored." The default fallback "computer" only
+	// applies if KARKHANA_WORKER_IMAGE is set to that literal
+	// value — otherwise we leave it empty and let the recipe win.
+	cfg.WorkerImage = os.Getenv("KARKHANA_WORKER_IMAGE")
+
+	// Default recipe name. Drivers spawn workers under this
+	// recipe when they don't pass an explicit recipe argument.
+	cfg.DefaultRecipe = envOr("KARKHANA_DEFAULT_RECIPE", "desktop-watch")
 
 	// Driver tools extension path on the host. Resolved to an
 	// absolute path so the host pi subprocess (which may have a
@@ -148,10 +162,10 @@ func Load() (*Config, error) {
 	cfg.InternalURL = envOr("KARKHANA_INTERNAL_URL", "http://localhost"+cfg.Addr)
 	cfg.DBPath = envOr("KARKHANA_DB_PATH", "karkhana.db")
 
-	// Pi extensions. Explicit env var (KARKHANA_PI_EXTENSIONS,
-	// comma-separated) wins. Otherwise: empty for the vanilla
-	// "computer" image (no extension dir baked); for any other
-	// image, default to the computer-use extension path.
+	// Pi extensions. DEPRECATED at v0.7 in favour of recipe.
+	// Extensions in recipes/<name>.yaml. Still honoured: if
+	// KARKHANA_PI_EXTENSIONS is set (comma-separated), it
+	// overrides the default recipe's extensions at load time.
 	if raw := os.Getenv("KARKHANA_PI_EXTENSIONS"); raw != "" {
 		for _, p := range strings.Split(raw, ",") {
 			p = strings.TrimSpace(p)
@@ -159,8 +173,6 @@ func Load() (*Config, error) {
 				cfg.PiExtensions = append(cfg.PiExtensions, p)
 			}
 		}
-	} else if cfg.WorkerImage != "computer" {
-		cfg.PiExtensions = []string{DefaultComputerUseExtensionPath}
 	}
 
 	return cfg, nil
