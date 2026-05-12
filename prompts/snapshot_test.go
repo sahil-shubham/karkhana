@@ -41,6 +41,16 @@ func snapshotCases() []snapshotCase {
 			ctx:          Context{Task: "open bhatti.sh and screenshot the landing page"},
 		},
 		{
+			templateName: "worker.headless-dev",
+			goldenName:   "worker.headless-dev.golden",
+			ctx:          Context{Task: "clone bhatti, scan its top-level Go packages, write_note('arch', ...)"},
+		},
+		{
+			templateName: "worker.mixed",
+			goldenName:   "worker.mixed.golden",
+			ctx:          Context{Task: "explore bhatti.sh and the bhatti github repo together"},
+		},
+		{
 			templateName: "worker.bash-only",
 			goldenName:   "worker.bash-only.golden",
 			ctx:          Context{Task: "list files in /tmp and pick the three largest"},

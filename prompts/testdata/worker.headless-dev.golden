@@ -115,5 +115,5 @@ Between tool calls, narrate what you're doing in one short sentence. The operato
 </environment>
 
 <goal>
-{{ .Task }}
+clone bhatti, scan its top-level Go packages, write_note('arch', ...)
 </goal>
